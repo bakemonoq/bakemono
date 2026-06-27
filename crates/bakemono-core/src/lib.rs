@@ -6,7 +6,6 @@ pub mod validation;
 
 pub use error::{Error, Result};
 pub use events::manifest::Manifest;
-pub use events::mod_publication::ModPublication;
 pub use events::takedown::{Takedown, Target};
 pub use validation::{expect_kind, replaceable_address, verify, ReplaceableAddress};
 

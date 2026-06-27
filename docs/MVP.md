@@ -45,7 +45,7 @@ If all seven steps work without intervention, MVP ships.
 
 ### Common
 
-- `bakemono-core` with kind 31063 / 31064 / 31065 event types, tag helpers, validation (see `PROTOCOL.md`)
+- `bakemono-core` with kind 31063 manifest + kind 31064 takedown event types, tag helpers, validation (see `PROTOCOL.md`)
 - Signing and verification via the `nostr` rust crate (secp256k1 Schnorr)
 - BitTorrent v2 with WebTorrent compatibility (hybrid trackers if needed)
 - TURN fallback via a small coturn instance behind rate limit
@@ -70,7 +70,7 @@ If all seven steps work without intervention, MVP ships.
 
 Loose sequence. Each step ships something demoable.
 
-1. **Workspace + `bakemono-core`.** Set up the Cargo workspace under `crates/`. Build `bakemono-core` first: kind 31063 manifest event type, kind 31064 takedown, kind 31065 mod publication, tag schema constants and helpers, event validation, wrapping the `nostr` crate. Unit tests covering: event build + sign + verify roundtrip; tag schema validation (missing required tag is rejected); replaceable event semantics (same `(pubkey, kind, d)` triple replaces older event in a mock store); forged-signature rejection. This is the foundation everything else imports.
+1. **Workspace + `bakemono-core`.** Set up the Cargo workspace under `crates/`. Build `bakemono-core` first: kind 31063 manifest event type, kind 31064 takedown event type, tag schema constants and helpers, event validation, wrapping the `nostr` crate. Unit tests covering: event build + sign + verify roundtrip; tag schema validation (missing required tag is rejected); replaceable event semantics (same `(pubkey, kind, d)` triple replaces older event in a mock store); forged-signature rejection. This is the foundation everything else imports.
 2. **Tiny CLI smoke test.** Throwaway binary that uses `bakemono-core` to read a file from disk, build a kind 31063 event, sign it, and publish it to a single local relay over WebSocket. Throwaway tiny subscriber that connects to the same relay and prints received events. Proves the core works end-to-end against a real relay before any product code.
 3. **Wrapper around gallery-dl.** Scrapes one Patreon creator into a folder. CLI only; Python sidecar invoked from rust. Output is just files on disk.
 4. **Scraping pipeline producing signed events.** Wire steps 1-3 together: scraper outputs files, each file gets hashed, each gets a signed kind 31063 event built and published. CLI driver still.

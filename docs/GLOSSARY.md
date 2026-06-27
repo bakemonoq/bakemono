@@ -7,7 +7,7 @@ Quick reference for terms used throughout the Bakemono docs and code.
 - **Nostr**: open peer-to-peer protocol for signed, replayable JSON events. We use it as our metadata wire format and federation transport.
 - **Relay**: a Nostr server that accepts events from clients, stores them, and streams them to subscribers. Stateless beyond storage. No coordination with other relays.
 - **Event**: the unit of Nostr data. Signed JSON with `id`, `kind`, `pubkey`, `created_at`, `tags`, `content`, `sig`. Our manifests are kind 31063 events.
-- **Kind**: Nostr's event type number. Bakemono manifests are kind 31063. Takedowns 31064. Mod publications 31065. The range 30000-39999 is parameterized-replaceable per NIP-33.
+- **Kind**: Nostr's event type number. Bakemono manifests are kind 31063. Takedowns 31064. The range 30000-39999 is parameterized-replaceable per NIP-33.
 - **NIP**: Nostr Implementation Possibility. The spec system Nostr uses. NIP-01 is the base protocol; NIP-33 is replaceable events; NIP-19 is bech32 encoding; etc.
 - **NIP-33 (parameterized replaceable events)**: lets a contributor update their own event by publishing a new one with the same `d` tag. Relays keep only the latest version per `(pubkey, kind, d)` triple.
 - **secp256k1 / Schnorr / BIP-340**: the cryptography Nostr uses for keys and signatures. Same curve as Bitcoin.

@@ -16,7 +16,7 @@ Kemono failed because content storage was centralized on a single IP block. Bake
 
 The repo is a single Cargo workspace. Three rust crates plus docs.
 
-- `bakemono-core` - shared library crate. Bakemono Nostr event types (kind 31063 manifest, 31064 takedown, 31065 mod publication), tag schema helpers, event-building and validation routines, protocol version constants. Wraps the `nostr` crate from rust-nostr.org. Pure logic, zero I/O. Imported by both `bakemono-app` and `bakemono-board` so the wire protocol cannot drift between client and server. Unit-tested in isolation.
+- `bakemono-core` - shared library crate. Bakemono Nostr event types (kind 31063 manifest, kind 31064 takedown), tag schema helpers, event-building and validation routines, protocol version constants. Wraps the `nostr` crate from rust-nostr.org. Pure logic, zero I/O. Imported by both `bakemono-app` and `bakemono-board` so the wire protocol cannot drift between client and server. Unit-tested in isolation.
 - `bakemono-board` - the self-hostable web instance. Runs a `nostr-rs-relay` sidecar, runs an indexer that subscribes to a configured relay set and ingests kind 31063 events into postgres, serves search/browse UI, runs a warm cache for popular previews. Rust: axum + sqlx + maud (SSR templates) + Postgres. Depends on `bakemono-core`.
 - `bakemono-app` - cross-platform desktop client. Tauri (rust + web frontend). Three thin pieces around one shared backend: a daemon (DHT, BT v2 seeder, scraping queue, Nostr event signing and multi-relay publish), a GUI (configure scrapes, manage keypair and relay list, see contribution stats), a tray icon (quick status, pause/resume). Depends on `bakemono-core`. Wraps gallery-dl for art/post sites and yt-dlp for video, both invoked from the rust daemon as Tauri sidecar binaries (Python runtime bundled). Uses an embedded webview to let the user log into Patreon themselves; session stays local, never sent to any server.
 
@@ -31,7 +31,7 @@ The repo is a single Cargo workspace. Three rust crates plus docs.
 | Board backend | rust: axum + sqlx + maud + Postgres |
 | Async runtime | tokio |
 | HTTP client | reqwest |
-| Metadata wire format | Nostr events (kind 31063 manifest, 31064 takedown, 31065 mod publication) |
+| Metadata wire format | Nostr events (kind 31063 manifest, kind 31064 takedown) |
 | Federation transport | Nostr relays. Multi-relay publish + subscribe over WebSocket per NIP-01 |
 | Relay implementation | `nostr-rs-relay` (rust, MIT, by Greg Heartsfield) run as sidecar to the board |
 | Signing | `nostr` crate from rust-nostr.org. secp256k1 Schnorr per BIP-340, NIP-01 canonicalization |

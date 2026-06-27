@@ -162,10 +162,6 @@ Signed by an instance operator. Records that this instance has chosen to hide a 
 
 Target can be by `e` (event id), `x` (file hash), or `p` (contributor pubkey). The `reason` tag is a free-form string with conventional values: `dmca-us`, `eu-court-order`, `csam`, `spam`, `wrong-content`, etc.
 
-### Kind 31065: moderation publication
-
-An instance can publish a periodic summary of mod actions for transparency. Useful for downstream observers.
-
 ### How peer instances apply mod actions
 
 Each instance's indexer subscribes to kinds 31064 from peer instance pubkeys it trusts (configurable). When it receives a takedown signed by a trusted peer, it applies the takedown to its own postgres index per local policy.
@@ -185,6 +181,10 @@ Each instance's indexer subscribes to kinds 31064 from peer instance pubkeys it 
 
 - The Bakemono manifest kind is fixed at 31063 for v1 of the schema. Breaking changes introduce a new kind (e.g., 31066) and we publish to both for a transition period.
 - Tag additions within v1 must be ignorable by older indexers. No required new tags after launch.
+
+## Reserved kinds
+
+- **31065** is reserved for a future periodic transparency-log aggregate event (signed daily summary of an instance's mod actions). Not implemented in MVP; do not reuse for anything else
 
 ## Reserved tags
 

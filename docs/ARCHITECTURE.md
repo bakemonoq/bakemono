@@ -48,7 +48,7 @@ Bakemono/
   crates/
     bakemono-core/        # shared library crate
       src/
-        events/           # kind 31063 manifest, 31064 takedown, 31065 mod pub
+        events/           # kind 31063 manifest, kind 31064 takedown
         tags.rs           # tag schema constants and helpers
         validation.rs     # event well-formedness checks beyond Nostr's base
         protocol.rs       # kind constants, version constants
