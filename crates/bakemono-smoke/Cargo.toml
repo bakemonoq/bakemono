@@ -1,0 +1,17 @@
+[package]
+name = "bakemono-smoke"
+description = "Throwaway end-to-end smoke test for bakemono-core against a live relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+bakemono-core = { path = "../bakemono-core" }
+nostr-sdk.workspace = true
+nostr-relay-builder.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+sha2.workspace = true
+hex.workspace = true
