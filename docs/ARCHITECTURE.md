@@ -6,7 +6,7 @@ Bakemono is built around one core idea: separate WHAT a file is from WHERE it li
 
 ### 1. Content layer
 
-The actual file bytes. Lives in a BitTorrent v2 / WebTorrent swarm. Every file is addressed by its sha256 hash, so the file's identity is what it is, not where it lives. Any peer holding the bytes can serve them to any other peer. The content layer has no central server, no CDN, no single point of failure. Taking down any host, instance, or the project's primary domain does not affect content availability as long as at least one peer is seeding.
+The actual file bytes. Lives in a BitTorrent v1 + WebRTC swarm via the `webtorrent` package. Every file is addressed by its sha256 hash, so the file's identity is what it is, not where it lives. Any peer holding the bytes can serve them to any other peer. The content layer has no central server, no CDN, no single point of failure. Taking down any host, instance, or the project's primary domain does not affect content availability as long as at least one peer is seeding.
 
 ### 2. Metadata layer
 
@@ -64,14 +64,20 @@ Bakemono/
     bakemono-app/         # binary crate (Tauri desktop client)
       src/
         main.rs           # Tauri shell + GUI commands
-        daemon/           # background: seeder, scrape queue, relay publisher
+        daemon/           # background: scrape queue, relay publisher, IPC to webtorrent sidecar
         scraper/          # gallery-dl / yt-dlp sidecar invocation
+        seeder/           # spawns and supervises the webtorrent Node sidecar
         identity/         # local secp256k1 keypair management
         relays/           # default relay list, user-configured overrides
   docs/
 ```
 
-Alongside the rust crates, the board runs `nostr-rs-relay` as a separate sidecar process (not part of the workspace; pulled in as a docker container or system binary). The indexer connects to it as a WebSocket client at `ws://localhost:8080`.
+Alongside the rust crates, two Node sidecars run:
+
+- `nostr-rs-relay` (rust binary) sits next to the board, exposing `ws://localhost:8080` to the indexer.
+- `webtorrent` (Node, >=2.3.0) runs as a Tauri sidecar in the desktop app (seeds scraped files over BT v1 + WebRTC) and also runs on the board for the warm-cache fetcher/seeder. Same package, both roles.
+
+Neither sidecar is part of the rust workspace; both are pulled in as system binaries or container images.
 
 `bakemono-core` is the contract. If a type or routine ends up in both `bakemono-app` and `bakemono-board`, it belongs in core. Keeping I/O out of core means the event-shaping logic stays trivially unit-testable and the workspace builds quickly.
 
@@ -82,11 +88,11 @@ Alongside the rust crates, the board runs `nostr-rs-relay` as a separate sidecar
 | Alice's machine     |                       | Bob's machine       |
 |---------------------|                       |---------------------|
 | bakemono-app GUI    |                       | Browser             |
-| bakemono-daemon     |                       |  WebTorrent JS      |
+| bakemono-daemon     |                       |  webtorrent in JS   |
 |   scraper           |                       |  Bakemono web UI    |
 |   event signer      |                       +----------+----------+
-|   BT v2 seeder      |                                  |
-|   DHT participant   |                                  | WebRTC P2P
+|   webtorrent side-  |                                  |
+|   car (BT+WebRTC)   |                                  | WebRTC P2P
 |   relay publisher   |                                  | (direct bytes)
 +---------+-----------+                                  |
           |                                              |
@@ -122,7 +128,7 @@ Most home users are behind NAT, meaning their device cannot accept unsolicited i
 - **TURN**: relay server, fallback for symmetric / carrier-grade NAT. Eats real bandwidth. We will run a small TURN cluster behind a rate limit.
 - **UPnP / NAT-PMP**: app politely asks the home router to open a port. Many routers comply.
 
-The libraries (WebTorrent in the browser, librqbit and webrtc-rs on the rust side) include ICE. We wire it up; we do not reimplement it.
+The `webtorrent` package (used in the browser and in the desktop daemon via Node sidecar) handles ICE end-to-end through its WebRTC layer. We wire it up; we do not reimplement it.
 
 Realistic split: about 80% of users connect peer-to-peer directly via STUN + hole punching. About 15% need TURN relay for some or all sessions. About 5% have NAT hostile enough that connectivity degrades to "download via desktop client" rather than browser streaming. This is acceptable.
 

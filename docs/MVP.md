@@ -34,7 +34,7 @@ If all seven steps work without intervention, MVP ships.
 
 - Tauri shell, single binary per OS (Windows, macOS, Linux x86_64 + arm64)
 - Three internal pieces: daemon, GUI, tray icon
-- Daemon: BT v2 seeder via librqbit, DHT, scrape queue, Nostr event signer, multi-relay publisher
+- Daemon: rust core orchestrating a `webtorrent` Node sidecar (>=2.3.0) for BT v1 + WebRTC seeding, plus DHT participation, scrape queue, Nostr event signer, multi-relay publisher
 - GUI: keypair management (`nsec` import/export), Patreon login webview, creator selection, scrape progress, contribution stats, relay list editor
 - Tray: status, pause/resume seeding, open GUI, quit
 - Scraper: gallery-dl wrapped for Patreon (Python sidecar), exposing one creator at a time
@@ -47,7 +47,7 @@ If all seven steps work without intervention, MVP ships.
 
 - `bakemono-core` with kind 31063 manifest + kind 31064 takedown event types, tag helpers, validation (see `PROTOCOL.md`)
 - Signing and verification via the `nostr` rust crate (secp256k1 Schnorr)
-- BitTorrent v2 with WebTorrent compatibility (hybrid trackers if needed)
+- BitTorrent v1 plus native WebRTC via the `webtorrent` Node package (one stack for desktop daemon, board warm cache, and browser viewer)
 - TURN fallback via a small coturn instance behind rate limit
 
 ## Out of scope for v0
@@ -74,7 +74,7 @@ Loose sequence. Each step ships something demoable.
 2. **Tiny CLI smoke test.** Throwaway binary that uses `bakemono-core` to read a file from disk, build a kind 31063 event, sign it, and publish it to a single local relay over WebSocket. Throwaway tiny subscriber that connects to the same relay and prints received events. Proves the core works end-to-end against a real relay before any product code.
 3. **Wrapper around gallery-dl.** Scrapes one Patreon creator into a folder. CLI only; Python sidecar invoked from rust. Output is just files on disk.
 4. **Scraping pipeline producing signed events.** Wire steps 1-3 together: scraper outputs files, each file gets hashed, each gets a signed kind 31063 event built and published. CLI driver still.
-5. **Add seeder using librqbit.** Each scraped file is also seeded via BT v2 with a magnet link that matches the `magnet` tag in the published event. Test on a single machine first, then a second machine downloading via WebTorrent.
+5. **Add seeder via `webtorrent` Node sidecar (>=2.3.0).** The rust daemon spawns the sidecar and hands it the file path + torrent metadata via IPC. Each scraped file is seeded over BT v1 + WebRTC simultaneously, so both desktop torrent clients and browsers can fetch directly. The magnet link uses `urn:btih:<sha1-hex>` and matches the `magnet` tag in the published event. Test on a single machine, then verify a second machine's browser pulls the file via WebRTC.
 6. **Build `bakemono-board` v0 skeleton.** Run `nostr-rs-relay` sidecar locally. Build the indexer that subscribes to the local relay with `{"kinds": [31063]}` and writes events into postgres. Build a stub axum + maud frontend with creator-list and post-view pages. Add the WebTorrent JS player on the post-view page.
 7. **End-to-end loop demo.** Machine A runs the CLI: scrape, sign, publish to its local relay, seed. Machine B runs the board: indexer ingests events from a relay it subscribes to (could be A's), web UI shows them, WebTorrent player streams the file from A. This is the milestone where the architecture is proven real.
 8. **Wrap CLI scraper in the Tauri GUI.** Add keypair management (generate, import via `nsec`, export, backup prompt), Patreon webview, creator picker, scrape progress UI. Daemon shape emerges.

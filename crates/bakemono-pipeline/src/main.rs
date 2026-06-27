@@ -5,6 +5,7 @@ use nostr_sdk::prelude::*;
 
 use bakemono_pipeline::{gather_pairs, manifest_from_files, publish_manifests};
 use bakemono_scraper::{Cookies, ScrapeRequest, Scraper};
+use bakemono_seeder::Seeder;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -28,6 +29,7 @@ async fn scrape_and_publish(args: Vec<String>) -> Result<()> {
     let mut relays = Vec::new();
     let mut limit = None;
     let mut cookies = None;
+    let mut seed = true;
 
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
@@ -42,6 +44,7 @@ async fn scrape_and_publish(args: Vec<String>) -> Result<()> {
             }
             "--cookies" => cookies = Some(Cookies::File(value(&mut it, "--cookies")?.into())),
             "--browser" => cookies = Some(Cookies::Browser(value(&mut it, "--browser")?)),
+            "--no-seed" => seed = false,
             flag if flag.starts_with('-') => bail!("unknown flag {flag}"),
             positional if creator.is_none() => creator = Some(positional.to_string()),
             positional if dest.is_none() => dest = Some(PathBuf::from(positional)),
@@ -71,17 +74,19 @@ async fn scrape_and_publish(args: Vec<String>) -> Result<()> {
         outcome.dest.display()
     );
 
-    build_and_publish(gather_pairs(&outcome.dest)?, &keys, &or_local(relays)).await
+    build_and_publish(gather_pairs(&outcome.dest)?, &keys, &or_local(relays), seed).await
 }
 
 async fn ingest_and_publish(args: Vec<String>) -> Result<()> {
     let mut dir = None;
     let mut relays = Vec::new();
+    let mut seed = true;
 
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--relay" => relays.push(value(&mut it, "--relay")?),
+            "--no-seed" => seed = false,
             flag if flag.starts_with('-') => bail!("unknown flag {flag}"),
             positional if dir.is_none() => dir = Some(PathBuf::from(positional)),
             other => bail!("unexpected argument {other}"),
@@ -93,34 +98,51 @@ async fn ingest_and_publish(args: Vec<String>) -> Result<()> {
     let pairs = gather_pairs(&dir)?;
     eprintln!("found {} media files under {}", pairs.len(), dir.display());
 
-    build_and_publish(pairs, &keys, &or_local(relays)).await
+    build_and_publish(pairs, &keys, &or_local(relays), seed).await
 }
 
 async fn build_and_publish(
     pairs: Vec<(PathBuf, PathBuf)>,
     keys: &Keys,
     relays: &[String],
+    seed: bool,
 ) -> Result<()> {
     if pairs.is_empty() {
         bail!("no media+sidecar pairs found");
     }
+    let mut seeder = if seed {
+        Some(
+            Seeder::from_env()
+                .await
+                .context("starting webtorrent sidecar")?,
+        )
+    } else {
+        None
+    };
+
     let mut manifests = Vec::new();
     for (media, sidecar) in &pairs {
-        match manifest_from_files(media, sidecar) {
-            Ok(manifest) => {
-                println!(
-                    "  {} {} {}:{} #{} ({} bytes)",
-                    manifest.file_hash,
-                    manifest.creator,
-                    manifest.platform,
-                    manifest.post_id,
-                    manifest.file_index,
-                    manifest.size
-                );
-                manifests.push(manifest);
+        let mut manifest = match manifest_from_files(media, sidecar) {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                eprintln!("  skip {}: {e:#}", media.display());
+                continue;
             }
-            Err(e) => eprintln!("  skip {}: {e:#}", media.display()),
+        };
+        if let Some(seeder) = seeder.as_mut() {
+            manifest.magnet = seeder.seed(media).await.context("seeding file")?.magnet;
         }
+        println!(
+            "  {} {} {}:{} #{} ({} bytes)\n    {}",
+            manifest.file_hash,
+            manifest.creator,
+            manifest.platform,
+            manifest.post_id,
+            manifest.file_index,
+            manifest.size,
+            manifest.magnet
+        );
+        manifests.push(manifest);
     }
     if manifests.is_empty() {
         bail!("no manifests built");
@@ -128,6 +150,15 @@ async fn build_and_publish(
 
     let ids = publish_manifests(relays, keys, &manifests).await?;
     println!("published {} events to {}", ids.len(), relays.join(", "));
+
+    if let Some(seeder) = seeder {
+        println!(
+            "seeding {} files over BT v1 + WebRTC, ctrl-c to stop",
+            manifests.len()
+        );
+        tokio::signal::ctrl_c().await?;
+        seeder.shutdown().await?;
+    }
     Ok(())
 }
 

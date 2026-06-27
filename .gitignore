@@ -4,3 +4,5 @@
 /scrape/
 *cookies*.txt
 .env
+node_modules/
+nostr.db*

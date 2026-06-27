@@ -4,7 +4,7 @@ A federated, P2P-backed archive of paywalled creator content. Spiritual successo
 
 ## How it works
 
-- Content (images, audio, video, files) lives in a BitTorrent v2 / WebTorrent swarm. No central CDN.
+- Content (images, audio, video, files) lives in a BitTorrent v1 + WebRTC swarm via the `webtorrent` package. No central CDN.
 - Metadata is published as signed Nostr events (custom kind 31063) to many independent relays. No central index.
 - Users scrape their own paid subscriptions via a desktop app, contribute the bytes to the swarm, and fan signed events out to multiple relays at once.
 - Browsers preview content directly via WebTorrent. No plugin, no torrent client needed for normal viewing.

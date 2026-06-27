@@ -26,8 +26,8 @@ The repo is a single Cargo workspace. Three rust crates plus docs.
 |---|---|
 | Desktop app shell | Tauri + rust |
 | Scraping | gallery-dl, yt-dlp (Python sidecars invoked from rust) |
-| Seeding | librqbit (rust, BitTorrent v2) |
-| Browser preview | WebTorrent (WebRTC, JS in browser) |
+| Seeding (desktop + board warm cache) | `webtorrent` >=2.3.0 (Node sidecar; BT v1 over TCP/uTP + native WebRTC) |
+| Browser preview | `webtorrent` >=2.3.0 (same package, runs in the browser via WebRTC) |
 | Board backend | rust: axum + sqlx + maud + Postgres |
 | Async runtime | tokio |
 | HTTP client | reqwest |

@@ -22,8 +22,8 @@ Quick reference for terms used throughout the Bakemono docs and code.
 - **Seed / seeder**: a peer with the complete file, sharing it. The opposite of a leech.
 - **Leech / leecher**: a peer downloading and partially sharing. Not pejorative in this project; everyone leeches before they seed.
 - **DHT (Distributed Hash Table)**: the distributed phonebook BitTorrent uses to look up "who has hash X". Each peer holds a slice; queries hop through the network in roughly 15-20 steps.
-- **BitTorrent v2**: the modern BitTorrent protocol revision. Per-file hashing, better security, easier dedup. The version we target.
-- **WebTorrent**: BitTorrent over WebRTC. Lets browsers participate in swarms without a plugin. Slightly different swarm from native BT but bridgeable via hybrid clients.
+- **BitTorrent v1**: the classic BitTorrent protocol (SHA-1 infohash, urn:btih magnet links). What `webtorrent` and most existing torrent clients use. BT v2 (SHA-256) exists but lacks WebRTC support, so we stay on v1 for end-to-end compatibility with browsers.
+- **WebTorrent (`webtorrent` >=2.3.0)**: BitTorrent client written in JS that runs both in browsers (over WebRTC) and in Node (over TCP/uTP + WebRTC). Since 2.3.0 the package has native WebRTC support and the older `webtorrent-hybrid` split is deprecated. We use the same package as the Tauri sidecar in the desktop app, in the board's warm cache, and in the browser viewer.
 - **WebRTC**: browser-native peer-to-peer transport. Includes ICE for NAT traversal.
 - **Magnet link**: a URI containing a torrent's infohash and metadata. Lets a peer join a swarm without downloading a .torrent file first.
 
@@ -50,7 +50,7 @@ Quick reference for terms used throughout the Bakemono docs and code.
 - **yt-dlp**: existing Python video extractor. Handles Patreon embedded video.
 - **Tauri**: rust framework for cross-platform desktop apps with a web frontend. Smaller and faster than Electron. Our desktop app framework.
 - **bakemono-core**: shared rust crate holding Bakemono event types, tag helpers, validation, and protocol constants. Wraps the `nostr` crate. Imported by both `bakemono-app` and `bakemono-board` to guarantee the wire format cannot drift. Pure logic, no I/O.
-- **librqbit / rqbit**: modern rust BitTorrent v2 client and library by ikatson. Used in the app's daemon for seeding and in the board for optional warm-cache torrent participation.
+- **librqbit / rqbit**: rust BitTorrent client and library by ikatson. Initially considered for the daemon's seeder, but BT v2 only and no native WebRTC, so it cannot serve browsers directly. Parked as a candidate for a v2+ rust-native rewrite once a WebRTC-capable rust BT library matures. Not used in v0.
 - **axum**: rust async web framework on tokio. Board's HTTP layer.
 - **sqlx**: rust async Postgres driver with compile-time-checked queries. Board's DB layer.
 - **maud**: rust compile-time HTML template macro. Board's SSR rendering
