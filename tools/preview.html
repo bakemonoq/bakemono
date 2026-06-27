@@ -9,6 +9,7 @@
     input { width: 100%; padding: .5rem; font-family: monospace }
     button { margin-top: .5rem; padding: .5rem 1rem }
     #status { color: #555; white-space: pre-wrap }
+    #warn { color: #a60; font-size: .85rem }
     img, video { max-width: 100%; display: block; margin-top: 1rem }
   </style>
 </head>
@@ -18,14 +19,15 @@
   <input id="magnet" placeholder="magnet:?xt=urn:btih:...">
   <button id="go" disabled>Load</button>
   <p id="status">loading webtorrent...</p>
+  <p id="warn"></p>
   <div id="out"></div>
 
   <script type="module">
     const status = (t) => { document.getElementById('status').textContent = t }
+    const warn = (t) => { document.getElementById('warn').textContent = t }
     window.addEventListener('error', (e) => status('page error: ' + (e.message || e)))
     window.addEventListener('unhandledrejection', (e) => status('error: ' + (e.reason?.message || e.reason)))
 
-    // dist/webtorrent.min.js is an ES module with a default export, so it must be imported
     let WebTorrent
     try {
       ({ default: WebTorrent } = await import('./webtorrent.min.js'))
@@ -45,18 +47,19 @@
       const magnet = document.getElementById('magnet').value.trim()
       if (!magnet) return
       document.getElementById('out').innerHTML = ''
-      status('announcing to trackers, looking for a peer...')
+      warn('')
 
       const torrent = client.add(magnet)
-      torrent.on('warning', (w) => status('warning: ' + w.message))
-      torrent.on('wire', () => status('connected to ' + torrent.numPeers + ' peer(s), downloading...'))
-      torrent.on('download', () => {
-        status('downloading ' + Math.round(torrent.progress * 100) + '% from ' + torrent.numPeers + ' peer(s)')
-      })
-      torrent.on('ready', () => {
+      torrent.on('warning', (w) => warn('warning: ' + w.message))
+
+      const tick = setInterval(() => {
+        status(`peers: ${torrent.numPeers} | metadata: ${torrent.ready ? 'yes' : 'no'} | progress: ${Math.round(torrent.progress * 100)}% | down: ${(torrent.downloadSpeed / 1000).toFixed(1)} kB/s`)
+      }, 500)
+
+      const render = () => {
         for (const file of torrent.files) {
           file.getBlobURL((err, url) => {
-            if (err) return status('blob error: ' + err.message)
+            if (err) return warn('blob error: ' + err.message)
             const isVideo = /\.(mp4|webm|mov)$/i.test(file.name)
             const el = document.createElement(isVideo ? 'video' : 'img')
             if (isVideo) el.controls = true
@@ -64,7 +67,9 @@
             document.getElementById('out').appendChild(el)
           })
         }
-      })
+      }
+      torrent.on('ready', render)
+      torrent.on('done', () => { clearInterval(tick); status('done - ' + torrent.name + ' (' + torrent.numPeers + ' peers)') })
     }
   </script>
 </body>
