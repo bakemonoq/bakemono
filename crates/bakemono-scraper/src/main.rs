@@ -61,7 +61,7 @@ fn parse_args() -> Result<ScrapeRequest> {
 
     let creator = creator.context(USAGE)?;
     let mut request = ScrapeRequest::new(creator, dest.unwrap_or_else(|| PathBuf::from("scrape")));
-    request.cookies = cookies;
+    request.cookies = cookies.or_else(cookies_from_env);
     request.limit = limit;
     request.quiet = quiet;
     Ok(request)
@@ -72,8 +72,21 @@ fn value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String> 
         .with_context(|| format!("{flag} expects a value"))
 }
 
+fn cookies_from_env() -> Option<Cookies> {
+    if let Some(path) = std::env::var_os("BAKEMONO_COOKIES") {
+        Some(Cookies::File(PathBuf::from(path)))
+    } else {
+        std::env::var("BAKEMONO_COOKIES_BROWSER")
+            .ok()
+            .map(Cookies::Browser)
+    }
+}
+
 fn print_usage() {
     eprintln!("{USAGE}");
+    eprintln!(
+        "env: BAKEMONO_COOKIES=<file>, BAKEMONO_COOKIES_BROWSER=<name>, BAKEMONO_GALLERY_DL=<path>"
+    );
 }
 
 const USAGE: &str =
