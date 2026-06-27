@@ -1,3 +1,9 @@
+//! Kind 31063 manifest: the signed Nostr event that describes one archived file.
+//! It never carries the bytes, only points at them by sha256 (`x` tag) and magnet, so a
+//! file's identity is what it is, not where it lives. Parameterized-replaceable per NIP-33
+//! keyed on `d` = `platform:creator_id:post_id:file_index`, so a contributor can republish to
+//! update their own entry while a different contributor's copy of the same post stays distinct
+
 use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
 
 use crate::error::{Error, Result};

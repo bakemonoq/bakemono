@@ -1,3 +1,7 @@
+//! Kind 31065 moderation publication: an operator's periodic, signed summary of the takedowns it issued.
+//! It gathers `e` references to those takedown events under a `d` period key so peer boards and other
+//! observers can audit an instance's moderation history without replaying every individual action
+
 use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
 
 use crate::error::{Error, Result};

@@ -1,3 +1,9 @@
+//! Kind 31064 takedown: an instance operator's signed statement that a target should be hidden.
+//! The target is one of an event id (`e`), a file hash (`x`), or a contributor pubkey (`p`), with a
+//! free-form `reason` such as `dmca-us` or `csam`. It hides nothing on its own: each board decides
+//! whether to honor a peer operator's takedown and relays keep the original event regardless, so the
+//! set of takedowns doubles as a public, signed transparency log of every moderation decision
+
 use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
 
 use crate::error::{Error, Result};
