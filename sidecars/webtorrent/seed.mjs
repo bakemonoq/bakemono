@@ -13,7 +13,9 @@ const OVERRIDE = (process.env.BAKEMONO_TRACKERS ?? '')
   .filter(Boolean)
 const TRACKERS = OVERRIDE.length > 0 ? OVERRIDE : DEFAULT_TRACKERS
 
-const client = new WebTorrent()
+// BAKEMONO_ISOLATE=1 turns off DHT/LSD so only our own tracker forms the swarm (avoids VPN/foreign peers)
+const isolate = process.env.BAKEMONO_ISOLATE === '1'
+const client = new WebTorrent(isolate ? { dht: false, lsd: false } : {})
 
 function send(message) {
   process.stdout.write(JSON.stringify(message) + '\n')
