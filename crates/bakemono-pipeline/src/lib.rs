@@ -151,7 +151,7 @@ fn sniff_mime(bytes: &[u8]) -> &'static str {
     }
 }
 
-// btmh placeholder over the file's own sha256, the real BT v2 infohash lands with the seeder
+// placeholder btih derived from the content hash, replaced by the real v1 infohash once seeded
 fn placeholder_magnet(file_hash: &str) -> String {
-    format!("magnet:?xt=urn:btmh:1220{file_hash}")
+    format!("magnet:?xt=urn:btih:{}", &file_hash[..40])
 }

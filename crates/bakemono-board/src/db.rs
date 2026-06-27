@@ -46,7 +46,7 @@ pub async fn upsert(pool: &PgPool, event: &Event, manifest: &Manifest) -> Result
 pub async fn creators(pool: &PgPool) -> Result<Vec<CreatorRow>> {
     let rows = sqlx::query_as::<_, CreatorRow>(
         "SELECT platform, creator_id, MAX(creator) AS creator,
-                COUNT(DISTINCT post_id) AS posts, COUNT(*) AS files
+                COUNT(DISTINCT post_id) AS posts, COUNT(DISTINCT file_hash) AS files
          FROM manifests GROUP BY platform, creator_id ORDER BY creator",
     )
     .fetch_all(pool)
@@ -61,7 +61,8 @@ pub async fn posts_by_creator(
 ) -> Result<Vec<PostRow>> {
     let rows = sqlx::query_as::<_, PostRow>(
         "SELECT platform, creator_id, post_id, MAX(creator) AS creator,
-                MAX(post_title) AS post_title, MAX(posted_at) AS posted_at, COUNT(*) AS files
+                MAX(post_title) AS post_title, MAX(posted_at) AS posted_at,
+                COUNT(DISTINCT file_hash) AS files
          FROM manifests WHERE platform = $1 AND creator_id = $2
          GROUP BY platform, creator_id, post_id ORDER BY MAX(created_at) DESC",
     )
@@ -78,9 +79,13 @@ pub async fn post_files(
     creator_id: &str,
     post_id: &str,
 ) -> Result<Vec<ManifestRow>> {
+    // dedup by file hash (latest event per identical content), then order for display
     let rows = sqlx::query_as::<_, ManifestRow>(
-        "SELECT * FROM manifests WHERE platform = $1 AND creator_id = $2 AND post_id = $3
-         ORDER BY file_index",
+        "SELECT * FROM (
+             SELECT DISTINCT ON (file_hash) * FROM manifests
+             WHERE platform = $1 AND creator_id = $2 AND post_id = $3
+             ORDER BY file_hash, created_at DESC
+         ) t ORDER BY file_index",
     )
     .bind(platform)
     .bind(creator_id)
@@ -92,7 +97,9 @@ pub async fn post_files(
 
 pub async fn recent(pool: &PgPool, limit: i64) -> Result<Vec<ManifestRow>> {
     let rows = sqlx::query_as::<_, ManifestRow>(
-        "SELECT * FROM manifests ORDER BY created_at DESC LIMIT $1",
+        "SELECT * FROM (
+             SELECT DISTINCT ON (file_hash) * FROM manifests ORDER BY file_hash, created_at DESC
+         ) t ORDER BY created_at DESC LIMIT $1",
     )
     .bind(limit)
     .fetch_all(pool)
@@ -213,6 +220,34 @@ mod tests {
         assert_eq!(files.len(), 1, "only the newest event is kept");
         assert_eq!(files[0].size, 999);
         assert_eq!(files[0].event_id, newer.id.to_hex());
+
+        sqlx::query("DELETE FROM manifests WHERE creator_id = $1")
+            .bind(&creator_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dedupes_by_file_hash_across_pubkeys() {
+        let Ok(url) = std::env::var("BAKEMONO_TEST_DB") else {
+            eprintln!("skipping: BAKEMONO_TEST_DB not set");
+            return;
+        };
+        let pool = connect(&url).await.unwrap();
+        let creator_id = format!("dedup-{}", std::process::id());
+        let manifest = sample(&creator_id);
+
+        // same content, two different contributors (pubkeys) -> shown once
+        let a = manifest.to_event(&Keys::generate()).unwrap();
+        let b = manifest.to_event(&Keys::generate()).unwrap();
+        upsert(&pool, &a, &manifest).await.unwrap();
+        upsert(&pool, &b, &manifest).await.unwrap();
+
+        let files = post_files(&pool, &manifest.platform, &creator_id, &manifest.post_id)
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 1);
 
         sqlx::query("DELETE FROM manifests WHERE creator_id = $1")
             .bind(&creator_id)

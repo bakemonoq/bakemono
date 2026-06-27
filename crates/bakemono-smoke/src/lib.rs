@@ -56,9 +56,9 @@ pub async fn fetch_manifests(relay_url: &str, timeout: Duration) -> Result<Vec<E
     Ok(events.into_iter().collect())
 }
 
-// real BT v2 infohash arrives with the seeder in a later step, this stands in until then
+// placeholder btih derived from the content hash, replaced by the real v1 infohash once seeded
 fn placeholder_magnet(file_hash: &str, filename: &str) -> String {
-    format!("magnet:?xt=urn:btmh:1220{file_hash}&dn={filename}")
+    format!("magnet:?xt=urn:btih:{}&dn={}", &file_hash[..40], filename)
 }
 
 fn guess_mime(path: &Path) -> &'static str {
