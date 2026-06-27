@@ -1,0 +1,11 @@
+[package]
+name = "bakemono-scraper"
+description = "Rust wrapper that drives gallery-dl to scrape one creator into a folder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+anyhow.workspace = true

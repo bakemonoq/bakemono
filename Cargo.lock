@@ -71,6 +71,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bakemono-scraper"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "bakemono-smoke"
 version = "0.0.0"
 dependencies = [
