@@ -1,0 +1,16 @@
+[package]
+name = "bakemono-board"
+description = "Self-hostable board: indexes kind 31063 events into Postgres and serves a browse UI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bakemono-core = { path = "../bakemono-core" }
+nostr-sdk.workspace = true
+sqlx.workspace = true
+axum.workspace = true
+maud.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
