@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use nostr_sdk::prelude::*;
@@ -162,15 +162,45 @@ async fn build_and_publish(
     Ok(())
 }
 
+// stable identity across restarts: env override, else a persisted key file, else generate and save
 fn load_keys() -> Result<Keys> {
-    match std::env::var("BAKEMONO_NSEC") {
-        Ok(nsec) => Ok(Keys::parse(&nsec)?),
-        Err(_) => {
-            let keys = Keys::generate();
-            eprintln!("generated nsec {}", keys.secret_key().to_bech32()?);
-            Ok(keys)
-        }
+    if let Ok(nsec) = std::env::var("BAKEMONO_NSEC") {
+        return Ok(Keys::parse(&nsec)?);
     }
+    let path = key_file_path();
+    if path.exists() {
+        let nsec = std::fs::read_to_string(&path)?;
+        return Ok(Keys::parse(nsec.trim())?);
+    }
+    let keys = Keys::generate();
+    save_key(&path, &keys.secret_key().to_bech32()?)?;
+    eprintln!(
+        "generated identity {}, saved to {}",
+        keys.public_key().to_bech32()?,
+        path.display()
+    );
+    Ok(keys)
+}
+
+fn key_file_path() -> PathBuf {
+    if let Ok(p) = std::env::var("BAKEMONO_KEY_FILE") {
+        return PathBuf::from(p);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".config/bakemono/identity.nsec")
+}
+
+fn save_key(path: &Path, nsec: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, nsec)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 fn cookies_from_env() -> Option<Cookies> {
