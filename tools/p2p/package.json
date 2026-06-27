@@ -1,0 +1,10 @@
+{
+  "name": "bakemono-p2p-test",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "description": "Minimal two-host BitTorrent connectivity test, no tracker/dht/relay",
+  "dependencies": {
+    "webtorrent": "^3.0.0"
+  }
+}

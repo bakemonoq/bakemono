@@ -12,7 +12,8 @@ async fn seeds_a_file_and_returns_a_btih_magnet() {
         return;
     }
 
-    let file = std::env::temp_dir().join(format!("bakemono-seed-{}.bin", std::process::id()));
+    // odd chars in the name must be handled (staged to a sanitized path before seeding)
+    let file = std::env::temp_dir().join(format!("bk seed | {} ☾.bin", std::process::id()));
     std::fs::write(&file, b"bakemono seed test payload").unwrap();
 
     let mut seeder = Seeder::start(Path::new("node"), &script).await.unwrap();

@@ -197,7 +197,13 @@ mod tests {
             eprintln!("skipping: BAKEMONO_TEST_DB not set");
             return;
         };
-        let pool = connect(&url).await.unwrap();
+        let pool = match connect(&url).await {
+            Ok(pool) => pool,
+            Err(e) => {
+                eprintln!("skipping: cannot reach test db: {e}");
+                return;
+            }
+        };
         let keys = Keys::generate();
         let creator_id = format!("test-{}", std::process::id());
         let mut manifest = sample(&creator_id);
@@ -234,7 +240,13 @@ mod tests {
             eprintln!("skipping: BAKEMONO_TEST_DB not set");
             return;
         };
-        let pool = connect(&url).await.unwrap();
+        let pool = match connect(&url).await {
+            Ok(pool) => pool,
+            Err(e) => {
+                eprintln!("skipping: cannot reach test db: {e}");
+                return;
+            }
+        };
         let creator_id = format!("dedup-{}", std::process::id());
         let manifest = sample(&creator_id);
 

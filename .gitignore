@@ -7,3 +7,4 @@
 node_modules/
 nostr.db*
 tools/webtorrent.min.js
+bk-dl/

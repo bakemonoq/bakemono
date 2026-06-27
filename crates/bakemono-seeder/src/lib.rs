@@ -1,4 +1,6 @@
-use std::path::Path;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -16,6 +18,7 @@ pub struct Seeder {
     child: Child,
     stdin: ChildStdin,
     lines: Lines<BufReader<ChildStdout>>,
+    staging: PathBuf,
 }
 
 impl Seeder {
@@ -31,10 +34,15 @@ impl Seeder {
         let stdout = child.stdout.take().context("sidecar stdout missing")?;
         let lines = BufReader::new(stdout).lines();
 
+        let staging = std::env::temp_dir().join(format!("bakemono-seed-{}", std::process::id()));
+        std::fs::create_dir_all(&staging)
+            .with_context(|| format!("creating staging dir {}", staging.display()))?;
+
         let mut seeder = Self {
             child,
             stdin,
             lines,
+            staging,
         };
         seeder.wait_for("ready").await?;
         Ok(seeder)
@@ -47,12 +55,9 @@ impl Seeder {
         Self::start(Path::new(&node), Path::new(&script)).await
     }
 
+    // webtorrent mis-hashes pieces when the source path has odd chars, so seed a sanitized hardlink
     pub async fn seed(&mut self, file: &Path) -> Result<SeedInfo> {
-        let path = file
-            .canonicalize()
-            .with_context(|| format!("resolving {}", file.display()))?
-            .to_string_lossy()
-            .into_owned();
+        let path = self.stage(file)?.to_string_lossy().into_owned();
         self.send(&serde_json::json!({"cmd": "seed", "path": path}))
             .await?;
         loop {
@@ -81,7 +86,23 @@ impl Seeder {
             .wait()
             .await
             .context("waiting for sidecar exit")?;
+        let _ = std::fs::remove_dir_all(&self.staging);
         Ok(())
+    }
+
+    fn stage(&self, file: &Path) -> Result<PathBuf> {
+        let src = file
+            .canonicalize()
+            .with_context(|| format!("resolving {}", file.display()))?;
+        let mut hasher = DefaultHasher::new();
+        src.to_string_lossy().hash(&mut hasher);
+        let dir = self.staging.join(format!("{:016x}", hasher.finish()));
+        std::fs::create_dir_all(&dir)?;
+        let staged = dir.join(safe_filename(&src));
+        if !staged.exists() && std::fs::hard_link(&src, &staged).is_err() {
+            std::fs::copy(&src, &staged).with_context(|| format!("staging {}", src.display()))?;
+        }
+        Ok(staged)
     }
 
     async fn wait_for(&mut self, event_name: &str) -> Result<()> {
@@ -118,4 +139,26 @@ impl Seeder {
 
 fn str_field<'a>(event: &'a Value, key: &str) -> Option<&'a str> {
     event.get(key).and_then(Value::as_str)
+}
+
+fn safe_filename(src: &Path) -> String {
+    let raw = src
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "file".to_string()
+    } else {
+        cleaned
+    }
 }
