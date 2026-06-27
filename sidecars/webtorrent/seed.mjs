@@ -1,12 +1,17 @@
 import WebTorrent from 'webtorrent'
 import readline from 'node:readline'
 
-// wss trackers let browsers (WebRTC) discover the same swarm the desktop seeds to
-const TRACKERS = [
+// announce list; override with BAKEMONO_TRACKERS (comma-separated) to use your own tracker
+const DEFAULT_TRACKERS = [
   'wss://tracker.openwebtorrent.com',
   'wss://tracker.webtorrent.dev',
   'udp://tracker.opentrackr.org:1337/announce',
 ]
+const OVERRIDE = (process.env.BAKEMONO_TRACKERS ?? '')
+  .split(',')
+  .map((t) => t.trim())
+  .filter(Boolean)
+const TRACKERS = OVERRIDE.length > 0 ? OVERRIDE : DEFAULT_TRACKERS
 
 const client = new WebTorrent()
 
