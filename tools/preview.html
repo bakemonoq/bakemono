@@ -16,47 +16,55 @@
   <h3>Bakemono WebTorrent preview</h3>
   <p>Paste a manifest magnet from another machine's seeder and load it over WebRTC.</p>
   <input id="magnet" placeholder="magnet:?xt=urn:btih:...">
-  <button id="go">Load</button>
-  <p id="status"></p>
+  <button id="go" disabled>Load</button>
+  <p id="status">loading webtorrent...</p>
   <div id="out"></div>
 
-  <!-- served from the same dir; copy it next to this file (see instructions) -->
-  <script src="./webtorrent.min.js"></script>
-  <script>
+  <script type="module">
     const status = (t) => { document.getElementById('status').textContent = t }
     window.addEventListener('error', (e) => status('page error: ' + (e.message || e)))
+    window.addEventListener('unhandledrejection', (e) => status('error: ' + (e.reason?.message || e.reason)))
 
-    if (typeof WebTorrent === 'undefined') {
-      status('webtorrent.min.js did not load - copy it next to preview.html (see instructions)')
-    } else {
-      const client = new WebTorrent()
-      client.on('error', (e) => status('client error: ' + e.message))
+    // dist/webtorrent.min.js is an ES module with a default export, so it must be imported
+    let WebTorrent
+    try {
+      ({ default: WebTorrent } = await import('./webtorrent.min.js'))
+    } catch (e) {
+      status('failed to import webtorrent.min.js: ' + e.message)
+    }
+    if (!WebTorrent) throw new Error('webtorrent unavailable')
 
-      document.getElementById('go').onclick = () => {
-        const magnet = document.getElementById('magnet').value.trim()
-        if (!magnet) return
-        document.getElementById('out').innerHTML = ''
-        status('announcing to trackers, looking for a peer...')
+    const client = new WebTorrent()
+    client.on('error', (e) => status('client error: ' + e.message))
 
-        const torrent = client.add(magnet)
-        torrent.on('warning', (w) => status('warning: ' + w.message))
-        torrent.on('wire', () => status('connected to ' + torrent.numPeers + ' peer(s), downloading...'))
-        torrent.on('download', () => {
-          status('downloading ' + Math.round(torrent.progress * 100) + '% from ' + torrent.numPeers + ' peer(s)')
-        })
-        torrent.on('ready', () => {
-          torrent.files.forEach((file) => {
-            file.getBlobURL((err, url) => {
-              if (err) return status('blob error: ' + err.message)
-              const isVideo = /\.(mp4|webm|mov)$/i.test(file.name)
-              const el = document.createElement(isVideo ? 'video' : 'img')
-              if (isVideo) el.controls = true
-              el.src = url
-              document.getElementById('out').appendChild(el)
-            })
+    const go = document.getElementById('go')
+    go.disabled = false
+    status('ready - paste a magnet and click Load')
+
+    go.onclick = () => {
+      const magnet = document.getElementById('magnet').value.trim()
+      if (!magnet) return
+      document.getElementById('out').innerHTML = ''
+      status('announcing to trackers, looking for a peer...')
+
+      const torrent = client.add(magnet)
+      torrent.on('warning', (w) => status('warning: ' + w.message))
+      torrent.on('wire', () => status('connected to ' + torrent.numPeers + ' peer(s), downloading...'))
+      torrent.on('download', () => {
+        status('downloading ' + Math.round(torrent.progress * 100) + '% from ' + torrent.numPeers + ' peer(s)')
+      })
+      torrent.on('ready', () => {
+        for (const file of torrent.files) {
+          file.getBlobURL((err, url) => {
+            if (err) return status('blob error: ' + err.message)
+            const isVideo = /\.(mp4|webm|mov)$/i.test(file.name)
+            const el = document.createElement(isVideo ? 'video' : 'img')
+            if (isVideo) el.controls = true
+            el.src = url
+            document.getElementById('out').appendChild(el)
           })
-        })
-      }
+        }
+      })
     }
   </script>
 </body>
