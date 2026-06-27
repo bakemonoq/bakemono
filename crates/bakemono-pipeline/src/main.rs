@@ -1,0 +1,171 @@
+use std::path::PathBuf;
+
+use anyhow::{bail, Context, Result};
+use nostr_sdk::prelude::*;
+
+use bakemono_pipeline::{gather_pairs, manifest_from_files, publish_manifests};
+use bakemono_scraper::{Cookies, ScrapeRequest, Scraper};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let mut args = std::env::args().skip(1);
+    let mode = args.next().context(USAGE)?;
+    let rest: Vec<String> = args.collect();
+    match mode.as_str() {
+        "scrape" => scrape_and_publish(rest).await,
+        "ingest" => ingest_and_publish(rest).await,
+        "-h" | "--help" => {
+            eprintln!("{USAGE}");
+            Ok(())
+        }
+        other => bail!("unknown mode `{other}`\n{USAGE}"),
+    }
+}
+
+async fn scrape_and_publish(args: Vec<String>) -> Result<()> {
+    let mut creator = None;
+    let mut dest = None;
+    let mut relays = Vec::new();
+    let mut limit = None;
+    let mut cookies = None;
+
+    let mut it = args.into_iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--relay" => relays.push(value(&mut it, "--relay")?),
+            "--limit" => {
+                limit = Some(
+                    value(&mut it, "--limit")?
+                        .parse()
+                        .context("--limit number")?,
+                )
+            }
+            "--cookies" => cookies = Some(Cookies::File(value(&mut it, "--cookies")?.into())),
+            "--browser" => cookies = Some(Cookies::Browser(value(&mut it, "--browser")?)),
+            flag if flag.starts_with('-') => bail!("unknown flag {flag}"),
+            positional if creator.is_none() => creator = Some(positional.to_string()),
+            positional if dest.is_none() => dest = Some(PathBuf::from(positional)),
+            other => bail!("unexpected argument {other}"),
+        }
+    }
+
+    let creator = creator.context(SCRAPE_USAGE)?;
+    let dest = dest.context(SCRAPE_USAGE)?;
+    let keys = load_keys()?;
+    let scraper = match std::env::var_os("BAKEMONO_GALLERY_DL") {
+        Some(path) => Scraper::with_binary(path),
+        None => Scraper::new(),
+    };
+    let mut request = ScrapeRequest::new(creator, &dest);
+    request.cookies = cookies.or_else(cookies_from_env);
+    request.limit = limit;
+
+    eprintln!(
+        "using {}",
+        scraper.version().context("gallery-dl not found")?
+    );
+    let outcome = scraper.scrape(&request)?;
+    eprintln!(
+        "scraped {} files into {}",
+        outcome.files.len(),
+        outcome.dest.display()
+    );
+
+    build_and_publish(gather_pairs(&outcome.dest)?, &keys, &or_local(relays)).await
+}
+
+async fn ingest_and_publish(args: Vec<String>) -> Result<()> {
+    let mut dir = None;
+    let mut relays = Vec::new();
+
+    let mut it = args.into_iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--relay" => relays.push(value(&mut it, "--relay")?),
+            flag if flag.starts_with('-') => bail!("unknown flag {flag}"),
+            positional if dir.is_none() => dir = Some(PathBuf::from(positional)),
+            other => bail!("unexpected argument {other}"),
+        }
+    }
+
+    let dir = dir.context(INGEST_USAGE)?;
+    let keys = load_keys()?;
+    let pairs = gather_pairs(&dir)?;
+    eprintln!("found {} media files under {}", pairs.len(), dir.display());
+
+    build_and_publish(pairs, &keys, &or_local(relays)).await
+}
+
+async fn build_and_publish(
+    pairs: Vec<(PathBuf, PathBuf)>,
+    keys: &Keys,
+    relays: &[String],
+) -> Result<()> {
+    if pairs.is_empty() {
+        bail!("no media+sidecar pairs found");
+    }
+    let mut manifests = Vec::new();
+    for (media, sidecar) in &pairs {
+        match manifest_from_files(media, sidecar) {
+            Ok(manifest) => {
+                println!(
+                    "  {} {} {}:{} #{} ({} bytes)",
+                    manifest.file_hash,
+                    manifest.creator,
+                    manifest.platform,
+                    manifest.post_id,
+                    manifest.file_index,
+                    manifest.size
+                );
+                manifests.push(manifest);
+            }
+            Err(e) => eprintln!("  skip {}: {e:#}", media.display()),
+        }
+    }
+    if manifests.is_empty() {
+        bail!("no manifests built");
+    }
+
+    let ids = publish_manifests(relays, keys, &manifests).await?;
+    println!("published {} events to {}", ids.len(), relays.join(", "));
+    Ok(())
+}
+
+fn load_keys() -> Result<Keys> {
+    match std::env::var("BAKEMONO_NSEC") {
+        Ok(nsec) => Ok(Keys::parse(&nsec)?),
+        Err(_) => {
+            let keys = Keys::generate();
+            eprintln!("generated nsec {}", keys.secret_key().to_bech32()?);
+            Ok(keys)
+        }
+    }
+}
+
+fn cookies_from_env() -> Option<Cookies> {
+    if let Some(path) = std::env::var_os("BAKEMONO_COOKIES") {
+        Some(Cookies::File(PathBuf::from(path)))
+    } else {
+        std::env::var("BAKEMONO_COOKIES_BROWSER")
+            .ok()
+            .map(Cookies::Browser)
+    }
+}
+
+fn or_local(relays: Vec<String>) -> Vec<String> {
+    if relays.is_empty() {
+        vec!["ws://127.0.0.1:8080".to_string()]
+    } else {
+        relays
+    }
+}
+
+fn value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String> {
+    args.next()
+        .with_context(|| format!("{flag} expects a value"))
+}
+
+const SCRAPE_USAGE: &str =
+    "usage: bakemono-pipeline scrape <creator> <dest> [--relay URL] [--limit N] [--cookies FILE | --browser NAME]";
+const INGEST_USAGE: &str = "usage: bakemono-pipeline ingest <dir> [--relay URL]";
+const USAGE: &str = "usage: bakemono-pipeline <scrape|ingest> ...";

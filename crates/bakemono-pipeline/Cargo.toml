@@ -1,0 +1,20 @@
+[package]
+name = "bakemono-pipeline"
+description = "Wires the scraper to signed kind 31063 events and publishes them"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bakemono-core = { path = "../bakemono-core" }
+bakemono-scraper = { path = "../bakemono-scraper" }
+nostr-sdk.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+nostr-relay-builder.workspace = true
