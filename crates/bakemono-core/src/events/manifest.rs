@@ -1,0 +1,125 @@
+use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp};
+
+use crate::error::{Error, Result};
+use crate::protocol::KIND_MANIFEST;
+use crate::tags;
+use crate::validation::expect_kind;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Manifest {
+    pub platform: String,
+    pub creator: String,
+    pub creator_id: String,
+    pub post_id: String,
+    pub file_index: u32,
+    pub file_hash: String,
+    pub size: u64,
+    pub mime: String,
+    pub magnet: String,
+    pub filename: Option<String>,
+    pub post_title: Option<String>,
+    pub posted_at: Option<String>,
+    pub tier: Option<String>,
+    pub topics: Vec<String>,
+    pub thumb: Option<String>,
+    pub content: String,
+}
+
+impl Manifest {
+    pub fn d_tag(&self) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            self.platform, self.creator_id, self.post_id, self.file_index
+        )
+    }
+
+    pub fn to_event(&self, keys: &Keys) -> Result<Event> {
+        self.sign(keys, None)
+    }
+
+    pub fn to_event_at(&self, keys: &Keys, created_at: u64) -> Result<Event> {
+        self.sign(keys, Some(created_at))
+    }
+
+    pub fn from_event(event: &Event) -> Result<Self> {
+        expect_kind(event, KIND_MANIFEST)?;
+        let d = tags::require(event, tags::D)?;
+        Ok(Self {
+            platform: tags::require(event, tags::PLATFORM)?,
+            creator: tags::require(event, tags::CREATOR)?,
+            creator_id: tags::require(event, tags::CREATOR_ID)?,
+            post_id: tags::require(event, tags::POST_ID)?,
+            file_index: file_index_from_d(&d)?,
+            file_hash: tags::require(event, tags::X)?,
+            size: parse_u64(tags::SIZE, &tags::require(event, tags::SIZE)?)?,
+            mime: tags::require(event, tags::MIME)?,
+            magnet: tags::require(event, tags::MAGNET)?,
+            filename: tags::first(event, tags::FILENAME),
+            post_title: tags::first(event, tags::POST_TITLE),
+            posted_at: tags::first(event, tags::POSTED_AT),
+            tier: tags::first(event, tags::TIER),
+            topics: tags::all(event, tags::TOPIC),
+            thumb: tags::first(event, tags::THUMB),
+            content: event.content.clone(),
+        })
+    }
+
+    fn sign(&self, keys: &Keys, created_at: Option<u64>) -> Result<Event> {
+        let mut builder = EventBuilder::new(Kind::from(KIND_MANIFEST), self.content.as_str())
+            .tags(self.build_tags()?);
+        if let Some(ts) = created_at {
+            builder = builder.custom_created_at(Timestamp::from(ts));
+        }
+        builder
+            .sign_with_keys(keys)
+            .map_err(|e| Error::Build(e.to_string()))
+    }
+
+    fn build_tags(&self) -> Result<Vec<Tag>> {
+        let mut rows = vec![
+            vec![tags::D.to_string(), self.d_tag()],
+            vec![tags::X.to_string(), self.file_hash.clone()],
+            vec![tags::SIZE.to_string(), self.size.to_string()],
+            vec![tags::MIME.to_string(), self.mime.clone()],
+            vec![tags::MAGNET.to_string(), self.magnet.clone()],
+            vec![tags::PLATFORM.to_string(), self.platform.clone()],
+            vec![tags::CREATOR.to_string(), self.creator.clone()],
+            vec![tags::CREATOR_ID.to_string(), self.creator_id.clone()],
+            vec![tags::POST_ID.to_string(), self.post_id.clone()],
+        ];
+        push_opt(&mut rows, tags::FILENAME, &self.filename);
+        push_opt(&mut rows, tags::POST_TITLE, &self.post_title);
+        push_opt(&mut rows, tags::POSTED_AT, &self.posted_at);
+        push_opt(&mut rows, tags::TIER, &self.tier);
+        push_opt(&mut rows, tags::THUMB, &self.thumb);
+        for topic in &self.topics {
+            rows.push(vec![tags::TOPIC.to_string(), topic.clone()]);
+        }
+        rows.into_iter()
+            .map(|row| Tag::parse(row).map_err(|e| Error::Build(e.to_string())))
+            .collect()
+    }
+}
+
+fn push_opt(rows: &mut Vec<Vec<String>>, key: &str, value: &Option<String>) {
+    if let Some(v) = value {
+        rows.push(vec![key.to_string(), v.clone()]);
+    }
+}
+
+fn file_index_from_d(d: &str) -> Result<u32> {
+    d.rsplit(':')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| Error::MalformedTag {
+            tag: tags::D,
+            value: d.to_string(),
+        })
+}
+
+fn parse_u64(tag: &'static str, raw: &str) -> Result<u64> {
+    raw.parse().map_err(|_| Error::MalformedTag {
+        tag,
+        value: raw.to_string(),
+    })
+}
