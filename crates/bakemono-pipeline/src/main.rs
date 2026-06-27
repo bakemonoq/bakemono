@@ -186,8 +186,10 @@ fn key_file_path() -> PathBuf {
     if let Ok(p) = std::env::var("BAKEMONO_KEY_FILE") {
         return PathBuf::from(p);
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".config/bakemono/identity.nsec")
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("bakemono")
+        .join("identity.nsec")
 }
 
 fn save_key(path: &Path, nsec: &str) -> Result<()> {
