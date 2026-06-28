@@ -22,19 +22,31 @@ pub struct Seeder {
 }
 
 impl Seeder {
-    pub async fn start(node: &Path, script: &Path) -> Result<Self> {
-        let mut child = Command::new(node)
+    pub async fn start(
+        node: &Path,
+        script: &Path,
+        staging_root: &Path,
+        extra_env: &[(String, String)],
+    ) -> Result<Self> {
+        let mut command = Command::new(node);
+        command
             .arg(script)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        let mut child = command
             .spawn()
             .with_context(|| format!("spawning {} {}", node.display(), script.display()))?;
         let stdin = child.stdin.take().context("sidecar stdin missing")?;
         let stdout = child.stdout.take().context("sidecar stdout missing")?;
         let lines = BufReader::new(stdout).lines();
 
-        let staging = std::env::temp_dir().join(format!("bakemono-seed-{}", std::process::id()));
+        // staging persists and is reused across runs: a file already linked here is skipped,
+        // so launches cost O(new files), not O(all files), and there is nothing to sweep
+        let staging = staging_root.to_path_buf();
         std::fs::create_dir_all(&staging)
             .with_context(|| format!("creating staging dir {}", staging.display()))?;
 
@@ -49,10 +61,21 @@ impl Seeder {
     }
 
     pub async fn from_env() -> Result<Self> {
+        Self::from_env_with(&[], None).await
+    }
+
+    // extra_env is set on the sidecar (e.g. BAKEMONO_TRACKERS/BAKEMONO_STUN from app config);
+    // staging_root should sit on the same volume as the source files so hardlinks never fall back to copy
+    pub async fn from_env_with(
+        extra_env: &[(String, String)],
+        staging_root: Option<&Path>,
+    ) -> Result<Self> {
         let node = std::env::var("BAKEMONO_NODE").unwrap_or_else(|_| "node".to_string());
         let script = std::env::var("BAKEMONO_WEBTORRENT")
             .unwrap_or_else(|_| "sidecars/webtorrent/seed.mjs".to_string());
-        Self::start(Path::new(&node), Path::new(&script)).await
+        let default_root = std::env::temp_dir();
+        let staging_root = staging_root.unwrap_or(&default_root);
+        Self::start(Path::new(&node), Path::new(&script), staging_root, extra_env).await
     }
 
     // webtorrent mis-hashes pieces when the source path has odd chars, so seed a sanitized hardlink
@@ -86,17 +109,33 @@ impl Seeder {
             .wait()
             .await
             .context("waiting for sidecar exit")?;
-        let _ = std::fs::remove_dir_all(&self.staging);
+        // staging is intentionally left in place; it is reused by the next run
         Ok(())
+    }
+
+    // drop staged links whose source is no longer present, so deleted files stop pinning disk;
+    // one directory listing, no content reads, removes only dead entries
+    pub fn retain_staging(&self, live_sources: &[PathBuf]) {
+        let keep: std::collections::HashSet<String> = live_sources
+            .iter()
+            .filter_map(|p| p.canonicalize().ok())
+            .map(|p| staging_key(&p))
+            .collect();
+        let Ok(entries) = std::fs::read_dir(&self.staging) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if !keep.contains(entry.file_name().to_string_lossy().as_ref()) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
     }
 
     fn stage(&self, file: &Path) -> Result<PathBuf> {
         let src = file
             .canonicalize()
             .with_context(|| format!("resolving {}", file.display()))?;
-        let mut hasher = DefaultHasher::new();
-        src.to_string_lossy().hash(&mut hasher);
-        let dir = self.staging.join(format!("{:016x}", hasher.finish()));
+        let dir = self.staging.join(staging_key(&src));
         std::fs::create_dir_all(&dir)?;
         let staged = dir.join(safe_filename(&src));
         if !staged.exists() && std::fs::hard_link(&src, &staged).is_err() {
@@ -139,6 +178,12 @@ impl Seeder {
 
 fn str_field<'a>(event: &'a Value, key: &str) -> Option<&'a str> {
     event.get(key).and_then(Value::as_str)
+}
+
+fn staging_key(canonical_src: &Path) -> String {
+    let mut hasher = DefaultHasher::new();
+    canonical_src.to_string_lossy().hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 fn safe_filename(src: &Path) -> String {

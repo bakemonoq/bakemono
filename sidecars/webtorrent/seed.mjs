@@ -28,6 +28,11 @@ if (isolate) {
 }
 const client = new WebTorrent(opts)
 
+// when the parent dies the pipe breaks; exit quietly instead of throwing an unhandled EPIPE
+process.stdout.on('error', (err) => {
+  if (err?.code === 'EPIPE') process.exit(0)
+})
+
 function send(message) {
   process.stdout.write(JSON.stringify(message) + '\n')
 }
