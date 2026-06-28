@@ -157,6 +157,7 @@ header { border-bottom: 1px solid #8884; margin-bottom: 1rem; padding-bottom: .5
 .list { list-style: none; padding: 0 }
 .list li { padding: .35rem 0; border-bottom: 1px solid #8882 }
 .muted { color: #8888 }
+.error { color: #e4564a }
 .body { margin: 1rem 0 }
 .file { margin: 1rem 0; padding: .5rem; border: 1px solid #8884; border-radius: 6px }
 .file img, .file video { max-width: 100%; display: block; margin-top: .5rem }
@@ -180,8 +181,21 @@ for (const el of document.querySelectorAll('.file')) {
   }
   status.textContent = 'connecting...'
   const torrent = client.add(el.dataset.magnet)
+  // tracker complete/incomplete counts include us and 20-min ghost peers, so they lie; numPeers is
+  // the only honest 'a seeder is actually reachable' signal, and metadata never arrives without one
+  let deadline = Date.now() + 30000
   const tick = setInterval(() => {
-    status.textContent = torrent.numPeers > 0 ? ('downloading ' + Math.round(torrent.progress * 100) + '%') : 'connecting...'
+    if (torrent.numPeers > 0) {
+      deadline = Date.now() + 30000
+      status.className = 'muted'
+      status.textContent = 'downloading ' + Math.round(torrent.progress * 100) + '%'
+    } else if (Date.now() > deadline) {
+      status.className = 'error'
+      status.textContent = 'no seeders online - nobody is sharing this file right now'
+    } else {
+      status.className = 'muted'
+      status.textContent = 'connecting...'
+    }
   }, 500)
   torrent.on('ready', () => {
     for (const file of torrent.files) {
