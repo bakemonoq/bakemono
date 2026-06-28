@@ -39,6 +39,10 @@ impl SeederHandle {
         }
     }
 
+    pub async fn is_started(&self) -> bool {
+        self.inner.lock().await.is_some()
+    }
+
     pub async fn shutdown(&self) {
         if let Some(seeder) = self.inner.lock().await.take() {
             seeder.shutdown().await.ok();

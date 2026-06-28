@@ -4,14 +4,15 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use nostr_relay_builder::MockRelay;
 use nostr_sdk::prelude::*;
-use tokio_util::sync::CancellationToken;
+use serde_json::{json, Value};
 
 use bakemono_app::core::identity::Identity;
-use bakemono_app::core::pipeline::{reseed, run_ingest, run_scrape, JobContext, Progress, RunSummary};
-use bakemono_app::core::seeder::SeederHandle;
+use bakemono_app::core::pipeline::{Progress, RunSummary};
+use bakemono_app::core::source::AppContentSource;
 use bakemono_core::protocol::KIND_MANIFEST;
 use bakemono_core::Manifest;
-use bakemono_scraper::{Cookies, ScrapeRequest};
+use bakemono_daemon::config::AppConfig;
+use bakemono_daemon::daemon::Daemon;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -22,15 +23,21 @@ async fn main() -> Result<()> {
         std::env::set_var("BAKEMONO_ISOLATE", "1");
     }
 
+    let mut config = AppConfig::default();
+    config.seed = opts.seed;
+    if !opts.trackers.is_empty() {
+        config.trackers = opts.trackers.clone();
+    }
+
     // reseed exercises the launch path (seed from disk + prune orphaned staging), no relay needed
     if let Mode::Reseed { dir } = &opts.mode {
-        let seeder = SeederHandle::new();
-        seeder
-            .ensure_started(&opts.trackers, &[])
-            .await
-            .context("starting seeder")?;
-        let count = reseed(&seeder, dir).await;
-        seeder.shutdown().await;
+        let source = AppContentSource {
+            relays: Vec::new(),
+            identity: Identity::generate(),
+        };
+        let daemon = Daemon::new(config, dir.clone(), source);
+        let count = daemon.reseed().await?;
+        daemon.shutdown().await;
         println!("reseeded {count} file(s) from {}", dir.display());
         return Ok(());
     }
@@ -42,8 +49,21 @@ async fn main() -> Result<()> {
     let identity = Identity::generate();
     eprintln!("identity {}", identity.npub()?);
 
-    let relays = vec![url.clone()];
-    let summary = run(&opts, &relays, &identity).await?;
+    let source = AppContentSource {
+        relays: vec![url.clone()],
+        identity,
+    };
+    let (content_dir, job) = job_from_mode(&opts.mode);
+    let daemon = Daemon::new(config, content_dir, source);
+
+    let progress = |event: Value| {
+        if let Ok(p) = serde_json::from_value::<Progress>(event) {
+            println!("  {}", render(&p));
+        }
+    };
+    let result = daemon.run_job(job, &progress).await;
+    daemon.shutdown().await;
+    let summary: RunSummary = serde_json::from_value(result?)?;
 
     verify(&url, &summary).await?;
     println!(
@@ -53,35 +73,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run(opts: &Opts, relays: &[String], identity: &Identity) -> Result<RunSummary> {
-    let progress = |p: Progress| println!("  {}", render(&p));
-    let cancel = CancellationToken::new();
-    let seeder = if opts.seed {
-        let handle = SeederHandle::new();
-        // mirrors the GUI: --tracker stands in for config; a launch-time env var still wins
-        handle
-            .ensure_started(&opts.trackers, &[])
-            .await
-            .context("starting seeder")?;
-        Some(handle)
-    } else {
-        None
-    };
-
-    let ctx = JobContext {
-        relays,
-        identity,
-        seeder: seeder.as_ref(),
-        cancel: &cancel,
-        progress: &progress,
-    };
-
-    let result = match &opts.mode {
-        Mode::Reseed { .. } => unreachable!("reseed is handled before run()"),
-        Mode::Ingest { dir } => {
-            eprintln!("ingesting {}", dir.display());
-            run_ingest(dir, &ctx).await
-        }
+fn job_from_mode(mode: &Mode) -> (PathBuf, Value) {
+    match mode {
+        Mode::Reseed { .. } => unreachable!("reseed is handled before this"),
+        Mode::Ingest { dir } => (
+            dir.clone(),
+            json!({"kind": "ingest", "dir": dir.to_string_lossy()}),
+        ),
         Mode::Scrape {
             creator,
             limit,
@@ -91,17 +89,16 @@ async fn run(opts: &Opts, relays: &[String], identity: &Identity) -> Result<RunS
             let dest = dest
                 .clone()
                 .unwrap_or_else(|| std::env::temp_dir().join("bakemono-scrapetest"));
-            let mut request = ScrapeRequest::new(creator.clone(), &dest);
-            request.cookies = cookies.clone().map(Cookies::File);
-            eprintln!("scraping {creator} into {}", dest.display());
-            run_scrape(request, limit.map(|n| n as usize), &ctx).await
+            let job = json!({
+                "kind": "scrape",
+                "creator": creator,
+                "limit": limit,
+                "cookies": cookies.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                "dest": dest.to_string_lossy(),
+            });
+            (dest, job)
         }
-    };
-
-    if let Some(seeder) = &seeder {
-        seeder.shutdown().await;
     }
-    result
 }
 
 async fn verify(url: &str, summary: &RunSummary) -> Result<()> {

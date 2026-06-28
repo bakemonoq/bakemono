@@ -12,6 +12,12 @@ pub struct AppConfig {
     pub stun: Vec<String>,
     pub seed: bool,
     pub max_up_mbit: u32,
+    // 0 = unlimited; download cap matters mainly for farm nodes fetching content
+    #[serde(default)]
+    pub max_down_mbit: u32,
+    // default false: closing the desktop app leaves the daemon seeding in the background
+    #[serde(default)]
+    pub stop_daemon_on_exit: bool,
 }
 
 impl Default for AppConfig {
@@ -22,6 +28,8 @@ impl Default for AppConfig {
             stun: default_stun(),
             seed: true,
             max_up_mbit: 20,
+            max_down_mbit: 0,
+            stop_daemon_on_exit: false,
         }
     }
 }

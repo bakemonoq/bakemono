@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use nostr_sdk::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use bakemono_core::Manifest;
@@ -22,7 +22,7 @@ pub struct JobContext<'a> {
     pub progress: ProgressFn<'a>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "stage", rename_all = "snake_case")]
 pub enum Progress {
     Scraping { creator: String, dest: String },
@@ -61,14 +61,14 @@ pub enum Progress {
     },
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunSummary {
     pub manifests: Vec<ManifestSummary>,
     pub event_ids: Vec<String>,
     pub relays: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestSummary {
     pub d_tag: String,
     pub file_hash: String,

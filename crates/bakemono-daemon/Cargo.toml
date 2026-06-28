@@ -10,6 +10,7 @@ repository.workspace = true
 bakemono-core = { path = "../bakemono-core" }
 bakemono-seeder = { path = "../bakemono-seeder" }
 tokio = { workspace = true, features = ["sync"] }
+tokio-util.workspace = true
 anyhow.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
