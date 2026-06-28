@@ -1,5 +1,5 @@
 # image-only: copy just this file to the mac-mini, no source needed.
-# build + push from a machine that has the source (see README), then `docker compose -f docker-compose.deploy.yml up -d`
+# build + push from a machine that has the source (see deploy.sh), then `docker compose -f docker-compose.deploy.yml up -d`
 services:
   postgres:
     image: postgres:16
@@ -8,6 +8,14 @@ services:
       POSTGRES_DB: bakemono
     volumes:
       - bakemono-pg:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  relay:
+    image: scsibug/nostr-rs-relay:latest
+    ports:
+      - "8080:8080"
+    volumes:
+      - bakemono-relay:/usr/src/app/db
     restart: unless-stopped
 
   board:
@@ -21,7 +29,9 @@ services:
       - "3000:3000"
     depends_on:
       - postgres
+      - relay
     restart: unless-stopped
 
 volumes:
   bakemono-pg:
+  bakemono-relay:

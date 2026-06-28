@@ -8,6 +8,14 @@ services:
       - bakemono-pg:/var/lib/postgresql/data
     restart: unless-stopped
 
+  relay:
+    image: scsibug/nostr-rs-relay:latest
+    ports:
+      - "8080:8080"
+    volumes:
+      - bakemono-relay:/usr/src/app/db
+    restart: unless-stopped
+
   board:
     image: ${BOARD_IMAGE:-bakemono-board:latest}
     build:
@@ -20,7 +28,9 @@ services:
       - "3000:3000"
     depends_on:
       - postgres
+      - relay
     restart: unless-stopped
 
 volumes:
   bakemono-pg:
+  bakemono-relay:
