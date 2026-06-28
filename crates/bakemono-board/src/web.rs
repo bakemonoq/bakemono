@@ -178,11 +178,11 @@ for (const el of document.querySelectorAll('.file')) {
     status.textContent = 'open this board over https or via http://localhost (a LAN IP over http has no Web Crypto)'
     continue
   }
-  status.textContent = 'connecting to swarm...'
+  status.textContent = 'connecting...'
   const torrent = client.add(el.dataset.magnet)
   const tick = setInterval(() => {
-    status.textContent = `peers: ${torrent.numPeers} | ${Math.round(torrent.progress * 100)}%`
-  }, 1000)
+    status.textContent = torrent.numPeers > 0 ? ('downloading ' + Math.round(torrent.progress * 100) + '%') : 'connecting...'
+  }, 500)
   torrent.on('ready', () => {
     for (const file of torrent.files) {
       file.blob().then((blob) => {
@@ -194,6 +194,6 @@ for (const el of document.querySelectorAll('.file')) {
       }).catch((err) => { status.textContent = 'error: ' + err.message })
     }
   })
-  torrent.on('done', () => { clearInterval(tick); status.textContent = 'loaded (' + torrent.numPeers + ' peers)' })
+  torrent.on('done', () => { clearInterval(tick); status.remove() })
 }
 ";
