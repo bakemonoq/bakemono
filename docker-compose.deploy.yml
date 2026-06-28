@@ -1,0 +1,27 @@
+# image-only: copy just this file to the mac-mini, no source needed.
+# build + push from a machine that has the source (see README), then `docker compose -f docker-compose.deploy.yml up -d`
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: bakemono
+    volumes:
+      - bakemono-pg:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  board:
+    image: ${BOARD_IMAGE:-localhost:5050/bakemono-board:latest}
+    pull_policy: always
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bakemono?sslmode=disable
+      BAKEMONO_RELAYS: ${BAKEMONO_RELAYS:-ws://relay:8080}
+      BAKEMONO_ICE_SERVERS: ${BAKEMONO_ICE_SERVERS:-[]}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+volumes:
+  bakemono-pg:
