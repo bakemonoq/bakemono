@@ -1,9 +1,11 @@
+pub mod defaults;
 pub mod error;
 pub mod events;
 pub mod protocol;
 pub mod tags;
 pub mod validation;
 
+pub use defaults::{default_relays, default_stun, default_trackers};
 pub use error::{Error, Result};
 pub use events::manifest::Manifest;
 pub use events::takedown::{Takedown, Target};

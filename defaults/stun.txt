@@ -1,0 +1,4 @@
+# STUN servers used for WebRTC NAT traversal (public IP discovery + hole punching).
+# One STUN URL per line. Blank lines and lines starting with # are ignored.
+# To add a server: open a PR adding one stun: URL on its own line.
+stun:stun.l.google.com:19302

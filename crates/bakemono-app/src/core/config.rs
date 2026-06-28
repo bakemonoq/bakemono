@@ -3,23 +3,6 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-// our local relay first for the dev/demo loop, then the public set baked in per MVP
-pub const DEFAULT_RELAYS: &[&str] = &[
-    "ws://127.0.0.1:8080",
-    "wss://relay.damus.io",
-    "wss://nos.lol",
-    "wss://relay.snort.social",
-    "wss://nostr.wine",
-];
-
-pub const DEFAULT_TRACKERS: &[&str] = &[
-    "wss://tracker.openwebtorrent.com",
-    "wss://tracker.webtorrent.dev",
-    "udp://tracker.opentrackr.org:1337/announce",
-];
-
-pub const DEFAULT_STUN: &[&str] = &["stun:stun.l.google.com:19302"];
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub relays: Vec<String>,
@@ -34,7 +17,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            relays: DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect(),
+            relays: default_relays(),
             trackers: default_trackers(),
             stun: default_stun(),
             seed: true,
@@ -43,12 +26,19 @@ impl Default for AppConfig {
     }
 }
 
+// our local relay first for the dev/demo loop, then the shared public set
+fn default_relays() -> Vec<String> {
+    std::iter::once("ws://127.0.0.1:8080".to_string())
+        .chain(bakemono_core::default_relays())
+        .collect()
+}
+
 fn default_trackers() -> Vec<String> {
-    DEFAULT_TRACKERS.iter().map(|s| s.to_string()).collect()
+    bakemono_core::default_trackers()
 }
 
 fn default_stun() -> Vec<String> {
-    DEFAULT_STUN.iter().map(|s| s.to_string()).collect()
+    bakemono_core::default_stun()
 }
 
 impl AppConfig {

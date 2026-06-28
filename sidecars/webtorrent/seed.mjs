@@ -1,17 +1,30 @@
 import WebTorrent from 'webtorrent'
 import readline from 'node:readline'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 
 // announce list; override with BAKEMONO_TRACKERS (comma-separated) to use your own tracker
-const DEFAULT_TRACKERS = [
-  'wss://tracker.openwebtorrent.com',
-  'wss://tracker.webtorrent.dev',
-  'udp://tracker.opentrackr.org:1337/announce',
-]
 const OVERRIDE = (process.env.BAKEMONO_TRACKERS ?? '')
   .split(',')
   .map((t) => t.trim())
   .filter(Boolean)
-const TRACKERS = OVERRIDE.length > 0 ? OVERRIDE : DEFAULT_TRACKERS
+const TRACKERS = OVERRIDE.length > 0 ? OVERRIDE : defaultTrackers()
+if (TRACKERS.length === 0) {
+  console.error('warning: no trackers (BAKEMONO_TRACKERS unset and defaults/trackers.txt unreadable); swarm will be DHT-only')
+}
+
+// standalone fallback: read the shared list at /defaults/trackers.txt (the rust daemon sets the env)
+function defaultTrackers() {
+  try {
+    const path = fileURLToPath(new URL('../../defaults/trackers.txt', import.meta.url))
+    return readFileSync(path, 'utf8')
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith('#'))
+  } catch {
+    return []
+  }
+}
 
 // BAKEMONO_ISOLATE=1 turns off DHT/LSD so only our own tracker forms the swarm (avoids VPN/foreign peers)
 const isolate = process.env.BAKEMONO_ISOLATE === '1'
