@@ -108,9 +108,15 @@ async fn post_page(
                     p.muted { (f.filename.clone().unwrap_or_else(|| f.file_hash.clone())) " - " (f.size) " bytes" }
                 }
             }
+            script { (PreEscaped(format!("window.__bakemonoIce = {};", ice_servers_json()))) }
             script type="module" { (PreEscaped(PLAYER_JS)) }
         },
     )
+}
+
+// BAKEMONO_ICE_SERVERS is a JSON array of RTCIceServer objects, default none (host-only)
+fn ice_servers_json() -> String {
+    std::env::var("BAKEMONO_ICE_SERVERS").unwrap_or_else(|_| "[]".to_string())
 }
 
 async fn webtorrent_js() -> impl IntoResponse {
@@ -161,7 +167,9 @@ const PLAYER_JS: &str = "
 import WebTorrent from '/webtorrent.min.js'
 // WebTorrent needs Web Crypto, which only exists in a secure context (https or http://localhost)
 const secure = window.isSecureContext
-const client = secure ? new WebTorrent() : null
+// iceServers from the board config (empty = host-only, fast on a LAN; set STUN/TURN for the internet)
+const iceServers = window.__bakemonoIce || []
+const client = secure ? new WebTorrent({ tracker: { rtcConfig: { iceServers } } }) : null
 for (const el of document.querySelectorAll('.file')) {
   const status = document.createElement('p')
   status.className = 'muted'

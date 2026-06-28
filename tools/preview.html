@@ -42,7 +42,8 @@
       throw new Error('insecure context')
     }
 
-    const client = new WebTorrent()
+    // empty iceServers = host candidates only, no STUN round-trips (fast on a LAN)
+    const client = new WebTorrent({ tracker: { rtcConfig: { iceServers: [] } } })
     client.on('error', (e) => status('client error: ' + e.message))
 
     const go = document.getElementById('go')
