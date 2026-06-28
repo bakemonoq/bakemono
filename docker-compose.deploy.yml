@@ -13,7 +13,7 @@ services:
   relay:
     image: scsibug/nostr-rs-relay:latest
     ports:
-      - "8080:8080"
+      - "${RELAY_PORT:-8080}:8080"
     volumes:
       - bakemono-relay:/usr/src/app/db
     restart: unless-stopped
