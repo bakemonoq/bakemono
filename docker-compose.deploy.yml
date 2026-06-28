@@ -18,6 +18,13 @@ services:
       - bakemono-relay:/usr/src/app/db
     restart: unless-stopped
 
+  tracker:
+    image: ${TRACKER_IMAGE:-localhost:5050/bakemono-tracker:latest}
+    pull_policy: always
+    ports:
+      - "${TRACKER_PORT:-9100}:8000"
+    restart: unless-stopped
+
   board:
     image: ${BOARD_IMAGE:-localhost:5050/bakemono-board:latest}
     pull_policy: always

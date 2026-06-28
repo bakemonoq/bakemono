@@ -16,6 +16,15 @@ services:
       - bakemono-relay:/usr/src/app/db
     restart: unless-stopped
 
+  tracker:
+    image: ${TRACKER_IMAGE:-bakemono-tracker:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile.tracker
+    ports:
+      - "${TRACKER_PORT:-9100}:8000"
+    restart: unless-stopped
+
   board:
     image: ${BOARD_IMAGE:-bakemono-board:latest}
     build:
