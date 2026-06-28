@@ -15,7 +15,18 @@ const TRACKERS = OVERRIDE.length > 0 ? OVERRIDE : DEFAULT_TRACKERS
 
 // BAKEMONO_ISOLATE=1 turns off DHT/LSD so only our own tracker forms the swarm (avoids VPN/foreign peers)
 const isolate = process.env.BAKEMONO_ISOLATE === '1'
-const client = new WebTorrent(isolate ? { dht: false, lsd: false } : {})
+// BAKEMONO_RTC_BIND pins WebRTC to one interface so we don't advertise VPN addresses to browsers
+const rtcConfig = {}
+if (process.env.BAKEMONO_RTC_BIND) rtcConfig.bindAddress = process.env.BAKEMONO_RTC_BIND
+if (process.env.BAKEMONO_STUN) {
+  rtcConfig.iceServers = process.env.BAKEMONO_STUN.split(',').map((urls) => ({ urls: urls.trim() }))
+}
+const opts = { tracker: { rtcConfig } }
+if (isolate) {
+  opts.dht = false
+  opts.lsd = false
+}
+const client = new WebTorrent(opts)
 
 function send(message) {
   process.stdout.write(JSON.stringify(message) + '\n')
