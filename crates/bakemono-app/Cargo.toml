@@ -1,0 +1,49 @@
+[package]
+name = "bakemono-app"
+description = "Cross-platform desktop client: scrape, seed, sign and publish kind 31063 events"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+default-run = "bakemono-app"
+
+[lib]
+name = "bakemono_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bakemono-app"
+path = "src/main.rs"
+
+[[bin]]
+name = "scrapetest"
+path = "src/bin/scrapetest.rs"
+required-features = ["harness"]
+
+[dependencies]
+bakemono-core = { path = "../bakemono-core" }
+bakemono-scraper = { path = "../bakemono-scraper" }
+bakemono-seeder = { path = "../bakemono-seeder" }
+nostr-sdk.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+serde = { version = "1", features = ["derive"] }
+dirs.workspace = true
+sha2.workspace = true
+hex.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+tauri = { version = "2", optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+tracing-appender = { workspace = true, optional = true }
+nostr-relay-builder = { workspace = true, optional = true }
+
+[build-dependencies]
+tauri-build = "2"
+
+[features]
+default = ["gui"]
+gui = ["dep:tauri", "dep:tracing-subscriber", "dep:tracing-appender"]
+harness = ["dep:nostr-relay-builder"]

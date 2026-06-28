@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>化け物 bakemono</title>
+  <style>
+    :root { color-scheme: light dark }
+    body { font-family: system-ui, sans-serif; max-width: 760px; margin: 1.5rem auto; padding: 0 1rem; line-height: 1.4 }
+    h1 { font-size: 1.4rem; margin: 0 0 1rem }
+    section { border: 1px solid #8884; border-radius: 8px; padding: 1rem; margin-bottom: 1rem }
+    h2 { font-size: 1rem; margin: 0 0 .6rem }
+    label { display: block; font-size: .85rem; margin: .4rem 0 .15rem; opacity: .8 }
+    input, textarea { width: 100%; padding: .45rem; font-family: monospace; box-sizing: border-box }
+    textarea { height: 6rem; resize: vertical }
+    button { padding: .45rem .9rem; margin: .5rem .4rem 0 0; cursor: pointer }
+    .row { display: flex; gap: .6rem; flex-wrap: wrap; align-items: flex-end }
+    .row > div { flex: 1; min-width: 8rem }
+    code { font-family: monospace; word-break: break-all }
+    #npub { font-family: monospace; word-break: break-all; opacity: .9 }
+    #log { background: #0001; border-radius: 6px; padding: .6rem; height: 16rem; overflow: auto; white-space: pre-wrap; font-family: monospace; font-size: .8rem }
+    summary { cursor: pointer; font-weight: 600 }
+    .hint { font-size: .8rem; opacity: .6; margin: .3rem 0 }
+  </style>
+</head>
+<body>
+  <h1>Bakemono</h1>
+
+  <section>
+    <h2>Sharing</h2>
+    <div id="stats">loading...</div>
+  </section>
+
+  <section>
+    <h2>Locations</h2>
+    <div id="paths">loading...</div>
+  </section>
+
+  <section>
+    <h2>Identity</h2>
+    <div id="npub">loading...</div>
+    <button id="gen">Generate new</button>
+    <button id="imp">Import nsec</button>
+    <button id="exp">Export nsec</button>
+  </section>
+
+  <section>
+    <details>
+      <summary>Advanced settings</summary>
+      <p class="hint">defaults are shipped; most users never need to change these</p>
+      <label>relays (one per line)</label>
+      <textarea id="relays"></textarea>
+      <label>trackers (one per line)</label>
+      <textarea id="trackers"></textarea>
+      <label>STUN servers (one per line)</label>
+      <textarea id="stun"></textarea>
+      <button id="saveSettings">Save</button>
+      <p class="hint">tracker and STUN changes take effect after restarting the app</p>
+    </details>
+  </section>
+
+  <section>
+    <h2>Scrape a creator</h2>
+    <div class="row">
+      <div>
+        <label>creator (vanity or URL)</label>
+        <input id="creator" placeholder="bonifasko">
+      </div>
+      <div>
+        <label>max posts</label>
+        <input id="limit" type="number" min="1" placeholder="5">
+      </div>
+    </div>
+    <label>Patreon login</label>
+    <select id="browser">
+      <option value="">cookies file below</option>
+      <option value="firefox">logged in via Firefox</option>
+      <option value="chrome">logged in via Chrome</option>
+      <option value="chromium">logged in via Chromium</option>
+      <option value="brave">logged in via Brave</option>
+      <option value="edge">logged in via Edge</option>
+      <option value="safari">logged in via Safari</option>
+    </select>
+    <input id="cookies" placeholder="or absolute path to cookies.txt">
+    <button id="scrape">Scrape and Share</button>
+  </section>
+
+  <section>
+    <h2>Activity <span id="status"></span></h2>
+    <button id="stop" disabled>Stop</button>
+    <div id="log"></div>
+  </section>
+
+  <script src="main.js"></script>
+</body>
+</html>
