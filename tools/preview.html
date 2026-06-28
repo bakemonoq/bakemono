@@ -36,6 +36,12 @@
     }
     if (!WebTorrent) throw new Error('webtorrent unavailable')
 
+    // WebTorrent needs Web Crypto, which only exists in a secure context (https or http://localhost)
+    if (!window.isSecureContext) {
+      status('open this page over https or via http://localhost - a LAN IP over http has no Web Crypto, which WebTorrent needs')
+      throw new Error('insecure context')
+    }
+
     const client = new WebTorrent()
     client.on('error', (e) => status('client error: ' + e.message))
 

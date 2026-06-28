@@ -159,12 +159,18 @@ a { color: #4488ff }
 
 const PLAYER_JS: &str = "
 import WebTorrent from '/webtorrent.min.js'
-const client = new WebTorrent()
+// WebTorrent needs Web Crypto, which only exists in a secure context (https or http://localhost)
+const secure = window.isSecureContext
+const client = secure ? new WebTorrent() : null
 for (const el of document.querySelectorAll('.file')) {
   const status = document.createElement('p')
   status.className = 'muted'
-  status.textContent = 'connecting to swarm...'
   el.appendChild(status)
+  if (!secure) {
+    status.textContent = 'open this board over https or via http://localhost (a LAN IP over http has no Web Crypto)'
+    continue
+  }
+  status.textContent = 'connecting to swarm...'
   const torrent = client.add(el.dataset.magnet)
   const tick = setInterval(() => {
     status.textContent = `peers: ${torrent.numPeers} | ${Math.round(torrent.progress * 100)}%`
