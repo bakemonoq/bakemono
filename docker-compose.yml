@@ -1,0 +1,26 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: bakemono
+    volumes:
+      - bakemono-pg:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  board:
+    image: ${BOARD_IMAGE:-bakemono-board:latest}
+    build:
+      context: .
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bakemono?sslmode=disable
+      BAKEMONO_RELAYS: ${BAKEMONO_RELAYS:-ws://relay:8080}
+      BAKEMONO_ICE_SERVERS: ${BAKEMONO_ICE_SERVERS:-[]}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+volumes:
+  bakemono-pg:

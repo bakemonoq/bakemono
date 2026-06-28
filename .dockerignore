@@ -1,0 +1,11 @@
+target/
+**/node_modules/
+.git/
+out/
+scrape/
+bk-dl/
+*.nsec
+*cookies*.txt
+nostr.db*
+tools/webtorrent.min.js
+.idea/
