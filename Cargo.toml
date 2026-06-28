@@ -22,3 +22,7 @@ dirs = "6"
 axum = "0.8"
 maud = "0.27"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "macros"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tracing-appender = "0.2"

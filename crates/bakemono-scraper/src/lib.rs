@@ -1,8 +1,11 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone)]
 pub struct ScrapeRequest {
@@ -103,6 +106,81 @@ impl Scraper {
         })
     }
 
+    // streams each downloaded media path as gallery-dl prints it; killable mid-run via the token
+    pub async fn scrape_streaming<F>(
+        &self,
+        request: &ScrapeRequest,
+        cancel: CancellationToken,
+        mut on_file: F,
+    ) -> Result<ScrapeOutcome, Error>
+    where
+        F: FnMut(PathBuf),
+    {
+        std::fs::create_dir_all(&request.dest).map_err(|source| Error::Io {
+            path: request.dest.clone(),
+            source,
+        })?;
+        let args = build_args(request);
+        tracing::info!(binary = %self.binary.to_string_lossy(), ?args, "running gallery-dl");
+
+        let mut child = tokio::process::Command::new(&self.binary)
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|source| Error::Spawn {
+                binary: self.binary.to_string_lossy().into_owned(),
+                source,
+            })?;
+
+        let stdout = child.stdout.take().expect("child stdout");
+        let stderr = child.stderr.take().expect("child stderr");
+        let stderr_tail = Arc::new(Mutex::new(Vec::<String>::new()));
+        let stderr_task = tokio::spawn(drain_stderr(stderr, stderr_tail.clone()));
+        let mut lines = BufReader::new(stdout).lines();
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    let _ = child.start_kill();
+                    tracing::info!("scrape cancelled, killing gallery-dl");
+                    break;
+                }
+                next = lines.next_line() => match next {
+                    Ok(Some(line)) => {
+                        // gallery-dl prints downloaded paths plainly and already-present ones as "# path"
+                        let line = line.trim();
+                        let line = line.strip_prefix("# ").unwrap_or(line);
+                        let path = PathBuf::from(line);
+                        if path.is_file() {
+                            on_file(path);
+                        }
+                    }
+                    _ => break,
+                },
+            }
+        }
+
+        let status = child.wait().await.map_err(|source| Error::Spawn {
+            binary: self.binary.to_string_lossy().into_owned(),
+            source,
+        })?;
+        let _ = stderr_task.await;
+        // a kill we asked for is not a failure; anything else with a bad status is
+        if !cancel.is_cancelled() && !status.success() {
+            let tail = stderr_tail.lock().expect("stderr tail").join("\n");
+            return Err(Error::Failed {
+                status: status_label(&status),
+                stderr: tail,
+            });
+        }
+        Ok(ScrapeOutcome {
+            creator: creator_name(&request.creator),
+            dest: request.dest.clone(),
+            files: collect_files(&request.dest)?,
+        })
+    }
+
     fn run(&self, args: &[String]) -> Result<Vec<u8>, Error> {
         let output = Command::new(&self.binary)
             .args(args)
@@ -196,6 +274,23 @@ fn collect_into(dir: &Path, files: &mut Vec<ScrapedFile>) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+async fn drain_stderr(stderr: tokio::process::ChildStderr, tail: Arc<Mutex<Vec<String>>>) {
+    let mut lines = BufReader::new(stderr).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        tracing::debug!(target: "gallery_dl", "{line}");
+        let mut tail = tail.lock().expect("stderr tail");
+        tail.push(line.to_string());
+        let overflow = tail.len().saturating_sub(20);
+        if overflow > 0 {
+            tail.drain(0..overflow);
+        }
+    }
 }
 
 fn status_label(status: &ExitStatus) -> String {
