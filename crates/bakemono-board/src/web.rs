@@ -177,14 +177,13 @@ for (const el of document.querySelectorAll('.file')) {
   }, 1000)
   torrent.on('ready', () => {
     for (const file of torrent.files) {
-      file.getBlobURL((err, url) => {
-        if (err) { status.textContent = 'error: ' + err.message; return }
+      file.blob().then((blob) => {
         const isVideo = /\\.(mp4|webm|mov)$/i.test(file.name)
         const node = document.createElement(isVideo ? 'video' : 'img')
         if (isVideo) node.controls = true
-        node.src = url
+        node.src = URL.createObjectURL(blob)
         el.appendChild(node)
-      })
+      }).catch((err) => { status.textContent = 'error: ' + err.message })
     }
   })
   torrent.on('done', () => { clearInterval(tick); status.textContent = 'loaded (' + torrent.numPeers + ' peers)' })

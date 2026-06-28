@@ -64,14 +64,13 @@
 
       const render = () => {
         for (const file of torrent.files) {
-          file.getBlobURL((err, url) => {
-            if (err) return warn('blob error: ' + err.message)
+          file.blob().then((blob) => {
             const isVideo = /\.(mp4|webm|mov)$/i.test(file.name)
             const el = document.createElement(isVideo ? 'video' : 'img')
             if (isVideo) el.controls = true
-            el.src = url
+            el.src = URL.createObjectURL(blob)
             document.getElementById('out').appendChild(el)
-          })
+          }).catch((err) => warn('blob error: ' + err.message))
         }
       }
       torrent.on('ready', render)
