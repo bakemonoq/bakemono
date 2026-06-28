@@ -1,0 +1,17 @@
+[package]
+name = "bakemono-daemon"
+description = "Headless seeding and orchestration daemon shared by the desktop app and farm seednodes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bakemono-core = { path = "../bakemono-core" }
+bakemono-seeder = { path = "../bakemono-seeder" }
+tokio = { workspace = true, features = ["sync"] }
+anyhow.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+dirs.workspace = true
+tracing.workspace = true

@@ -1,14 +1,7 @@
 pub mod catalog;
-pub mod config;
 pub mod identity;
 pub mod pipeline;
 pub mod scrape;
-pub mod seeder;
 
-use std::path::PathBuf;
-
-pub fn data_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("bakemono")
-}
+// generic daemon infrastructure now lives in bakemono-daemon; re-exported so call sites stay put
+pub use bakemono_daemon::{config, data_dir, seeder};

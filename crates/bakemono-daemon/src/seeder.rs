@@ -6,7 +6,7 @@ use tokio::sync::Mutex;
 
 use bakemono_seeder::{SeedInfo, Seeder};
 
-// one webtorrent sidecar for the whole app lifetime: started once, fed files as they arrive,
+// one webtorrent sidecar for the whole daemon lifetime: started once, fed files as they arrive,
 // torn down only on shutdown so published magnets keep a live seeder behind them
 #[derive(Clone, Default)]
 pub struct SeederHandle {

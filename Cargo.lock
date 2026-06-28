@@ -208,6 +208,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "bakemono-core",
+ "bakemono-daemon",
  "bakemono-scraper",
  "bakemono-seeder",
  "dirs",
@@ -246,6 +247,20 @@ dependencies = [
  "nostr",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "bakemono-daemon"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "bakemono-core",
+ "bakemono-seeder",
+ "dirs",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
