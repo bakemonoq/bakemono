@@ -57,13 +57,22 @@ A Bakemono manifest is a Nostr event of **kind 31063** (in the parameterized-rep
 - `posted_at` - ISO 8601 timestamp of when the source post was published.
 - `tier` - `free`, `paid`, or `unknown`. Whether this content required a paid subscription.
 - `t` - free-form topic tags per NIP-12. Multiple `t` tags allowed. E.g., `["t", "furry"]`, `["t", "art"]`.
-- `thumb` - inline thumbnail data URL for previews. Only for small images. Convenience field.
+- `thumb` - inline thumbnail as a base64 `data:` URL. Only for very small previews (target a few KB). Lets a board render a placeholder with zero swarm fetch. See Thumbnails below.
+- `thumb_x` - sha256 of a separately-seeded thumbnail file, used when the preview is too large to inline. Same encoding as `x`.
+- `thumb_magnet` - magnet for the thumbnail referenced by `thumb_x`. The thumbnail seeds as its own tiny torrent, so a board can preview without ever fetching the full-resolution file.
 
 ### Content field
 
 The `content` field is the source post's body text, plain or markdown. Empty string if the source post has no body.
 
-## Signing
+## Thumbnails
+
+Previews are generated client-side by the desktop app at scrape time, never by the board. After hashing the original file the app downscales images (or grabs a poster frame for video) into a small preview and attaches it one of two ways:
+
+- Tiny previews (a few KB) go inline in the `thumb` tag as a base64 `data:` URL. A board renders them with no swarm activity at all.
+- Larger previews are seeded as their own small file and referenced by `thumb_x` (sha256) + `thumb_magnet`. They join the swarm like any other file, so previews stay decentralized and survive the original's seeders going away.
+
+A board therefore never pulls the full-resolution file just to fill a grid of previews; the full file is fetched only when a user actually opens it. Thumbnails are immutable and content-addressed like everything else, so identical previews dedupe by hash
 
 Signing follows Nostr's standard NIP-01. No custom canonicalization, no `serde_jcs`.
 

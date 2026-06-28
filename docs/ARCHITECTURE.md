@@ -26,7 +26,7 @@ The end-to-end flow of one file from scrape to view in another user's browser. R
 
 1. **Scrape.** Alice runs the desktop app. She is logged into Patreon as a paying subscriber to creator "BoxOfMittens". The app uses her local cookies to fetch posts; cookies never leave her machine. It downloads `post123_image.jpg` (240 KB) to her hard drive.
 
-2. **Hash and build event.** App computes sha256, gets `a3f8d2e1...`. Reads post metadata (creator, post id, title, timestamp). Builds a Nostr event of kind 31063 with tags `x`, `size`, `m`, `magnet`, `platform`, `creator`, `post_id`, etc. Signs with Alice's secp256k1 private key using BIP-340 Schnorr (one call via the `nostr` rust crate).
+2. **Hash and build event.** App computes sha256, gets `a3f8d2e1...`. Reads post metadata (creator, post id, title, timestamp). Generates a small preview client-side (downscaled image, or a poster frame for video) and either inlines it in the `thumb` tag or seeds it as its own tiny file referenced by `thumb_x` + `thumb_magnet`, so a board can show previews without ever fetching the full file. Builds a Nostr event of kind 31063 with tags `x`, `size`, `m`, `magnet`, `platform`, `creator`, `post_id`, etc. Signs with Alice's secp256k1 private key using BIP-340 Schnorr (one call via the `nostr` rust crate).
 
 3. **Seed.** App spins up a BitTorrent v2 client locally. Joins the DHT. Announces "I have hash a3f8 at my IP:port". Alice's computer is now a peer in the swarm for this file.
 
