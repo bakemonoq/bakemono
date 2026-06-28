@@ -9,3 +9,4 @@ nostr.db*
 tools/webtorrent.min.js
 bk-dl/
 /deploy.sh
+crates/bakemono-app/gen/schemas/
