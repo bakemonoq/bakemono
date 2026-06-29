@@ -1,5 +1,5 @@
 [package]
-name = "bakemono-daemon"
+name = "bakemono-engine"
 description = "Headless seeding and orchestration daemon shared by the desktop app and farm seednodes"
 version.workspace = true
 edition.workspace = true

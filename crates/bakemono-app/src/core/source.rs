@@ -6,8 +6,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use bakemono_daemon::content::{ContentSource, ProgressFn};
-use bakemono_daemon::seeder::SeederHandle;
+use bakemono_engine::content::{ContentSource, ProgressFn};
+use bakemono_engine::seeder::SeederHandle;
 use bakemono_scraper::{Cookies, ScrapeRequest};
 
 use super::identity::Identity;

@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, State};
 use tracing_subscriber::prelude::*;
 
-use bakemono_daemon::ipc;
+use bakemono_engine::ipc;
 
 use crate::core::catalog::{self, CatalogStats};
 use crate::core::config::AppConfig;

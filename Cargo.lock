@@ -208,7 +208,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "bakemono-core",
- "bakemono-daemon",
+ "bakemono-engine",
  "bakemono-scraper",
  "bakemono-seeder",
  "dirs",
@@ -250,7 +250,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "bakemono-daemon"
+name = "bakemono-engine"
 version = "0.0.0"
 dependencies = [
  "anyhow",

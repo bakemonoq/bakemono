@@ -26,7 +26,7 @@ path = "src/bin/daemon.rs"
 
 [dependencies]
 bakemono-core = { path = "../bakemono-core" }
-bakemono-daemon = { path = "../bakemono-daemon" }
+bakemono-engine = { path = "../bakemono-engine" }
 bakemono-scraper = { path = "../bakemono-scraper" }
 bakemono-seeder = { path = "../bakemono-seeder" }
 nostr-sdk.workspace = true
