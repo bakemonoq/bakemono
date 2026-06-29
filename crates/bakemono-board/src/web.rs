@@ -37,6 +37,8 @@ pub fn router(state: AppState) -> Router {
         .route("/mod", get(mod_queue))
         .route("/mod/approve", post(mod_approve))
         .route("/mod/reject", post(mod_reject))
+        .route("/mod/approve-creator", post(mod_approve_creator))
+        .route("/mod/reject-creator", post(mod_reject_creator))
         .route("/mod/takedown", post(mod_takedown))
         .route("/mod/untakedown", post(mod_untakedown))
         .route("/webtorrent.min.js", get(webtorrent_js))
@@ -279,7 +281,8 @@ async fn mod_queue(State(state): State<AppState>, headers: HeaderMap) -> Respons
     if let Err(denied) = require_mod(&headers) {
         return denied;
     }
-    let pending = db::pending_pubkeys(&state.pool).await.unwrap_or_default();
+    let groups = db::pending_groups(&state.pool, 50).await.unwrap_or_default();
+    let pending = db::pending_pubkeys(&state.pool, 100).await.unwrap_or_default();
     let takedowns = db::takedowns(&state.pool).await.unwrap_or_default();
     render(
         "mod queue",
@@ -287,24 +290,52 @@ async fn mod_queue(State(state): State<AppState>, headers: HeaderMap) -> Respons
             p { a href="/" { "< home" } }
             h2 { "Mod queue" }
             p.muted { "first-seen pubkeys wait here; approve to publish their files, reject to drop them" }
-            @if pending.is_empty() { p.muted { "nothing awaiting review" } }
-            ul.list {
-                @for p in &pending {
-                    li {
-                        div { code { (npub(&p.pubkey)) } }
-                        span.muted {
-                            (p.files) " file(s)"
-                            @if let Some(c) = &p.creator { " - " (c) }
-                            @if let Some(s) = &p.sample { " - " (s) }
-                        }
-                        div {
-                            form method="post" action="/mod/approve" class="modform" {
-                                input type="hidden" name="pubkey" value=(p.pubkey);
-                                button { "approve" }
+            @if groups.is_empty() && pending.is_empty() { p.muted { "nothing awaiting review" } }
+            @if !groups.is_empty() {
+                h3 { "By creator" }
+                p.muted { "bulk-act on a flood: approve or reject every pending key that posted to a creator" }
+                ul.list {
+                    @for g in &groups {
+                        li {
+                            div { (g.creator.clone().unwrap_or_else(|| g.creator_id.clone())) " " span.muted { "(" (g.platform) ")" } }
+                            span.muted { (g.pubkeys) " pubkey(s) - " (g.files) " file(s)" }
+                            div {
+                                form method="post" action="/mod/approve-creator" class="modform" {
+                                    input type="hidden" name="platform" value=(g.platform);
+                                    input type="hidden" name="creator_id" value=(g.creator_id);
+                                    button { "approve all" }
+                                }
+                                form method="post" action="/mod/reject-creator" class="modform" {
+                                    input type="hidden" name="platform" value=(g.platform);
+                                    input type="hidden" name="creator_id" value=(g.creator_id);
+                                    button { "reject all" }
+                                }
                             }
-                            form method="post" action="/mod/reject" class="modform" {
-                                input type="hidden" name="pubkey" value=(p.pubkey);
-                                button { "reject" }
+                        }
+                    }
+                }
+            }
+            @if !pending.is_empty() {
+                h3 { "By pubkey" }
+                p.muted { "newest first, capped at 100; clear the backlog or use the per-creator actions above" }
+                ul.list {
+                    @for p in &pending {
+                        li {
+                            div { code { (npub(&p.pubkey)) } }
+                            span.muted {
+                                (p.files) " file(s)"
+                                @if let Some(c) = &p.creator { " - " (c) }
+                                @if let Some(s) = &p.sample { " - " (s) }
+                            }
+                            div {
+                                form method="post" action="/mod/approve" class="modform" {
+                                    input type="hidden" name="pubkey" value=(p.pubkey);
+                                    button { "approve" }
+                                }
+                                form method="post" action="/mod/reject" class="modform" {
+                                    input type="hidden" name="pubkey" value=(p.pubkey);
+                                    button { "reject" }
+                                }
                             }
                         }
                     }
@@ -376,6 +407,30 @@ async fn mod_reject(
         return denied;
     }
     let _ = db::reject_pubkey(&pool, &form.pubkey).await;
+    Redirect::to("/mod").into_response()
+}
+
+async fn mod_approve_creator(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Form(form): Form<CreatorForm>,
+) -> Response {
+    if let Err(denied) = require_mod(&headers) {
+        return denied;
+    }
+    let _ = db::approve_creator(&pool, &form.platform, &form.creator_id).await;
+    Redirect::to("/mod").into_response()
+}
+
+async fn mod_reject_creator(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Form(form): Form<CreatorForm>,
+) -> Response {
+    if let Err(denied) = require_mod(&headers) {
+        return denied;
+    }
+    let _ = db::reject_creator(&pool, &form.platform, &form.creator_id).await;
     Redirect::to("/mod").into_response()
 }
 
@@ -459,6 +514,12 @@ async fn mod_untakedown(
 #[derive(serde::Deserialize)]
 struct ModForm {
     pubkey: String,
+}
+
+#[derive(serde::Deserialize)]
+struct CreatorForm {
+    platform: String,
+    creator_id: String,
 }
 
 #[derive(serde::Deserialize)]

@@ -14,6 +14,7 @@ services:
       - "${RELAY_PORT:-8080}:8080"
     volumes:
       - bakemono-relay:/usr/src/app/db
+      - ./relay/config.toml:/usr/src/app/config.toml:ro
     restart: unless-stopped
 
   tracker:

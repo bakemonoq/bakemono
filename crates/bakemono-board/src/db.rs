@@ -10,26 +10,25 @@ pub async fn connect(url: &str) -> Result<PgPool> {
     Ok(pool)
 }
 
+// cap on pubkeys awaiting review; fresh keys past it are shed until the queue drains or gc frees room
+const MAX_PENDING: i64 = 5_000;
+// pending pubkeys left unreviewed this long are garbage-collected along with their hidden manifests
+pub const PENDING_TTL_SECS: i64 = 14 * 24 * 3_600;
+
 pub async fn upsert(pool: &PgPool, event: &Event, manifest: &Manifest) -> Result<()> {
     let created_at = event.created_at.as_secs() as i64;
     let pubkey = event.pubkey.to_hex();
-    // first sighting of a pubkey lands it in the mod queue as pending
-    sqlx::query(
-        "INSERT INTO pubkeys (pubkey, status, first_seen)
-         VALUES ($1, 'pending', EXTRACT(EPOCH FROM now())::bigint)
-         ON CONFLICT (pubkey) DO NOTHING",
-    )
-    .bind(&pubkey)
-    .execute(pool)
-    .await?;
-    // drop events from rejected pubkeys instead of storing them hidden
-    let rejected: bool =
-        sqlx::query_scalar("SELECT status = 'rejected' FROM pubkeys WHERE pubkey = $1")
-            .bind(&pubkey)
-            .fetch_one(pool)
-            .await?;
-    if rejected {
-        return Ok(());
+    match pubkey_status(pool, &pubkey).await?.as_deref() {
+        // already rejected: drop instead of storing it hidden
+        Some("rejected") => return Ok(()),
+        // a known pending or approved pubkey: fall through and store
+        Some(_) => {}
+        // never seen: enqueue for review only while the queue has room, else shed the flood
+        None => {
+            if !try_enqueue_pubkey(pool, &pubkey, MAX_PENDING).await? {
+                return Ok(());
+            }
+        }
     }
     // NIP-33: a newer event with the same (pubkey, d) replaces the older one
     sqlx::query("DELETE FROM manifests WHERE pubkey = $1 AND d_tag = $2 AND created_at < $3")
@@ -60,6 +59,48 @@ pub async fn upsert(pool: &PgPool, event: &Event, manifest: &Manifest) -> Result
         .execute(pool)
         .await?;
     Ok(())
+}
+
+async fn pubkey_status(pool: &PgPool, pubkey: &str) -> Result<Option<String>> {
+    let status = sqlx::query_scalar("SELECT status FROM pubkeys WHERE pubkey = $1")
+        .bind(pubkey)
+        .fetch_optional(pool)
+        .await?;
+    Ok(status)
+}
+
+// enqueue a never-seen pubkey as pending only while the queue is under the cap; the bool says whether
+// it was enqueued, so a flood of fresh keys past the cap is shed rather than filling the queue
+pub(crate) async fn try_enqueue_pubkey(pool: &PgPool, pubkey: &str, cap: i64) -> Result<bool> {
+    let res = sqlx::query(
+        "INSERT INTO pubkeys (pubkey, status, first_seen)
+         SELECT $1, 'pending', EXTRACT(EPOCH FROM now())::bigint
+         WHERE (SELECT COUNT(*) FROM pubkeys WHERE status = 'pending') < $2
+         ON CONFLICT (pubkey) DO NOTHING",
+    )
+    .bind(pubkey)
+    .bind(cap)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+// drop pending pubkeys never reviewed within the ttl, with their hidden manifests, so an unreviewed
+// flood self-heals instead of growing the index forever; returns the number of manifests removed
+pub async fn gc_pending(pool: &PgPool, ttl_secs: i64) -> Result<u64> {
+    let res = sqlx::query(
+        "WITH stale AS (
+             DELETE FROM pubkeys
+             WHERE status = 'pending'
+               AND first_seen < EXTRACT(EPOCH FROM now())::bigint - $1
+             RETURNING pubkey
+         )
+         DELETE FROM manifests WHERE pubkey IN (SELECT pubkey FROM stale)",
+    )
+    .bind(ttl_secs)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
 }
 
 pub async fn creators(pool: &PgPool) -> Result<Vec<CreatorRow>> {
@@ -159,15 +200,35 @@ pub async fn recent(pool: &PgPool, limit: i64) -> Result<Vec<ManifestRow>> {
     Ok(rows)
 }
 
-pub async fn pending_pubkeys(pool: &PgPool) -> Result<Vec<PendingRow>> {
+pub async fn pending_pubkeys(pool: &PgPool, limit: i64) -> Result<Vec<PendingRow>> {
     let rows = sqlx::query_as::<_, PendingRow>(
         "SELECT p.pubkey, COUNT(m.event_id) AS files,
                 MAX(m.creator) AS creator, MAX(m.post_title) AS sample
          FROM pubkeys p LEFT JOIN manifests m ON m.pubkey = p.pubkey
          WHERE p.status = 'pending'
          GROUP BY p.pubkey, p.first_seen
-         ORDER BY p.first_seen DESC",
+         ORDER BY p.first_seen DESC
+         LIMIT $1",
     )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+// pending keys collapsed by the creator they target, so a flood aimed at one creator reviews as a
+// handful of rows the operator can bulk-approve or bulk-reject instead of thousands of single keys
+pub async fn pending_groups(pool: &PgPool, limit: i64) -> Result<Vec<PendingGroup>> {
+    let rows = sqlx::query_as::<_, PendingGroup>(
+        "SELECT m.platform, m.creator_id, MAX(m.creator) AS creator,
+                COUNT(DISTINCT m.pubkey) AS pubkeys, COUNT(m.event_id) AS files
+         FROM pubkeys p JOIN manifests m ON m.pubkey = p.pubkey
+         WHERE p.status = 'pending'
+         GROUP BY m.platform, m.creator_id
+         ORDER BY COUNT(DISTINCT m.pubkey) DESC, COUNT(m.event_id) DESC
+         LIMIT $1",
+    )
+    .bind(limit)
     .fetch_all(pool)
     .await?;
     Ok(rows)
@@ -191,6 +252,40 @@ pub async fn reject_pubkey(pool: &PgPool, pubkey: &str) -> Result<()> {
         .execute(pool)
         .await?;
     Ok(())
+}
+
+// approve every still-pending pubkey that posted to this creator (approved keys are left untouched)
+pub async fn approve_creator(pool: &PgPool, platform: &str, creator_id: &str) -> Result<u64> {
+    let res = sqlx::query(
+        "UPDATE pubkeys SET status = 'approved'
+         WHERE status = 'pending' AND pubkey IN (
+             SELECT DISTINCT pubkey FROM manifests WHERE platform = $1 AND creator_id = $2
+         )",
+    )
+    .bind(platform)
+    .bind(creator_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+// reject the still-pending keys that targeted this creator and drop their manifests in one pass
+pub async fn reject_creator(pool: &PgPool, platform: &str, creator_id: &str) -> Result<u64> {
+    let res = sqlx::query(
+        "WITH targeted AS (
+             SELECT DISTINCT pubkey FROM manifests WHERE platform = $1 AND creator_id = $2
+         ), rejected AS (
+             UPDATE pubkeys SET status = 'rejected'
+             WHERE status = 'pending' AND pubkey IN (SELECT pubkey FROM targeted)
+             RETURNING pubkey
+         )
+         DELETE FROM manifests WHERE pubkey IN (SELECT pubkey FROM rejected)",
+    )
+    .bind(platform)
+    .bind(creator_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
 }
 
 // hide a target locally; the d_tag is the NIP-33 replaceable id so a fresh decision on the same
@@ -253,6 +348,15 @@ pub struct PendingRow {
     pub files: i64,
     pub creator: Option<String>,
     pub sample: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+pub struct PendingGroup {
+    pub platform: String,
+    pub creator_id: String,
+    pub creator: Option<String>,
+    pub pubkeys: i64,
+    pub files: i64,
 }
 
 #[derive(sqlx::FromRow, Default)]
@@ -337,6 +441,7 @@ CREATE TABLE IF NOT EXISTS pubkeys (
     status     TEXT NOT NULL DEFAULT 'pending',
     first_seen BIGINT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS pubkeys_status ON pubkeys (status);
 -- grandfather pubkeys already indexed into the queue (one-time, idempotent)
 INSERT INTO pubkeys (pubkey, status, first_seen)
 SELECT pubkey, 'pending', MIN(created_at) FROM manifests GROUP BY pubkey
@@ -546,6 +651,102 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_cap_sheds_fresh_keys_when_full() {
+        let Ok(url) = std::env::var("BAKEMONO_TEST_DB") else {
+            eprintln!("skipping: BAKEMONO_TEST_DB not set");
+            return;
+        };
+        let pool = match connect(&url).await {
+            Ok(pool) => pool,
+            Err(e) => {
+                eprintln!("skipping: cannot reach test db: {e}");
+                return;
+            }
+        };
+        let full = format!("capfull-{}", std::process::id());
+        let room = format!("caproom-{}", std::process::id());
+
+        // a zero cap is always full, so a fresh key is shed
+        assert!(!try_enqueue_pubkey(&pool, &full, 0).await.unwrap());
+        // a generous cap enqueues the fresh key once; a repeat is not a new insert
+        assert!(try_enqueue_pubkey(&pool, &room, 1_000_000).await.unwrap());
+        assert!(!try_enqueue_pubkey(&pool, &room, 1_000_000).await.unwrap());
+
+        sqlx::query("DELETE FROM pubkeys WHERE pubkey = ANY($1)")
+            .bind(vec![full, room])
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn gc_drops_stale_pending_with_manifests() {
+        let Ok(url) = std::env::var("BAKEMONO_TEST_DB") else {
+            eprintln!("skipping: BAKEMONO_TEST_DB not set");
+            return;
+        };
+        let pool = match connect(&url).await {
+            Ok(pool) => pool,
+            Err(e) => {
+                eprintln!("skipping: cannot reach test db: {e}");
+                return;
+            }
+        };
+        let stale = Keys::generate();
+        let fresh = Keys::generate();
+        let creator_id = format!("gc-{}", std::process::id());
+        let mut manifest = sample(&creator_id);
+        manifest.file_hash =
+            format!("{:0<64}", creator_id.replace(|c: char| !c.is_ascii_hexdigit(), ""));
+
+        upsert(&pool, &manifest.to_event(&stale).unwrap(), &manifest)
+            .await
+            .unwrap();
+        upsert(&pool, &manifest.to_event(&fresh).unwrap(), &manifest)
+            .await
+            .unwrap();
+
+        // backdate one pending key so only it falls outside the ttl window
+        sqlx::query("UPDATE pubkeys SET first_seen = 0 WHERE pubkey = $1")
+            .bind(stale.public_key().to_hex())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        gc_pending(&pool, 24 * 3_600).await.unwrap();
+
+        assert_eq!(
+            count_manifests(&pool, &stale.public_key().to_hex()).await,
+            0,
+            "a stale pending key and its manifests are collected"
+        );
+        assert_eq!(
+            count_manifests(&pool, &fresh.public_key().to_hex()).await,
+            1,
+            "a recently-seen pending key survives gc"
+        );
+
+        sqlx::query("DELETE FROM manifests WHERE creator_id = $1")
+            .bind(&creator_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM pubkeys WHERE pubkey = $1")
+            .bind(fresh.public_key().to_hex())
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    async fn count_manifests(pool: &PgPool, pubkey: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM manifests WHERE pubkey = $1")
+            .bind(pubkey)
+            .fetch_one(pool)
+            .await
+            .unwrap()
     }
 
     fn sample(creator_id: &str) -> Manifest {

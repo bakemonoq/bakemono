@@ -1,5 +1,6 @@
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use nostr_sdk::prelude::*;
@@ -34,14 +35,17 @@ pub async fn run(pool: PgPool, relays: Vec<String>, trusted: Vec<PublicKey>) -> 
     );
 
     let trusted: Arc<HashSet<String>> = Arc::new(trusted.iter().map(PublicKey::to_hex).collect());
+    let limiter = Arc::new(IngestLimiter::default());
+    spawn_pending_gc(pool.clone());
     client
         .handle_notifications(|notification| {
             let pool = pool.clone();
             let trusted = trusted.clone();
+            let limiter = limiter.clone();
             async move {
                 if let RelayPoolNotification::Event { event, .. } = notification {
                     match event.kind.as_u16() {
-                        KIND_MANIFEST => ingest_manifest(&pool, &event).await,
+                        KIND_MANIFEST => ingest_manifest(&pool, &event, &limiter).await,
                         KIND_TAKEDOWN => ingest_takedown(&pool, &event, &trusted).await,
                         _ => {}
                     }
@@ -53,8 +57,26 @@ pub async fn run(pool: PgPool, relays: Vec<String>, trusted: Vec<PublicKey>) -> 
     Ok(())
 }
 
-async fn ingest_manifest(pool: &PgPool, event: &Event) {
+// pending pubkeys never reviewed within the ttl are swept on a timer so an unreviewed flood self-heals
+fn spawn_pending_gc(pool: PgPool) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(GC_INTERVAL).await;
+            match crate::db::gc_pending(&pool, crate::db::PENDING_TTL_SECS).await {
+                Ok(n) if n > 0 => println!("gc: dropped {n} stale pending manifest(s)"),
+                Ok(_) => {}
+                Err(e) => eprintln!("pending gc error: {e:#}"),
+            }
+        }
+    });
+}
+
+async fn ingest_manifest(pool: &PgPool, event: &Event, limiter: &IngestLimiter) {
     if event.verify().is_err() {
+        return;
+    }
+    // rate-limit on the authenticated pubkey so no single key (even an approved one) can flood the index
+    if !limiter.allow(&event.pubkey.to_hex(), now_secs()) {
         return;
     }
     let manifest = match Manifest::from_event(event) {
@@ -83,6 +105,83 @@ async fn ingest_takedown(pool: &PgPool, event: &Event, trusted: &HashSet<String>
     }
 }
 
+const GC_INTERVAL: Duration = Duration::from_secs(3_600);
+const RATE_WINDOW_SECS: u64 = 10;
+const PER_PUBKEY_MAX: u32 = 600;
+const GLOBAL_MAX: u32 = 6_000;
+const MAX_TRACKED_PUBKEYS: usize = 100_000;
+
+// fixed-window rate limiter over authenticated pubkeys, with a global ceiling as the flood backstop
+struct IngestLimiter {
+    window_secs: u64,
+    per_pubkey_max: u32,
+    global_max: u32,
+    state: Mutex<LimiterState>,
+}
+
+struct LimiterState {
+    pubkeys: HashMap<String, Window>,
+    global: Window,
+}
+
+struct Window {
+    start: u64,
+    count: u32,
+}
+
+impl Default for IngestLimiter {
+    fn default() -> Self {
+        Self::new(RATE_WINDOW_SECS, PER_PUBKEY_MAX, GLOBAL_MAX)
+    }
+}
+
+impl IngestLimiter {
+    fn new(window_secs: u64, per_pubkey_max: u32, global_max: u32) -> Self {
+        Self {
+            window_secs,
+            per_pubkey_max,
+            global_max,
+            state: Mutex::new(LimiterState {
+                pubkeys: HashMap::new(),
+                global: Window { start: 0, count: 0 },
+            }),
+        }
+    }
+
+    // true while this pubkey is under both its own and the global rate for the current window
+    fn allow(&self, pubkey: &str, now: u64) -> bool {
+        let mut st = self.state.lock().unwrap();
+        if st.pubkeys.len() > MAX_TRACKED_PUBKEYS {
+            let window = self.window_secs;
+            st.pubkeys.retain(|_, w| now.saturating_sub(w.start) < window);
+        }
+        let per_ok = {
+            let w = st
+                .pubkeys
+                .entry(pubkey.to_string())
+                .or_insert(Window { start: now, count: 0 });
+            bump(w, now, self.window_secs, self.per_pubkey_max)
+        };
+        per_ok && bump(&mut st.global, now, self.window_secs, self.global_max)
+    }
+}
+
+fn bump(w: &mut Window, now: u64, window: u64, max: u32) -> bool {
+    if now.saturating_sub(w.start) >= window {
+        w.start = now;
+        w.count = 0;
+    }
+    w.count += 1;
+    w.count <= max
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,6 +189,22 @@ mod tests {
 
     use bakemono_core::{Manifest, Takedown, Target};
     use nostr_relay_builder::MockRelay;
+
+    #[test]
+    fn rate_limiter_caps_per_pubkey_and_globally() {
+        let limiter = IngestLimiter::new(10, 3, 100);
+        assert!(limiter.allow("a", 100));
+        assert!(limiter.allow("a", 100));
+        assert!(limiter.allow("a", 100));
+        assert!(!limiter.allow("a", 101), "a fourth event in the window is dropped");
+        assert!(limiter.allow("a", 120), "the next window allows the pubkey again");
+
+        let flood = IngestLimiter::new(10, 100, 4);
+        for i in 0..4 {
+            assert!(flood.allow(&format!("k{i}"), 0));
+        }
+        assert!(!flood.allow("k4", 0), "the global window caps a fresh-key flood");
+    }
 
     // set BAKEMONO_TEST_DB to a Postgres url to run, otherwise skipped
     #[tokio::test]

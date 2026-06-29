@@ -1,0 +1,25 @@
+[info]
+name = "bakemono relay"
+description = "Bakemono manifest (31063) and takedown (31064) relay"
+
+[database]
+engine = "sqlite"
+data_directory = "/usr/src/app/db"
+
+[network]
+address = "0.0.0.0"
+port = 8080
+
+[options]
+# reject events timestamped too far ahead; also blunts future-dating tricks against the index
+reject_future_seconds = 1800
+
+[limits]
+# coarse per-connection flood controls; the board enforces its own per-pubkey limit on ingest
+messages_per_sec = 20
+subscriptions_per_min = 120
+# cap event size (manifest content is capped at 64 KiB in bakemono-core, tags add the rest)
+max_event_bytes = 131072
+max_ws_message_bytes = 262144
+# this relay only carries Bakemono events; enable once verified against your relay version
+# event_kind_allowlist = [31063, 31064]
