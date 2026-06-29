@@ -221,8 +221,9 @@ $('scrape').onclick = () => {
 refreshIdentity()
 refreshConfig()
 refreshPaths()
-refreshStats()
 refreshCookies()
-// start the daemon if it isn't already up, then keep the status dot live
-invoke('start_daemon').catch((e) => log('daemon start failed: ' + e)).finally(refreshDaemon)
-setInterval(refreshDaemon, 3000)
+// start the daemon if it isn't already up, then keep status + stats live. stats need the daemon
+// reachable, so poll them on the same tick rather than once at load (before the daemon is up)
+function poll() { refreshDaemon(); refreshStats() }
+invoke('start_daemon').catch((e) => log('daemon start failed: ' + e)).finally(poll)
+setInterval(poll, 3000)
