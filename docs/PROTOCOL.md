@@ -107,14 +107,14 @@ A relay is a server that accepts events, stores them, and serves them to subscri
 
 ### What the reference instance runs
 
-- `nostr-rs-relay` (rust, MIT, by Greg Heartsfield) as a sidecar process colocated with the board. Exposed at `wss://relay.bakemono.example`.
+- `nostr-rs-relay` (rust, MIT, by Greg Heartsfield) as a sidecar process colocated with the board. Exposed at `wss://relay.bakemono.app`.
 - The board's indexer connects to its own relay (`ws://localhost:8080`) AND to a configured list of public relays.
 
 ### Default relay set for the desktop app
 
 The app ships with sensible defaults; users can edit the list. v0 default:
 
-- `wss://relay.bakemono.example` (ours)
+- `wss://relay.bakemono.app` (ours)
 - `wss://relay.damus.io` (public, large)
 - `wss://nos.lol` (public, persistent)
 - `wss://relay.snort.social` (public)

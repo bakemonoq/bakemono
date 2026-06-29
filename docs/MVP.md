@@ -20,7 +20,7 @@ If all seven steps work without intervention, MVP ships.
 
 ### bakemono-board v0
 
-- `nostr-rs-relay` running as a sidecar at `wss://relay.bakemono.example`
+- `nostr-rs-relay` running as a sidecar at `wss://relay.bakemono.app`
 - Indexer that subscribes to a configured relay set (ours + 4-5 public Nostr relays) with filter `{"kinds": [31063]}`
 - Postgres schema for events (deduped by event id, indexed by file hash, pubkey, creator, platform, posted_at), mod queue, takedown ledger
 - Search and browse UI: by creator, by recent, by hash, by simple text search on post title and content
@@ -28,7 +28,7 @@ If all seven steps work without intervention, MVP ships.
 - Warm cache: a small disk cache of the top N most-viewed files, served via plain HTTPS when present
 - Mod queue UI for board operators to approve / reject events from first-seen pubkeys
 - Instance operator keypair management, kind 31064 takedown signing
-- One STUN endpoint at `stun.bakemono.example` (small public-facing service)
+- One STUN endpoint at `stun.bakemono.app` (small public-facing service)
 
 ### bakemono-app v0
 

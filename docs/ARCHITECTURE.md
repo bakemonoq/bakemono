@@ -30,7 +30,7 @@ The end-to-end flow of one file from scrape to view in another user's browser. R
 
 3. **Seed.** App spins up a BitTorrent v2 client locally. Joins the DHT. Announces "I have hash a3f8 at my IP:port". Alice's computer is now a peer in the swarm for this file.
 
-4. **Publish to relays.** App fans out the event to its full configured relay set in parallel: our `wss://relay.bakemono.example`, plus public Nostr relays (relay.damus.io, nos.lol, nostr.wine, etc). Each relay verifies the signature, stores the event, and starts streaming it to its subscribers. NO bytes go to any relay, only the event.
+4. **Publish to relays.** App fans out the event to its full configured relay set in parallel: our `wss://relay.bakemono.app`, plus public Nostr relays (relay.damus.io, nos.lol, nostr.wine, etc). Each relay verifies the signature, stores the event, and starts streaming it to its subscribers. NO bytes go to any relay, only the event.
 
 5. **Browse.** Bob lands on a Bakemono board from a Reddit post. He searches "BoxOfMittens". The board's postgres (filled by its indexer subscribing to the same relays Alice published to) returns Alice's event. Page renders with post title, text, image placeholder.
 
