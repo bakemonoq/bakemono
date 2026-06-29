@@ -45,6 +45,9 @@ pub fn run() {
             app_paths,
             sharing_stats,
             start_scrape,
+            open_patreon_login,
+            capture_patreon_cookies,
+            saved_patreon_cookies,
             cancel_job,
             daemon_status,
             start_daemon,
@@ -55,6 +58,10 @@ pub fn run() {
         // so stop the daemon here too when the user opted in, then exit the process
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
+                // closing the patreon login popup must not quit the app
+                if window.label() != "main" {
+                    return;
+                }
                 stop_daemon_if_configured();
                 window.app_handle().exit(0);
             }
@@ -184,6 +191,32 @@ async fn start_scrape(
     })
     .await
     .map_err(stringify)
+}
+
+// open an embedded webview to patreon.com; the user logs in there and we read the
+// session straight out of the webview - the credentials never leave the machine
+#[tauri::command]
+async fn open_patreon_login(app: AppHandle) -> Result<(), String> {
+    crate::patreon::open_login(&app).map_err(stringify)
+}
+
+#[tauri::command]
+async fn capture_patreon_cookies(app: AppHandle) -> Result<CookieCapture, String> {
+    let (count, path) = crate::patreon::capture_cookies(&app)
+        .await
+        .map_err(stringify)?;
+    Ok(CookieCapture { count, path })
+}
+
+#[derive(Serialize)]
+struct CookieCapture {
+    count: usize,
+    path: String,
+}
+
+#[tauri::command]
+fn saved_patreon_cookies() -> Option<String> {
+    crate::patreon::saved_cookies_path()
 }
 
 #[tauri::command]

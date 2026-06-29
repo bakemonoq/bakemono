@@ -26,6 +26,19 @@
     .dot { display: inline-block; width: .7rem; height: .7rem; border-radius: 50%; background: #888; margin-right: .4rem; vertical-align: middle }
     .dot.up { background: #3ba55d }
     .dot.down { background: #e4564a }
+    .card { background: #8881; border-radius: 8px; padding: .8rem; margin-bottom: 1rem }
+    .between { display: flex; justify-content: space-between; align-items: center; gap: .8rem }
+    .title { font-weight: 600 }
+    .status { display: flex; align-items: center; gap: .4rem; font-size: .85rem; margin-top: .2rem; opacity: .85 }
+    button.primary { background: #4f6bed; color: #fff; border: 0; border-radius: 6px; font-weight: 600 }
+    button.primary:hover { filter: brightness(1.08) }
+    button.primary:disabled { opacity: .5; cursor: default; filter: none }
+    button.patreon { background: #f1465a; color: #fff; border: 0; border-radius: 6px; font-weight: 600 }
+    button.patreon:hover { filter: brightness(1.08) }
+    button.go { width: 100%; padding: .6rem; margin-top: .3rem }
+    .adv { margin-top: .7rem }
+    .adv summary { font-weight: 500; font-size: .85rem; opacity: .75 }
+    .adv label { margin-top: .5rem }
   </style>
 </head>
 <body>
@@ -85,6 +98,33 @@
 
   <section>
     <h2>Scrape a creator</h2>
+
+    <div class="card">
+      <div class="between">
+        <div>
+          <div class="title">Patreon session</div>
+          <div class="status"><span class="dot" id="cookieDot"></span><span id="cookieStatus">not signed in</span></div>
+        </div>
+        <button id="patreonLogin" class="patreon">Log in</button>
+      </div>
+      <p class="hint">a popup opens for you to sign in; the session stays on this machine and is never uploaded</p>
+      <details class="adv">
+        <summary>Use existing cookies instead</summary>
+        <label>browser you're already logged into</label>
+        <select id="browser">
+          <option value="">none (use the session above)</option>
+          <option value="firefox">Firefox</option>
+          <option value="chrome">Chrome</option>
+          <option value="chromium">Chromium</option>
+          <option value="brave">Brave</option>
+          <option value="edge">Edge</option>
+          <option value="safari">Safari</option>
+        </select>
+        <label>or a cookies.txt file</label>
+        <input id="cookies" placeholder="absolute path to cookies.txt">
+      </details>
+    </div>
+
     <div class="row">
       <div>
         <label>creator (vanity or URL)</label>
@@ -95,18 +135,7 @@
         <input id="limit" type="number" min="1" placeholder="5">
       </div>
     </div>
-    <label>Patreon login</label>
-    <select id="browser">
-      <option value="">cookies file below</option>
-      <option value="firefox">logged in via Firefox</option>
-      <option value="chrome">logged in via Chrome</option>
-      <option value="chromium">logged in via Chromium</option>
-      <option value="brave">logged in via Brave</option>
-      <option value="edge">logged in via Edge</option>
-      <option value="safari">logged in via Safari</option>
-    </select>
-    <input id="cookies" placeholder="or absolute path to cookies.txt">
-    <button id="scrape">Scrape and Share</button>
+    <button id="scrape" class="primary go">Scrape and Share</button>
   </section>
 
   <section>

@@ -161,6 +161,38 @@ $('stop').onclick = async () => {
   log('stop requested')
 }
 
+$('patreonLogin').onclick = async () => {
+  try {
+    await invoke('open_patreon_login')
+    log('opened Patreon login - sign in and the session saves automatically')
+  } catch (err) {
+    log('could not open login: ' + err)
+  }
+}
+
+function markSignedIn(text) {
+  $('cookieDot').className = 'dot up'
+  $('cookieStatus').textContent = text
+  $('patreonLogin').textContent = 'Re-login'
+}
+
+// the rust side captures cookies once the popup reaches a logged-in page, then closes it
+listen('patreon-captured', (e) => {
+  const { count, path } = e.payload
+  $('cookies').value = path
+  $('browser').value = ''
+  markSignedIn(`signed in (${count} cookies)`)
+  log(`Patreon session saved (${count} cookies)`)
+})
+
+async function refreshCookies() {
+  const path = await invoke('saved_patreon_cookies')
+  if (path) {
+    if (!$('cookies').value) $('cookies').value = path
+    markSignedIn('signed in (saved session)')
+  }
+}
+
 $('scrape').onclick = () => {
   const creator = $('creator').value.trim()
   if (!creator) return alert('enter a creator')
@@ -176,6 +208,7 @@ refreshIdentity()
 refreshConfig()
 refreshPaths()
 refreshStats()
+refreshCookies()
 // start the daemon if it isn't already up, then keep the status dot live
 invoke('start_daemon').catch((e) => log('daemon start failed: ' + e)).finally(refreshDaemon)
 setInterval(refreshDaemon, 3000)
