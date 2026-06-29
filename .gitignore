@@ -10,3 +10,5 @@ tools/webtorrent.min.js
 bk-dl/
 /deploy.sh
 crates/bakemono-app/gen/schemas/
+crates/bakemono-app/binaries/
+crates/bakemono-app/sidecars/

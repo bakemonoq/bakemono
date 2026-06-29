@@ -24,6 +24,7 @@ serde_json.workspace = true
 tracing.workspace = true
 
 tauri = { version = "2", optional = true }
+tauri-plugin-updater = { version = "2", optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 tracing-appender = { workspace = true, optional = true }
 
@@ -32,4 +33,4 @@ tauri-build = "2"
 
 [features]
 default = ["gui"]
-gui = ["dep:tauri", "dep:tracing-subscriber", "dep:tracing-appender"]
+gui = ["dep:tauri", "dep:tauri-plugin-updater", "dep:tracing-subscriber", "dep:tracing-appender"]

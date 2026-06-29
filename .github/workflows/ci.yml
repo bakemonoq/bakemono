@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      # the desktop gui build needs node/gallery-dl/daemon staged as Tauri sidecars (see
+      # release.yml); the rest of the workspace builds and tests without them. the app's non-gui
+      # path is checked separately below
+      - run: cargo test --workspace --exclude bakemono-app
+      - run: cargo clippy --workspace --exclude bakemono-app --all-targets
+      - run: cargo check -p bakemono-app --no-default-features

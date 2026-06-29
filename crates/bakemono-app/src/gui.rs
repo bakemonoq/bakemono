@@ -1,5 +1,5 @@
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -24,14 +24,19 @@ pub fn run() {
     );
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState::new(identity, config))
-        .setup(|_app| {
+        .setup(|app| {
+            // point the daemon at the bundled sidecars (release only) before it spawns
+            let _ = BUNDLED.set(resolve_bundled(app));
             // make sure a daemon is running (spawn one detached if not)
             tauri::async_runtime::spawn(async {
                 if let Err(e) = ensure_daemon().await {
                     tracing::error!("could not start daemon: {e:#}");
                 }
             });
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move { notify_if_update(handle).await });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -322,6 +327,7 @@ fn spawn_daemon() -> std::io::Result<()> {
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    apply_bundled_env(&mut cmd);
     // own process group so the daemon survives the gui and ignores its signals
     #[cfg(unix)]
     {
@@ -338,6 +344,81 @@ fn daemon_bin_name() -> &'static str {
         "bakemono-daemon.exe"
     } else {
         "bakemono-daemon"
+    }
+}
+
+// release builds ship node, gallery-dl and the webtorrent script with the app; hand the daemon
+// their paths through the env seams the engine already reads. dev builds leave these unset and
+// fall back to PATH / the in-repo sidecar
+static BUNDLED: OnceLock<Bundled> = OnceLock::new();
+
+#[derive(Default)]
+struct Bundled {
+    node: Option<PathBuf>,
+    gallery_dl: Option<PathBuf>,
+    webtorrent: Option<PathBuf>,
+}
+
+fn resolve_bundled(app: &tauri::App) -> Bundled {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+    let next_to_exe = |name: &str| -> Option<PathBuf> {
+        let path = exe_dir.as_ref()?.join(bin_name(name));
+        path.exists().then_some(path)
+    };
+    let webtorrent = app
+        .path()
+        .resource_dir()
+        .ok()
+        .map(|dir| dir.join("sidecars/webtorrent/seed.mjs"))
+        .filter(|p| p.exists());
+    Bundled {
+        node: next_to_exe("node"),
+        gallery_dl: next_to_exe("gallery-dl"),
+        webtorrent,
+    }
+}
+
+fn apply_bundled_env(cmd: &mut std::process::Command) {
+    let Some(bundled) = BUNDLED.get() else {
+        return;
+    };
+    if let Some(node) = &bundled.node {
+        cmd.env("BAKEMONO_NODE", node);
+    }
+    if let Some(script) = &bundled.webtorrent {
+        cmd.env("BAKEMONO_WEBTORRENT", script);
+    }
+    if let Some(gallery_dl) = &bundled.gallery_dl {
+        cmd.env("BAKEMONO_GALLERY_DL", gallery_dl);
+    }
+}
+
+fn bin_name(name: &str) -> String {
+    if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    }
+}
+
+async fn notify_if_update(app: AppHandle) {
+    use tauri_plugin_updater::UpdaterExt;
+    let updater = match app.updater() {
+        Ok(updater) => updater,
+        Err(e) => {
+            tracing::debug!("updater unavailable: {e}");
+            return;
+        }
+    };
+    match updater.check().await {
+        Ok(Some(update)) => {
+            tracing::info!(version = %update.version, "a new version is available");
+            let _ = app.emit("update-available", update.version.clone());
+        }
+        Ok(None) => {}
+        Err(e) => tracing::debug!("update check failed: {e}"),
     }
 }
 

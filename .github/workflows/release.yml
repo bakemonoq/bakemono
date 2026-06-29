@@ -1,0 +1,119 @@
+name: release
+
+# cut a release by pushing a tag, e.g. `git tag v0.1.0 && git push origin v0.1.0`.
+# secrets required: TAURI_SIGNING_PRIVATE_KEY, TAURI_SIGNING_PRIVATE_KEY_PASSWORD (updater key).
+# see docs/RELEASING.md
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            stable_asset: Bakemono_aarch64.dmg
+            bundle_glob: target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          - os: macos-13
+            target: x86_64-apple-darwin
+            stable_asset: Bakemono_x64.dmg
+            bundle_glob: target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            stable_asset: Bakemono_amd64.AppImage
+            bundle_glob: target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            stable_asset: Bakemono_x64-setup.exe
+            bundle_glob: target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install webtorrent sidecar deps
+        working-directory: sidecars/webtorrent
+        run: npm ci
+
+      - name: Build gallery-dl standalone
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip pyinstaller gallery-dl
+          echo "from gallery_dl import main; main()" > gdl_entry.py
+          pyinstaller --onefile --name gallery-dl --collect-all gallery_dl gdl_entry.py
+
+      - name: Stage app bundle (daemon + node + gallery-dl + webtorrent)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET="${{ matrix.target }}"
+          EXE=""
+          [ "$RUNNER_OS" = "Windows" ] && EXE=".exe"
+          APP=crates/bakemono-app
+          mkdir -p "$APP/binaries"
+          # our daemon, built for this target and shipped beside the gui
+          cargo build --release -p bakemono-daemon --target "$TARGET"
+          cp "target/$TARGET/release/bakemono-daemon$EXE" "$APP/binaries/bakemono-daemon-$TARGET$EXE"
+          # the runner's node runtime (correct OS/arch) as the webtorrent sidecar interpreter
+          cp "$(command -v node)" "$APP/binaries/node-$TARGET$EXE"
+          # gallery-dl built above
+          cp "dist/gallery-dl$EXE" "$APP/binaries/gallery-dl-$TARGET$EXE"
+          # the webtorrent script + its node_modules, copied in as a resource
+          rm -rf "$APP/sidecars"
+          mkdir -p "$APP/sidecars"
+          cp -R sidecars/webtorrent "$APP/sidecars/webtorrent"
+
+      - name: Build, bundle, sign updater, draft release
+        id: tauri
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: crates/bakemono-app
+          tagName: ${{ github.ref_name }}
+          releaseName: Bakemono ${{ github.ref_name }}
+          releaseDraft: true
+          args: --target ${{ matrix.target }}
+
+      # the board's /contribute page links to versionless asset names under releases/latest/download.
+      # upload a stable-named copy of each installer so those links survive version bumps. best-effort:
+      # never fail the release if a bundle path or naming needs a tweak
+      - name: Upload stable-named installer
+        if: always()
+        shell: bash
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          built=$(ls ${{ matrix.bundle_glob }} 2>/dev/null | head -1 || true)
+          if [ -z "$built" ]; then echo "no bundle matched ${{ matrix.bundle_glob }}"; exit 0; fi
+          cp "$built" "${{ matrix.stable_asset }}"
+          gh release upload "${{ github.ref_name }}" "${{ matrix.stable_asset }}" --clobber
