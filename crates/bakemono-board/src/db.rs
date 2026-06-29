@@ -64,7 +64,8 @@ pub async fn posts_by_creator(
                 MAX(post_title) AS post_title, MAX(posted_at) AS posted_at,
                 COUNT(DISTINCT file_hash) AS files
          FROM manifests WHERE platform = $1 AND creator_id = $2
-         GROUP BY platform, creator_id, post_id ORDER BY MAX(created_at) DESC",
+         GROUP BY platform, creator_id, post_id
+         ORDER BY MAX(posted_at) DESC NULLS LAST, MAX(created_at) DESC",
     )
     .bind(platform)
     .bind(creator_id)

@@ -72,7 +72,7 @@ async fn creator_page(
                         a href=(format!("/p/{}/{}/{}", p.platform, p.creator_id, p.post_id)) {
                             (p.post_title.clone().unwrap_or_else(|| p.post_id.clone()))
                         }
-                        span.muted { " " (p.files) " files" @if let Some(at) = &p.posted_at { " - " (at) } }
+                        span.muted { " " (p.files) " files" @if let Some(at) = &p.posted_at { " - " (pretty_date(at)) } }
                     }
                 }
             }
@@ -105,7 +105,10 @@ async fn post_page(
             @if !body.is_empty() { div.body { (PreEscaped(body)) } }
             @for f in &files {
                 div.file data-magnet=(f.magnet) data-mime=(f.mime) {
-                    p.muted { (f.filename.clone().unwrap_or_else(|| f.file_hash.clone())) " - " (f.size) " bytes" }
+                    p.muted {
+                        (f.filename.clone().unwrap_or_else(|| f.file_hash.clone())) " - " (f.size) " bytes"
+                        a.magnet href=(f.magnet) title="magnet link" { "🧲" }
+                    }
                 }
             }
             script { (PreEscaped(format!("window.__bakemonoIce = {};", ice_servers_json()))) }
@@ -117,6 +120,22 @@ async fn post_page(
 // BAKEMONO_ICE_SERVERS is a JSON array of RTCIceServer objects, default none (host-only)
 fn ice_servers_json() -> String {
     std::env::var("BAKEMONO_ICE_SERVERS").unwrap_or_else(|_| "[]".to_string())
+}
+
+// posted_at is ISO-8601 (2026-06-23T17:46:49.000+00:00); show a humane "Jun 23, 2026"
+fn pretty_date(raw: &str) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let date = raw.get(..10).unwrap_or(raw);
+    if let [year, month, day] = date.split('-').collect::<Vec<_>>()[..] {
+        if let Ok(m) = month.parse::<usize>() {
+            if (1..=12).contains(&m) {
+                return format!("{} {}, {}", MONTHS[m - 1], day.trim_start_matches('0'), year);
+            }
+        }
+    }
+    raw.to_string()
 }
 
 async fn webtorrent_js() -> impl IntoResponse {
@@ -147,6 +166,18 @@ fn render(title: &str, body: Markup) -> Html<String> {
     )
 }
 
+#[cfg(test)]
+mod tests {
+    use super::pretty_date;
+
+    #[test]
+    fn formats_iso_dates_and_passes_junk_through() {
+        assert_eq!(pretty_date("2026-06-23T17:46:49.000+00:00"), "Jun 23, 2026");
+        assert_eq!(pretty_date("2026-01-03 10:00:00"), "Jan 3, 2026");
+        assert_eq!(pretty_date("whenever"), "whenever");
+    }
+}
+
 const WEBTORRENT_JS: &str = include_str!("../assets/webtorrent.min.js");
 
 const STYLE: &str = "
@@ -161,6 +192,8 @@ header { border-bottom: 1px solid #8884; margin-bottom: 1rem; padding-bottom: .5
 .body { margin: 1rem 0 }
 .file { margin: 1rem 0; padding: .5rem; border: 1px solid #8884; border-radius: 6px }
 .file img, .file video { max-width: 100%; display: block; margin-top: .5rem }
+.magnet { margin-left: .4rem; text-decoration: none; opacity: .55; font-size: .9em }
+.magnet:hover { opacity: 1 }
 a { color: #4488ff }
 ";
 
