@@ -55,8 +55,10 @@ where
             write_line(&mut writer, &json!({"ok": true})).await?;
         }
         "shutdown" => {
-            write_line(&mut writer, &json!({"ok": true})).await?;
+            // cancel first: a fire-and-forget client (the gui on exit) may already be gone,
+            // so writing the ok can fail - the daemon must shut down regardless
             shutdown.cancel();
+            let _ = write_line(&mut writer, &json!({"ok": true})).await;
         }
         "run" => {
             let job = request.get("job").cloned().unwrap_or(Value::Null);
