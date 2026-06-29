@@ -32,6 +32,13 @@
   </section>
 
   <section>
+    <h2>Daemon <span id="dstatus" class="hint"></span></h2>
+    <p class="hint">the daemon keeps seeding in the background after this window closes</p>
+    <button id="drestart">Restart</button>
+    <button id="dstop">Stop</button>
+  </section>
+
+  <section>
     <h2>Locations</h2>
     <div id="paths">loading...</div>
   </section>
@@ -55,7 +62,7 @@
       <label>STUN servers (one per line)</label>
       <textarea id="stun"></textarea>
       <button id="saveSettings">Save</button>
-      <p class="hint">tracker and STUN changes take effect after restarting the app</p>
+      <p class="hint">saving restarts the daemon so the new relays/trackers/STUN take effect</p>
     </details>
   </section>
 

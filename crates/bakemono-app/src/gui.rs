@@ -1,19 +1,20 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager, State};
-use tokio_util::sync::CancellationToken;
+use serde_json::{json, Value};
+use tauri::{AppHandle, Emitter, State};
 use tracing_subscriber::prelude::*;
 
-use bakemono_scraper::{Cookies, ScrapeRequest};
+use bakemono_daemon::ipc;
 
 use crate::core::catalog::{self, CatalogStats};
 use crate::core::config::AppConfig;
 use crate::core::identity::{key_path, Identity};
-use crate::core::pipeline::{reseed, run_scrape, JobContext, Progress, RunSummary};
-use crate::core::seeder::SeederHandle;
 
+// the GUI is a thin client: the daemon process does the seeding/scraping/publishing, the GUI
+// just drives it over the local socket and manages identity/config files on disk
 pub fn run() {
     let _log_guard = init_logging();
     let identity = Identity::load_or_generate(&key_path()).expect("loading identity");
@@ -21,26 +22,17 @@ pub fn run() {
     tracing::info!(
         data_dir = %crate::core::data_dir().display(),
         npub = %identity.npub().unwrap_or_default(),
-        "starting bakemono"
+        "starting bakemono gui"
     );
 
     tauri::Builder::default()
         .manage(AppState::new(identity, config))
-        .setup(|app| {
-            let state = app.state::<AppState>();
-            let seeder = state.seeder.clone();
-            let (trackers, stun) = {
-                let guard = state.lock();
-                (guard.config.trackers.clone(), guard.config.stun.clone())
-            };
-            let dir = scrape_dest();
-            // start the seeder and re-seed everything on disk, so restarts resume seeding
-            tauri::async_runtime::spawn(async move {
-                if let Err(e) = seeder.ensure_started(&trackers, &stun).await {
-                    tracing::error!("seeder failed to start: {e:#}");
-                    return;
+        .setup(|_app| {
+            // make sure a daemon is running (spawn one detached if not)
+            tauri::async_runtime::spawn(async {
+                if let Err(e) = ensure_daemon().await {
+                    tracing::error!("could not start daemon: {e:#}");
                 }
-                reseed(&seeder, &dir).await;
             });
             Ok(())
         })
@@ -54,10 +46,22 @@ pub fn run() {
             app_paths,
             sharing_stats,
             start_scrape,
-            cancel_job
+            cancel_job,
+            daemon_status,
+            restart_daemon,
+            stop_daemon
         ])
-        .run(tauri::generate_context!())
-        .expect("running tauri application");
+        .build(tauri::generate_context!())
+        .expect("building tauri app")
+        .run(|_app, event| {
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                // daemon keeps seeding after the window closes unless the user opted out
+                if AppConfig::load().map(|c| c.stop_daemon_on_exit).unwrap_or(false) {
+                    shutdown_daemon_blocking();
+                    tracing::info!("stopped daemon on exit");
+                }
+            }
+        });
 }
 
 #[tauri::command]
@@ -107,12 +111,7 @@ fn save_settings(
     guard.config.trackers = trackers;
     guard.config.stun = stun;
     guard.config.save().map_err(stringify)?;
-    tracing::info!(
-        relays = guard.config.relays.len(),
-        trackers = guard.config.trackers.len(),
-        stun = guard.config.stun.len(),
-        "saved settings"
-    );
+    tracing::info!(relays = guard.config.relays.len(), "saved settings");
     Ok(guard.config.clone())
 }
 
@@ -132,48 +131,67 @@ fn sharing_stats() -> CatalogStats {
 }
 
 #[tauri::command]
-fn cancel_job(state: State<AppState>) -> Result<(), String> {
-    state.cancel_current();
-    Ok(())
-}
-
-#[tauri::command]
 async fn start_scrape(
     creator: String,
     limit: Option<u32>,
     cookies: Option<String>,
     browser: Option<String>,
     app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<RunSummary, String> {
-    let job = state.snapshot();
-    let token = state.begin_job()?;
-    if job.seed {
-        state
-            .seeder
-            .ensure_started(&job.trackers, &job.stun)
-            .await
-            .map_err(stringify)?;
-    }
-    let mut request = ScrapeRequest::new(creator, scrape_dest());
-    request.cookies = resolve_login(browser, cookies)?;
-    let callback = emitter(app);
-    let ctx = JobContext {
-        relays: &job.relays,
-        identity: &job.identity,
-        seeder: job.seed.then_some(&state.seeder),
-        cancel: &token,
-        progress: &callback,
+) -> Result<Value, String> {
+    ensure_daemon().await.map_err(stringify)?;
+    // resolve a cookies file path against the GUI's cwd before handing it to the daemon
+    let cookies = match cookies.filter(|c| !c.trim().is_empty()) {
+        Some(raw) => Some(resolve_cookies(&raw)?),
+        None => None,
     };
-    let result = run_scrape(request, limit.map(|n| n as usize), &ctx).await;
-    state.end_job();
-    result.map_err(stringify)
+    let job = json!({
+        "cmd": "run",
+        "job": {"kind": "scrape", "creator": creator, "limit": limit, "cookies": cookies, "browser": browser}
+    });
+    let app = app.clone();
+    ipc::call(job, move |data| {
+        let _ = app.emit("progress", data);
+    })
+    .await
+    .map_err(stringify)
+}
+
+#[tauri::command]
+async fn cancel_job() -> Result<(), String> {
+    ipc::call(json!({"cmd": "cancel"}), |_| {})
+        .await
+        .map_err(stringify)?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn daemon_status() -> Result<Value, String> {
+    ipc::call(json!({"cmd": "status"}), |_| {})
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+async fn stop_daemon() -> Result<(), String> {
+    let _ = ipc::call(json!({"cmd": "shutdown"}), |_| {}).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn restart_daemon() -> Result<(), String> {
+    let _ = ipc::call(json!({"cmd": "shutdown"}), |_| {}).await;
+    let sock = ipc::socket_path();
+    for _ in 0..40 {
+        if !sock.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    ensure_daemon().await.map_err(stringify)
 }
 
 pub struct AppState {
     inner: Mutex<Inner>,
-    job: Mutex<Option<CancellationToken>>,
-    seeder: SeederHandle,
 }
 
 struct Inner {
@@ -181,87 +199,83 @@ struct Inner {
     config: AppConfig,
 }
 
-struct Job {
-    identity: Identity,
-    relays: Vec<String>,
-    trackers: Vec<String>,
-    stun: Vec<String>,
-    seed: bool,
-}
-
 impl AppState {
     fn new(identity: Identity, config: AppConfig) -> Self {
         Self {
             inner: Mutex::new(Inner { identity, config }),
-            job: Mutex::new(None),
-            seeder: SeederHandle::new(),
         }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().expect("app state poisoned")
     }
+}
 
-    // copy out what a job needs so the lock is never held across an await
-    fn snapshot(&self) -> Job {
-        let guard = self.lock();
-        Job {
-            identity: guard.identity.clone(),
-            relays: guard.config.relays.clone(),
-            trackers: guard.config.trackers.clone(),
-            stun: guard.config.stun.clone(),
-            seed: guard.config.seed,
-        }
+async fn ensure_daemon() -> anyhow::Result<()> {
+    if daemon_alive().await {
+        return Ok(());
     }
-
-    fn begin_job(&self) -> Result<CancellationToken, String> {
-        let mut slot = self.job.lock().expect("job slot poisoned");
-        if slot.is_some() {
-            return Err("a job is already running".into());
+    spawn_daemon()?;
+    for _ in 0..100 {
+        if daemon_alive().await {
+            return Ok(());
         }
-        let token = CancellationToken::new();
-        *slot = Some(token.clone());
-        Ok(token)
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    anyhow::bail!("daemon did not come up");
+}
 
-    fn end_job(&self) {
-        *self.job.lock().expect("job slot poisoned") = None;
+async fn daemon_alive() -> bool {
+    ipc::call(json!({"cmd": "status"}), |_| {}).await.is_ok()
+}
+
+// the daemon binary ships next to the gui binary
+fn spawn_daemon() -> std::io::Result<()> {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(daemon_bin_name())))
+        .unwrap_or_else(|| PathBuf::from(daemon_bin_name()));
+    let mut cmd = std::process::Command::new(exe);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // own process group so the daemon survives the gui and ignores its signals
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
     }
+    cmd.spawn()?;
+    tracing::info!("spawned daemon");
+    Ok(())
+}
 
-    fn cancel_current(&self) {
-        if let Some(token) = self.job.lock().expect("job slot poisoned").as_ref() {
-            tracing::info!("cancel requested");
-            token.cancel();
-        }
+fn daemon_bin_name() -> &'static str {
+    if cfg!(windows) {
+        "bakemono-app-daemon.exe"
+    } else {
+        "bakemono-app-daemon"
     }
 }
 
-fn emitter(app: AppHandle) -> impl Fn(Progress) + Send + Sync {
-    move |progress| {
-        let _ = app.emit("progress", progress);
+#[cfg(unix)]
+fn shutdown_daemon_blocking() {
+    use std::io::Write;
+    if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(ipc::socket_path()) {
+        let _ = stream.write_all(b"{\"cmd\":\"shutdown\"}\n");
+        let _ = stream.flush();
     }
 }
+
+#[cfg(not(unix))]
+fn shutdown_daemon_blocking() {}
 
 fn scrape_dest() -> PathBuf {
     crate::core::data_dir().join("scrape")
 }
 
-// a chosen browser wins over a cookies file; either is optional (public posts need neither)
-fn resolve_login(
-    browser: Option<String>,
-    cookies: Option<String>,
-) -> Result<Option<Cookies>, String> {
-    if let Some(browser) = browser.filter(|b| !b.trim().is_empty()) {
-        return Ok(Some(Cookies::Browser(browser)));
-    }
-    match cookies.filter(|c| !c.trim().is_empty()) {
-        Some(raw) => Ok(Some(Cookies::File(resolve_cookies(&raw)?))),
-        None => Ok(None),
-    }
-}
-
-// resolve to an absolute path so gallery-dl finds it regardless of the app's working directory
-fn resolve_cookies(raw: &str) -> Result<PathBuf, String> {
+// resolve to an absolute path so the daemon (with its own cwd) finds the cookies file
+fn resolve_cookies(raw: &str) -> Result<String, String> {
     let path = PathBuf::from(raw);
     let absolute = if path.is_absolute() {
         path
@@ -273,7 +287,7 @@ fn resolve_cookies(raw: &str) -> Result<PathBuf, String> {
     if !absolute.is_file() {
         return Err(format!("cookies file not found: {}", absolute.display()));
     }
-    Ok(absolute)
+    Ok(absolute.to_string_lossy().into_owned())
 }
 
 #[derive(Serialize)]
@@ -286,10 +300,8 @@ struct Paths {
 fn init_logging() -> tracing_appender::non_blocking::WorkerGuard {
     let dir = crate::core::data_dir().join("logs");
     std::fs::create_dir_all(&dir).ok();
-    let (file_writer, guard) = tracing_appender::non_blocking(tracing_appender::rolling::daily(
-        &dir,
-        "bakemono.log",
-    ));
+    let (file_writer, guard) =
+        tracing_appender::non_blocking(tracing_appender::rolling::daily(&dir, "gui.log"));
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::registry()

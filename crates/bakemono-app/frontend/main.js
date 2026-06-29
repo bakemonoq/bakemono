@@ -85,10 +85,37 @@ async function refreshPaths() {
     `scrapes: <code>${p.scrape_dir}</code><br>logs: <code>${p.log_dir}</code>`
 }
 
+async function refreshDaemon() {
+  try {
+    const s = await invoke('daemon_status')
+    $('dstatus').textContent = s.running ? 'running a job' : (s.seeding ? 'seeding' : 'idle')
+  } catch {
+    $('dstatus').textContent = 'stopped'
+  }
+}
+
+$('drestart').onclick = async () => {
+  $('dstatus').textContent = 'restarting...'
+  try { await invoke('restart_daemon') } catch (e) { log('restart failed: ' + e) }
+  refreshDaemon()
+}
+
+$('dstop').onclick = async () => {
+  try { await invoke('stop_daemon') } catch (e) { log('stop failed: ' + e) }
+  refreshDaemon()
+}
+
+// identity/relay changes only take effect once the daemon reloads them
+async function applyToDaemon() {
+  try { await invoke('restart_daemon') } catch (e) { log('daemon restart failed: ' + e) }
+  refreshDaemon()
+}
+
 $('gen').onclick = async () => {
   if (!confirm('Replace the current identity with a new keypair?')) return
   $('npub').textContent = await invoke('generate_identity')
-  log('generated new identity')
+  log('generated new identity, restarting daemon')
+  applyToDaemon()
 }
 
 $('imp').onclick = async () => {
@@ -96,7 +123,8 @@ $('imp').onclick = async () => {
   if (!nsec) return
   try {
     $('npub').textContent = await invoke('import_identity', { nsec })
-    log('imported identity')
+    log('imported identity, restarting daemon')
+    applyToDaemon()
   } catch (err) {
     alert('import failed: ' + err)
   }
@@ -112,7 +140,8 @@ $('saveSettings').onclick = async () => {
   const trackers = lines('trackers')
   const stun = lines('stun')
   await invoke('save_settings', { relays, trackers, stun })
-  log(`saved settings: ${relays.length} relay(s), ${trackers.length} tracker(s), ${stun.length} STUN`)
+  log(`saved settings: ${relays.length} relay(s), ${trackers.length} tracker(s), ${stun.length} STUN; restarting daemon`)
+  applyToDaemon()
 }
 
 $('stop').onclick = async () => {
@@ -135,3 +164,4 @@ refreshIdentity()
 refreshConfig()
 refreshPaths()
 refreshStats()
+refreshDaemon()
