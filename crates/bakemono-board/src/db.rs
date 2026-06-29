@@ -74,6 +74,35 @@ pub async fn creators(pool: &PgPool) -> Result<Vec<CreatorRow>> {
     Ok(rows)
 }
 
+pub async fn search_creators(pool: &PgPool, query: &str) -> Result<Vec<CreatorRow>> {
+    let rows = sqlx::query_as::<_, CreatorRow>(
+        "SELECT platform, creator_id, MAX(creator) AS creator,
+                COUNT(DISTINCT post_id) AS posts, COUNT(DISTINCT file_hash) AS files
+         FROM visible_manifests
+         GROUP BY platform, creator_id
+         HAVING MAX(creator) ILIKE '%' || $1 || '%'
+         ORDER BY creator",
+    )
+    .bind(query)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+pub async fn stats(pool: &PgPool) -> Result<Stats> {
+    let row = sqlx::query_as::<_, Stats>(
+        "SELECT
+            COUNT(DISTINCT (platform, creator_id, post_id)) AS posts,
+            COUNT(DISTINCT (platform, creator_id)) AS authors,
+            COUNT(DISTINCT file_hash) AS files,
+            COUNT(DISTINCT pubkey) AS contributors
+         FROM visible_manifests",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row)
+}
+
 pub async fn posts_by_creator(
     pool: &PgPool,
     platform: &str,
@@ -224,6 +253,14 @@ pub struct PendingRow {
     pub files: i64,
     pub creator: Option<String>,
     pub sample: Option<String>,
+}
+
+#[derive(sqlx::FromRow, Default)]
+pub struct Stats {
+    pub posts: i64,
+    pub authors: i64,
+    pub files: i64,
+    pub contributors: i64,
 }
 
 #[derive(sqlx::FromRow)]

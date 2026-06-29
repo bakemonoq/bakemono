@@ -38,6 +38,11 @@ services:
       BAKEMONO_INSTANCE_NSEC: ${BAKEMONO_INSTANCE_NSEC:-}
       # peer instance npubs/hex whose takedowns this board honors, comma-separated
       BAKEMONO_TRUSTED_INSTANCES: ${BAKEMONO_TRUSTED_INSTANCES:-}
+      # board title shown in the header, browser tab and /info; unset keeps the default wordmark
+      BAKEMONO_BOARD_NAME: ${BAKEMONO_BOARD_NAME:-}
+      # DMCA and general contact shown on /info
+      BAKEMONO_DMCA_CONTACT: ${BAKEMONO_DMCA_CONTACT:-}
+      BAKEMONO_CONTACT: ${BAKEMONO_CONTACT:-}
     ports:
       - "3000:3000"
     depends_on:
