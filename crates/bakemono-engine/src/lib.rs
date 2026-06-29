@@ -5,6 +5,7 @@ pub mod daemon;
 pub mod ipc;
 pub mod logging;
 pub mod seeder;
+pub mod version;
 
 use std::path::PathBuf;
 

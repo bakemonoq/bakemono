@@ -14,6 +14,7 @@ use source::FarmContentSource;
 #[tokio::main]
 async fn main() -> Result<()> {
     let _log_guard = logging::init("seednode");
+    bakemono_engine::version::spawn_log_check(env!("CARGO_PKG_VERSION"));
     let config = AppConfig::load().unwrap_or_default();
     let content_dir = bakemono_engine::data_dir().join("cache");
     std::fs::create_dir_all(&content_dir).ok();

@@ -22,6 +22,9 @@ async fn main() -> Result<()> {
     if !ipc::is_running().await {
         bail!("the bakemono daemon is not running\nstart it with `bakemono-daemon` (or your service manager), then retry");
     }
+    if let Some(latest) = bakemono_engine::version::cached_newer(env!("CARGO_PKG_VERSION")) {
+        eprintln!("a newer bakemono release is available ({latest}): {}", bakemono_engine::version::RELEASES_URL);
+    }
     match cmd {
         "scrape" => scrape(&args[1..]).await,
         "ingest" => {
