@@ -37,6 +37,10 @@ pub fn run() {
             });
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move { notify_if_update(handle).await });
+            // macOS Cmd+Q (the default Quit item) fires no tauri event, so the daemon never gets
+            // the stop signal; install a menu whose Quit we can intercept
+            #[cfg(target_os = "macos")]
+            install_macos_menu(app)?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -87,6 +91,51 @@ fn stop_daemon_if_configured() {
         shutdown_daemon_blocking();
         tracing::info!("stopped daemon on exit");
     }
+}
+
+// replace the default macOS menu so Cmd+Q routes through our own Quit item; keep the Edit submenu
+// so copy/paste still works in the webview's text fields
+#[cfg(target_os = "macos")]
+fn install_macos_menu(app: &tauri::App) -> tauri::Result<()> {
+    use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
+    let quit = MenuItemBuilder::with_id("quit", "Quit Bakemono")
+        .accelerator("Cmd+Q")
+        .build(app)?;
+    let app_menu = SubmenuBuilder::new(app, "Bakemono")
+        .about(None)
+        .separator()
+        .hide()
+        .hide_others()
+        .show_all()
+        .separator()
+        .item(&quit)
+        .build()?;
+    let edit_menu = SubmenuBuilder::new(app, "Edit")
+        .undo()
+        .redo()
+        .separator()
+        .cut()
+        .copy()
+        .paste()
+        .select_all()
+        .build()?;
+    let window_menu = SubmenuBuilder::new(app, "Window")
+        .minimize()
+        .separator()
+        .close_window()
+        .build()?;
+    let menu = MenuBuilder::new(app)
+        .items(&[&app_menu, &edit_menu, &window_menu])
+        .build()?;
+    app.set_menu(menu)?;
+    let quit_id = quit.id().clone();
+    app.on_menu_event(move |app, event| {
+        if event.id() == &quit_id {
+            stop_daemon_if_configured();
+            app.exit(0);
+        }
+    });
+    Ok(())
 }
 
 #[tauri::command]
