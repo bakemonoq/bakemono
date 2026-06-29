@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -13,6 +14,7 @@ use bakemono_core::protocol::KIND_MANIFEST;
 use bakemono_core::Manifest;
 use bakemono_daemon::config::AppConfig;
 use bakemono_daemon::daemon::Daemon;
+use bakemono_daemon::ipc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -39,6 +41,18 @@ async fn main() -> Result<()> {
         let count = daemon.reseed().await?;
         daemon.shutdown().await;
         println!("reseeded {count} file(s) from {}", dir.display());
+        return Ok(());
+    }
+
+    // ipc drives a real daemon over the socket, end to end, in one process
+    if let Mode::Ipc { dir } = &opts.mode {
+        return run_ipc_test(dir.clone(), config).await;
+    }
+
+    // status connects to an already-running daemon process and prints its status
+    if let Mode::DaemonStatus = &opts.mode {
+        let result = ipc::call(json!({"cmd": "status"}), |_| {}).await?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
     }
 
@@ -73,8 +87,61 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+async fn run_ipc_test(dir: PathBuf, config: AppConfig) -> Result<()> {
+    // isolate the socket + staging + config under a throwaway data dir
+    let tmp = std::env::temp_dir().join(format!("bakemono-ipc-{}", std::process::id()));
+    std::env::set_var("BAKEMONO_DATA_DIR", &tmp);
+
+    let relay = MockRelay::run().await.context("starting embedded relay")?;
+    let url = relay.url().await.to_string();
+    eprintln!("embedded relay at {url}");
+
+    let source = AppContentSource {
+        relays: vec![url.clone()],
+        identity: Identity::generate(),
+    };
+    let daemon = Arc::new(Daemon::new(config, dir.clone(), source));
+    let server = {
+        let daemon = daemon.clone();
+        tokio::spawn(async move {
+            let _ = ipc::serve(daemon).await;
+        })
+    };
+
+    // wait for the daemon to bind its socket
+    let sock = ipc::socket_path();
+    for _ in 0..100 {
+        if sock.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    eprintln!("daemon socket at {}", sock.display());
+
+    let progress = |event: Value| {
+        if let Ok(p) = serde_json::from_value::<Progress>(event) {
+            println!("  {}", render(&p));
+        }
+    };
+    let job = json!({"cmd": "run", "job": {"kind": "ingest", "dir": dir.to_string_lossy()}});
+    let result = ipc::call(job, progress).await?;
+    let summary: RunSummary = serde_json::from_value(result)?;
+
+    verify(&url, &summary).await?;
+    let _ = ipc::call(json!({"cmd": "shutdown"}), |_| {}).await;
+    let _ = server.await;
+    let _ = std::fs::remove_dir_all(&tmp);
+    println!(
+        "\nPASS: {} event(s) published and verified over IPC",
+        summary.event_ids.len()
+    );
+    Ok(())
+}
+
 fn job_from_mode(mode: &Mode) -> (PathBuf, Value) {
     match mode {
+        Mode::Ipc { .. } => unreachable!("ipc is handled before this"),
+        Mode::DaemonStatus => unreachable!("status is handled before this"),
         Mode::Reseed { .. } => unreachable!("reseed is handled before this"),
         Mode::Ingest { dir } => (
             dir.clone(),
@@ -168,6 +235,10 @@ enum Mode {
     Reseed {
         dir: PathBuf,
     },
+    Ipc {
+        dir: PathBuf,
+    },
+    DaemonStatus,
     Scrape {
         creator: String,
         limit: Option<u32>,
@@ -219,6 +290,10 @@ impl Opts {
             Some("reseed") => Mode::Reseed {
                 dir: rest.first().map(PathBuf::from).unwrap_or_else(default_dir),
             },
+            Some("ipc") => Mode::Ipc {
+                dir: rest.first().map(PathBuf::from).unwrap_or_else(default_dir),
+            },
+            Some("status") => Mode::DaemonStatus,
             Some("scrape") => Mode::Scrape {
                 creator: rest.first().cloned().context("scrape needs a creator")?,
                 limit,
@@ -239,4 +314,4 @@ fn default_dir() -> PathBuf {
     PathBuf::from("out")
 }
 
-const USAGE: &str = "usage:\n  scrapetest [ingest [DIR]] [--tracker URL]... [--no-seed]\n  scrapetest scrape <creator> [--limit N] [--cookies FILE] [--dest DIR] [--tracker URL]... [--no-seed]";
+const USAGE: &str = "usage:\n  scrapetest [ingest [DIR]] [--tracker URL]... [--no-seed]\n  scrapetest reseed [DIR]\n  scrapetest ipc [DIR]\n  scrapetest scrape <creator> [--limit N] [--cookies FILE] [--dest DIR] [--tracker URL]... [--no-seed]";

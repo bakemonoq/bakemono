@@ -9,10 +9,12 @@ repository.workspace = true
 [dependencies]
 bakemono-core = { path = "../bakemono-core" }
 bakemono-seeder = { path = "../bakemono-seeder" }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "net"] }
 tokio-util.workspace = true
 anyhow.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 dirs.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true

@@ -84,9 +84,11 @@ impl<C: ContentSource> Daemon<C> {
     }
 
     pub async fn status(&self) -> Status {
+        let running = self.lock_job().is_some();
+        let seeding = self.seeder.is_started().await;
         Status {
-            running: self.lock_job().is_some(),
-            seeding: self.seeder.is_started().await,
+            running,
+            seeding,
             content_dir: self.content_dir.display().to_string(),
         }
     }

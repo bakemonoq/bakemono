@@ -20,6 +20,10 @@ name = "scrapetest"
 path = "src/bin/scrapetest.rs"
 required-features = ["harness"]
 
+[[bin]]
+name = "bakemono-app-daemon"
+path = "src/bin/daemon.rs"
+
 [dependencies]
 bakemono-core = { path = "../bakemono-core" }
 bakemono-daemon = { path = "../bakemono-daemon" }

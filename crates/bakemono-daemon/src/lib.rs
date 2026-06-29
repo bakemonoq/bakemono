@@ -1,6 +1,8 @@
 pub mod config;
 pub mod content;
 pub mod daemon;
+pub mod ipc;
+pub mod logging;
 pub mod seeder;
 
 use std::path::PathBuf;
