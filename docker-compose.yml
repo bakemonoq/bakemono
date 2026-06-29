@@ -33,6 +33,8 @@ services:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/bakemono?sslmode=disable
       BAKEMONO_RELAYS: ${BAKEMONO_RELAYS:-ws://relay:8080}
       BAKEMONO_ICE_SERVERS: ${BAKEMONO_ICE_SERVERS:-[]}
+      # mod queue password (HTTP Basic auth); leave unset to disable /mod
+      BAKEMONO_MOD_TOKEN: ${BAKEMONO_MOD_TOKEN:-}
     ports:
       - "3000:3000"
     depends_on:
