@@ -207,21 +207,12 @@ name = "bakemono-app"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "bakemono-core",
  "bakemono-engine",
- "bakemono-scraper",
- "bakemono-seeder",
- "dirs",
- "hex",
- "nostr-relay-builder",
- "nostr-sdk",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "tauri",
  "tauri-build",
  "tokio",
- "tokio-util",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -250,6 +241,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "bakemono-daemon"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "bakemono-core",
+ "bakemono-engine",
+ "bakemono-scraper",
+ "hex",
+ "nostr-relay-builder",
+ "nostr-sdk",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "bakemono-engine"
 version = "0.0.0"
 dependencies = [
@@ -257,6 +267,7 @@ dependencies = [
  "bakemono-core",
  "bakemono-seeder",
  "dirs",
+ "nostr",
  "serde",
  "serde_json",
  "tokio",

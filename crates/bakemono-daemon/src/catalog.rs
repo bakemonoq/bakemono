@@ -5,7 +5,7 @@ use std::path::Path;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::scrape::gather_pairs;
+use crate::scrape::gather_pairs;
 
 // the scrape directory is the source of truth; stats are derived from it, never cached on disk
 #[derive(Debug, Clone, Serialize)]

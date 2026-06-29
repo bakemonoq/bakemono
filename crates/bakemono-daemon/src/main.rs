@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use bakemono_app::core::identity::{key_path, Identity};
-use bakemono_app::core::source::{scrape_dest, AppContentSource};
+use bakemono_engine::identity::{key_path, Identity};
+use bakemono_daemon::source::{scrape_dest, AppContentSource};
 use bakemono_engine::config::AppConfig;
 use bakemono_engine::daemon::Daemon;
 use bakemono_engine::{ipc, logging};

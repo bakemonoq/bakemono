@@ -93,6 +93,10 @@ impl<C: ContentSource> Daemon<C> {
         }
     }
 
+    pub fn stats(&self) -> Value {
+        self.source.stats(&self.content_dir)
+    }
+
     pub async fn shutdown(&self) {
         self.cancel();
         self.seeder.shutdown().await;

@@ -8,9 +8,9 @@ use tokio_util::sync::CancellationToken;
 use bakemono_core::Manifest;
 use bakemono_scraper::{ScrapeRequest, Scraper};
 
-use super::identity::Identity;
-use super::scrape::{gather_pairs, manifest_from_files};
-use super::seeder::SeederHandle;
+use bakemono_engine::identity::Identity;
+use crate::scrape::{gather_pairs, manifest_from_files};
+use bakemono_engine::seeder::SeederHandle;
 
 pub type ProgressFn<'a> = &'a (dyn Fn(Progress) + Send + Sync);
 

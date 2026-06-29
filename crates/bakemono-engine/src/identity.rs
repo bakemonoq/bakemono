@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use nostr_sdk::prelude::*;
+use nostr::prelude::*;
 
 #[derive(Clone)]
 pub struct Identity {

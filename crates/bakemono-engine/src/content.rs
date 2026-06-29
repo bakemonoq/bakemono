@@ -24,4 +24,10 @@ pub trait ContentSource: Send + Sync + 'static {
 
     // files to (re)seed on startup, i.e. the current content set on disk
     fn seedable(&self, content_dir: &Path) -> Vec<PathBuf>;
+
+    // opaque stats for the `stats` ipc command (files/bytes/...); default = none
+    fn stats(&self, content_dir: &Path) -> Value {
+        let _ = content_dir;
+        Value::Null
+    }
 }

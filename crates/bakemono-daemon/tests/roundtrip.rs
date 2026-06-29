@@ -7,8 +7,8 @@ use nostr_relay_builder::MockRelay;
 use nostr_sdk::prelude::*;
 use tokio_util::sync::CancellationToken;
 
-use bakemono_app::core::identity::Identity;
-use bakemono_app::core::pipeline::{run_ingest, JobContext, Progress};
+use bakemono_engine::identity::Identity;
+use bakemono_daemon::pipeline::{run_ingest, JobContext, Progress};
 use bakemono_core::Manifest;
 
 const SIDECAR: &str = r#"{

@@ -7,11 +7,9 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, State};
 use tracing_subscriber::prelude::*;
 
+use bakemono_engine::config::AppConfig;
+use bakemono_engine::identity::{key_path, Identity};
 use bakemono_engine::ipc;
-
-use crate::core::catalog::{self, CatalogStats};
-use crate::core::config::AppConfig;
-use crate::core::identity::{key_path, Identity};
 
 // the GUI is a thin client: the daemon process does the seeding/scraping/publishing, the GUI
 // just drives it over the local socket and manages identity/config files on disk
@@ -20,7 +18,7 @@ pub fn run() {
     let identity = Identity::load_or_generate(&key_path()).expect("loading identity");
     let config = AppConfig::load().unwrap_or_default();
     tracing::info!(
-        data_dir = %crate::core::data_dir().display(),
+        data_dir = %bakemono_engine::data_dir().display(),
         npub = %identity.npub().unwrap_or_default(),
         "starting bakemono gui"
     );
@@ -135,7 +133,7 @@ async fn start_daemon() -> Result<(), String> {
 
 #[tauri::command]
 fn app_paths() -> Paths {
-    let data = crate::core::data_dir();
+    let data = bakemono_engine::data_dir();
     Paths {
         data_dir: data.display().to_string(),
         scrape_dir: scrape_dest().display().to_string(),
@@ -144,8 +142,10 @@ fn app_paths() -> Paths {
 }
 
 #[tauri::command]
-fn sharing_stats() -> CatalogStats {
-    catalog::stats(&scrape_dest())
+async fn sharing_stats() -> Result<Value, String> {
+    ipc::call(json!({"cmd": "stats"}), |_| {})
+        .await
+        .map_err(stringify)
 }
 
 #[tauri::command]
@@ -270,9 +270,9 @@ fn spawn_daemon() -> std::io::Result<()> {
 
 fn daemon_bin_name() -> &'static str {
     if cfg!(windows) {
-        "bakemono-app-daemon.exe"
+        "bakemono-daemon.exe"
     } else {
-        "bakemono-app-daemon"
+        "bakemono-daemon"
     }
 }
 
@@ -289,7 +289,7 @@ fn shutdown_daemon_blocking() {
 fn shutdown_daemon_blocking() {}
 
 fn scrape_dest() -> PathBuf {
-    crate::core::data_dir().join("scrape")
+    bakemono_engine::data_dir().join("scrape")
 }
 
 // resolve to an absolute path so the daemon (with its own cwd) finds the cookies file
@@ -316,7 +316,7 @@ struct Paths {
 }
 
 fn init_logging() -> tracing_appender::non_blocking::WorkerGuard {
-    let dir = crate::core::data_dir().join("logs");
+    let dir = bakemono_engine::data_dir().join("logs");
     std::fs::create_dir_all(&dir).ok();
     let (file_writer, guard) =
         tracing_appender::non_blocking(tracing_appender::rolling::daily(&dir, "gui.log"));

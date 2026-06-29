@@ -7,9 +7,9 @@ use nostr_relay_builder::MockRelay;
 use nostr_sdk::prelude::*;
 use serde_json::{json, Value};
 
-use bakemono_app::core::identity::Identity;
-use bakemono_app::core::pipeline::{Progress, RunSummary};
-use bakemono_app::core::source::AppContentSource;
+use bakemono_engine::identity::Identity;
+use bakemono_daemon::pipeline::{Progress, RunSummary};
+use bakemono_daemon::source::AppContentSource;
 use bakemono_core::protocol::KIND_MANIFEST;
 use bakemono_core::Manifest;
 use bakemono_engine::config::AppConfig;

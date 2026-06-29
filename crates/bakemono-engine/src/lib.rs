@@ -1,4 +1,5 @@
 pub mod config;
+pub mod identity;
 pub mod content;
 pub mod daemon;
 pub mod ipc;

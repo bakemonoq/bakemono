@@ -10,9 +10,9 @@ use bakemono_engine::content::{ContentSource, ProgressFn};
 use bakemono_engine::seeder::SeederHandle;
 use bakemono_scraper::{Cookies, ScrapeRequest};
 
-use super::identity::Identity;
-use super::pipeline::{run_ingest, run_scrape, JobContext, Progress};
-use super::scrape::gather_pairs;
+use bakemono_engine::identity::Identity;
+use crate::pipeline::{run_ingest, run_scrape, JobContext, Progress};
+use crate::scrape::gather_pairs;
 
 // the app's half of the daemon: scrape -> hash -> sign -> publish -> seed what I made
 pub struct AppContentSource {
@@ -83,10 +83,14 @@ impl ContentSource for AppContentSource {
             .map(|(media, _sidecar)| media)
             .collect()
     }
+
+    fn stats(&self, content_dir: &Path) -> Value {
+        serde_json::to_value(crate::catalog::stats(content_dir)).unwrap_or(Value::Null)
+    }
 }
 
 pub fn scrape_dest() -> PathBuf {
-    crate::core::data_dir().join("scrape")
+    bakemono_engine::data_dir().join("scrape")
 }
 
 // a chosen browser wins over a cookies file; either is optional (public posts need neither)

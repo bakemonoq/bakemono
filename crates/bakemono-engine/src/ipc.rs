@@ -46,6 +46,10 @@ where
             let status = daemon.status().await;
             write_line(&mut writer, &json!({"ok": true, "result": status})).await?;
         }
+        "stats" => {
+            let stats = daemon.stats();
+            write_line(&mut writer, &json!({"ok": true, "result": stats})).await?;
+        }
         "cancel" => {
             daemon.cancel();
             write_line(&mut writer, &json!({"ok": true})).await?;
