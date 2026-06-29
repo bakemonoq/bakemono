@@ -78,11 +78,21 @@ impl Takedown {
 }
 
 impl Target {
-    fn parts(&self) -> (&'static str, &str) {
+    // tag key (`e`/`x`/`p`) and value, the same pair used in the d_tag and the target tag
+    pub fn parts(&self) -> (&'static str, &str) {
         match self {
             Target::Event(v) => (tags::EVENT_REF, v),
             Target::FileHash(v) => (tags::X, v),
             Target::Pubkey(v) => (tags::PUBKEY_REF, v),
+        }
+    }
+
+    pub fn from_parts(kind: &str, value: String) -> Option<Self> {
+        match kind {
+            tags::EVENT_REF => Some(Target::Event(value)),
+            tags::X => Some(Target::FileHash(value)),
+            tags::PUBKEY_REF => Some(Target::Pubkey(value)),
+            _ => None,
         }
     }
 

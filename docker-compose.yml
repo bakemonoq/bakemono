@@ -35,6 +35,10 @@ services:
       BAKEMONO_ICE_SERVERS: ${BAKEMONO_ICE_SERVERS:-[]}
       # mod queue password (HTTP Basic auth); leave unset to disable /mod
       BAKEMONO_MOD_TOKEN: ${BAKEMONO_MOD_TOKEN:-}
+      # instance keypair (nsec) that signs kind 31064 takedowns; unset keeps hides local-only
+      BAKEMONO_INSTANCE_NSEC: ${BAKEMONO_INSTANCE_NSEC:-}
+      # peer instance npubs/hex whose takedowns this board honors, comma-separated
+      BAKEMONO_TRUSTED_INSTANCES: ${BAKEMONO_TRUSTED_INSTANCES:-}
     ports:
       - "3000:3000"
     depends_on:

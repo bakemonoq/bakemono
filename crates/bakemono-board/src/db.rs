@@ -2,7 +2,7 @@ use anyhow::Result;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
 use bakemono_core::nostr::Event;
-use bakemono_core::Manifest;
+use bakemono_core::{Manifest, Takedown};
 
 pub async fn connect(url: &str) -> Result<PgPool> {
     let pool = PgPoolOptions::new().max_connections(5).connect(url).await?;
@@ -66,8 +66,7 @@ pub async fn creators(pool: &PgPool) -> Result<Vec<CreatorRow>> {
     let rows = sqlx::query_as::<_, CreatorRow>(
         "SELECT platform, creator_id, MAX(creator) AS creator,
                 COUNT(DISTINCT post_id) AS posts, COUNT(DISTINCT file_hash) AS files
-         FROM manifests
-         WHERE pubkey IN (SELECT pubkey FROM pubkeys WHERE status = 'approved')
+         FROM visible_manifests
          GROUP BY platform, creator_id ORDER BY creator",
     )
     .fetch_all(pool)
@@ -84,9 +83,8 @@ pub async fn posts_by_creator(
         "SELECT platform, creator_id, post_id, MAX(creator) AS creator,
                 MAX(post_title) AS post_title, MAX(posted_at) AS posted_at,
                 COUNT(DISTINCT file_hash) AS files
-         FROM manifests
+         FROM visible_manifests
          WHERE platform = $1 AND creator_id = $2
-           AND pubkey IN (SELECT pubkey FROM pubkeys WHERE status = 'approved')
          GROUP BY platform, creator_id, post_id
          ORDER BY MAX(posted_at) DESC NULLS LAST, MAX(created_at) DESC",
     )
@@ -106,9 +104,8 @@ pub async fn post_files(
     // dedup by file hash (latest event per identical content), then order for display
     let rows = sqlx::query_as::<_, ManifestRow>(
         "SELECT * FROM (
-             SELECT DISTINCT ON (file_hash) * FROM manifests
+             SELECT DISTINCT ON (file_hash) * FROM visible_manifests
              WHERE platform = $1 AND creator_id = $2 AND post_id = $3
-               AND pubkey IN (SELECT pubkey FROM pubkeys WHERE status = 'approved')
              ORDER BY file_hash, created_at DESC
          ) t ORDER BY file_index",
     )
@@ -123,8 +120,7 @@ pub async fn post_files(
 pub async fn recent(pool: &PgPool, limit: i64) -> Result<Vec<ManifestRow>> {
     let rows = sqlx::query_as::<_, ManifestRow>(
         "SELECT * FROM (
-             SELECT DISTINCT ON (file_hash) * FROM manifests
-             WHERE pubkey IN (SELECT pubkey FROM pubkeys WHERE status = 'approved')
+             SELECT DISTINCT ON (file_hash) * FROM visible_manifests
              ORDER BY file_hash, created_at DESC
          ) t ORDER BY created_at DESC LIMIT $1",
     )
@@ -166,6 +162,60 @@ pub async fn reject_pubkey(pool: &PgPool, pubkey: &str) -> Result<()> {
         .execute(pool)
         .await?;
     Ok(())
+}
+
+// hide a target locally; the d_tag is the NIP-33 replaceable id so a fresh decision on the same
+// target overwrites the old one. source is "local" or the signer pubkey of a honored peer takedown
+pub async fn record_takedown(
+    pool: &PgPool,
+    takedown: &Takedown,
+    source: &str,
+    event_id: Option<&str>,
+) -> Result<()> {
+    let (target_type, target) = takedown.target.parts();
+    sqlx::query(UPSERT_TAKEDOWN)
+        .bind(takedown.d_tag())
+        .bind(target_type)
+        .bind(target)
+        .bind(&takedown.reason)
+        .bind(&takedown.explanation)
+        .bind(source)
+        .bind(event_id)
+        .bind(takedown.applied_at.as_deref().unwrap_or(""))
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn remove_takedown(pool: &PgPool, d_tag: &str) -> Result<()> {
+    sqlx::query("DELETE FROM takedowns WHERE d_tag = $1")
+        .bind(d_tag)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn takedowns(pool: &PgPool) -> Result<Vec<TakedownRow>> {
+    let rows = sqlx::query_as::<_, TakedownRow>(
+        "SELECT d_tag, target_type, target, reason, explanation, source, event_id, applied_at
+         FROM takedowns ORDER BY applied_at DESC, d_tag",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+#[derive(sqlx::FromRow)]
+#[allow(dead_code)]
+pub struct TakedownRow {
+    pub d_tag: String,
+    pub target_type: String,
+    pub target: String,
+    pub reason: String,
+    pub explanation: String,
+    pub source: String,
+    pub event_id: Option<String>,
+    pub applied_at: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -254,6 +304,29 @@ CREATE TABLE IF NOT EXISTS pubkeys (
 INSERT INTO pubkeys (pubkey, status, first_seen)
 SELECT pubkey, 'pending', MIN(created_at) FROM manifests GROUP BY pubkey
 ON CONFLICT (pubkey) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS takedowns (
+    d_tag       TEXT PRIMARY KEY,
+    target_type TEXT NOT NULL,
+    target      TEXT NOT NULL,
+    reason      TEXT NOT NULL,
+    explanation TEXT NOT NULL DEFAULT '',
+    source      TEXT NOT NULL,
+    event_id    TEXT,
+    applied_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS takedowns_target ON takedowns (target_type, target);
+
+-- the single definition of what the public UI shows: approved pubkeys, minus anything a takedown hides
+CREATE OR REPLACE VIEW visible_manifests AS
+SELECT m.* FROM manifests m
+WHERE m.pubkey IN (SELECT pubkey FROM pubkeys WHERE status = 'approved')
+  AND NOT EXISTS (
+      SELECT 1 FROM takedowns t WHERE
+          (t.target_type = 'e' AND t.target = m.event_id) OR
+          (t.target_type = 'x' AND t.target = m.file_hash) OR
+          (t.target_type = 'p' AND t.target = m.pubkey)
+  );
 ";
 
 const INSERT: &str = "
@@ -264,10 +337,24 @@ INSERT INTO manifests (
 ON CONFLICT (event_id) DO NOTHING
 ";
 
+const UPSERT_TAKEDOWN: &str = "
+INSERT INTO takedowns (d_tag, target_type, target, reason, explanation, source, event_id, applied_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+ON CONFLICT (d_tag) DO UPDATE SET
+    target_type = EXCLUDED.target_type,
+    target = EXCLUDED.target,
+    reason = EXCLUDED.reason,
+    explanation = EXCLUDED.explanation,
+    source = EXCLUDED.source,
+    event_id = COALESCE(EXCLUDED.event_id, takedowns.event_id),
+    applied_at = EXCLUDED.applied_at
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bakemono_core::nostr::Keys;
+    use bakemono_core::Target;
 
     // set BAKEMONO_TEST_DB to a Postgres url to run, otherwise skipped
     #[tokio::test]
@@ -289,6 +376,9 @@ mod tests {
 
         let older = manifest.to_event_at(&keys, 1_000).unwrap();
         upsert(&pool, &older, &manifest).await.unwrap();
+        approve_pubkey(&pool, &keys.public_key().to_hex())
+            .await
+            .unwrap();
         let files = post_files(&pool, &manifest.platform, &creator_id, &manifest.post_id)
             .await
             .unwrap();
@@ -330,15 +420,89 @@ mod tests {
         let manifest = sample(&creator_id);
 
         // same content, two different contributors (pubkeys) -> shown once
-        let a = manifest.to_event(&Keys::generate()).unwrap();
-        let b = manifest.to_event(&Keys::generate()).unwrap();
+        let ka = Keys::generate();
+        let kb = Keys::generate();
+        let a = manifest.to_event(&ka).unwrap();
+        let b = manifest.to_event(&kb).unwrap();
         upsert(&pool, &a, &manifest).await.unwrap();
         upsert(&pool, &b, &manifest).await.unwrap();
+        approve_pubkey(&pool, &ka.public_key().to_hex())
+            .await
+            .unwrap();
+        approve_pubkey(&pool, &kb.public_key().to_hex())
+            .await
+            .unwrap();
 
         let files = post_files(&pool, &manifest.platform, &creator_id, &manifest.post_id)
             .await
             .unwrap();
         assert_eq!(files.len(), 1);
+
+        sqlx::query("DELETE FROM manifests WHERE creator_id = $1")
+            .bind(&creator_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn takedown_hides_then_unhides_a_file() {
+        let Ok(url) = std::env::var("BAKEMONO_TEST_DB") else {
+            eprintln!("skipping: BAKEMONO_TEST_DB not set");
+            return;
+        };
+        let pool = match connect(&url).await {
+            Ok(pool) => pool,
+            Err(e) => {
+                eprintln!("skipping: cannot reach test db: {e}");
+                return;
+            }
+        };
+        let keys = Keys::generate();
+        let creator_id = format!("takedown-{}", std::process::id());
+        let mut manifest = sample(&creator_id);
+        let hash = format!("{:0<64}", creator_id.replace('-', ""));
+        manifest.file_hash = hash.clone();
+
+        let event = manifest.to_event(&keys).unwrap();
+        upsert(&pool, &event, &manifest).await.unwrap();
+        approve_pubkey(&pool, &keys.public_key().to_hex())
+            .await
+            .unwrap();
+        assert_eq!(
+            post_files(&pool, &manifest.platform, &creator_id, &manifest.post_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let takedown = Takedown {
+            target: Target::FileHash(hash.clone()),
+            reason: "dmca-us".into(),
+            applied_at: Some("2026-06-29T00:00:00+00:00".into()),
+            explanation: String::new(),
+        };
+        record_takedown(&pool, &takedown, "local", None)
+            .await
+            .unwrap();
+        assert!(
+            post_files(&pool, &manifest.platform, &creator_id, &manifest.post_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a file-hash takedown hides the file"
+        );
+
+        remove_takedown(&pool, &takedown.d_tag()).await.unwrap();
+        assert_eq!(
+            post_files(&pool, &manifest.platform, &creator_id, &manifest.post_id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "undoing the takedown brings it back"
+        );
 
         sqlx::query("DELETE FROM manifests WHERE creator_id = $1")
             .bind(&creator_id)

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use bakemono_core::nostr::{Event, EventBuilder, Keys, Kind, Tag};
-use bakemono_core::{replaceable_address, Error, Manifest, ReplaceableAddress};
+use bakemono_core::{replaceable_address, Error, Manifest, ReplaceableAddress, Takedown, Target};
 
 #[test]
 fn manifest_round_trips_through_a_signed_event() {
@@ -56,6 +56,48 @@ fn tampered_event_fails_verification() {
 
     assert!(forged.verify().is_err());
     assert!(bakemono_core::verify(&forged).is_err());
+}
+
+#[test]
+fn takedown_round_trips_through_a_signed_event() {
+    let keys = Keys::generate();
+    let takedown = Takedown {
+        target: Target::FileHash("a3f8d2e1".repeat(8)),
+        reason: "dmca-us".into(),
+        applied_at: Some("2026-06-27T20:00:00Z".into()),
+        explanation: "rights holder request".into(),
+    };
+    let event = takedown.to_event(&keys).unwrap();
+
+    assert!(event.verify().is_ok());
+    assert_eq!(event.kind.as_u16(), 31064);
+    assert_eq!(Takedown::from_event(&event).unwrap(), takedown);
+}
+
+#[test]
+fn takedown_d_tag_is_replaceable_per_target() {
+    let by_hash = Takedown {
+        target: Target::FileHash("abc".into()),
+        reason: "csam".into(),
+        applied_at: None,
+        explanation: String::new(),
+    };
+    let by_pubkey = Takedown {
+        target: Target::Pubkey("def".into()),
+        ..by_hash.clone()
+    };
+    assert_eq!(by_hash.d_tag(), "takedown:x:abc");
+    assert_eq!(by_pubkey.d_tag(), "takedown:p:def");
+    assert_ne!(by_hash.d_tag(), by_pubkey.d_tag());
+}
+
+#[test]
+fn target_from_parts_rejects_unknown_kind() {
+    assert_eq!(
+        Target::from_parts("x", "hash".into()),
+        Some(Target::FileHash("hash".into()))
+    );
+    assert_eq!(Target::from_parts("zzz", "v".into()), None);
 }
 
 fn upsert(store: &mut HashMap<ReplaceableAddress, Event>, event: Event) {

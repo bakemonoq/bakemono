@@ -1,5 +1,6 @@
 mod db;
 mod indexer;
+mod instance;
 mod web;
 
 use anyhow::Result;
@@ -12,19 +13,27 @@ async fn main() -> Result<()> {
     );
     let relays = relays();
     let bind = env_or("BAKEMONO_BIND", "127.0.0.1:3000");
+    let signer = instance::load();
+    let trusted = instance::trusted(signer.as_ref());
 
     let pool = db::connect(&database_url).await?;
 
     let indexer_pool = pool.clone();
+    let indexer_relays = relays.clone();
     tokio::spawn(async move {
-        if let Err(e) = indexer::run(indexer_pool, relays).await {
+        if let Err(e) = indexer::run(indexer_pool, indexer_relays, trusted).await {
             eprintln!("indexer stopped: {e:#}");
         }
     });
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     println!("board on http://{bind}");
-    axum::serve(listener, web::router(pool)).await?;
+    let state = web::AppState {
+        pool,
+        relays,
+        signer,
+    };
+    axum::serve(listener, web::router(state)).await?;
     Ok(())
 }
 

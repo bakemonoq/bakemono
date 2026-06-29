@@ -1,15 +1,33 @@
-use axum::extract::{Form, Path, State};
+use axum::extract::{Form, FromRef, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use base64::Engine;
+use chrono::Utc;
 use maud::{html, Markup, PreEscaped, DOCTYPE};
+use nostr_sdk::prelude::{Client, Event, Keys, PublicKey, ToBech32};
 use sqlx::postgres::PgPool;
+
+use bakemono_core::{Takedown, Target};
 
 use crate::db;
 
-pub fn router(pool: PgPool) -> Router {
+#[derive(Clone)]
+pub struct AppState {
+    pub pool: PgPool,
+    pub relays: Vec<String>,
+    pub signer: Option<Keys>,
+}
+
+// lets handlers that only need the pool keep extracting State<PgPool> unchanged
+impl FromRef<AppState> for PgPool {
+    fn from_ref(state: &AppState) -> Self {
+        state.pool.clone()
+    }
+}
+
+pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(home))
         .route("/c/{platform}/{creator_id}", get(creator_page))
@@ -17,8 +35,10 @@ pub fn router(pool: PgPool) -> Router {
         .route("/mod", get(mod_queue))
         .route("/mod/approve", post(mod_approve))
         .route("/mod/reject", post(mod_reject))
+        .route("/mod/takedown", post(mod_takedown))
+        .route("/mod/untakedown", post(mod_untakedown))
         .route("/webtorrent.min.js", get(webtorrent_js))
-        .with_state(pool)
+        .with_state(state)
 }
 
 async fn home(State(pool): State<PgPool>) -> Html<String> {
@@ -121,11 +141,12 @@ async fn post_page(
     )
 }
 
-async fn mod_queue(State(pool): State<PgPool>, headers: HeaderMap) -> Response {
+async fn mod_queue(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(denied) = require_mod(&headers) {
         return denied;
     }
-    let pending = db::pending_pubkeys(&pool).await.unwrap_or_default();
+    let pending = db::pending_pubkeys(&state.pool).await.unwrap_or_default();
+    let takedowns = db::takedowns(&state.pool).await.unwrap_or_default();
     render(
         "mod queue",
         html! {
@@ -155,9 +176,49 @@ async fn mod_queue(State(pool): State<PgPool>, headers: HeaderMap) -> Response {
                     }
                 }
             }
+            (takedown_section(&state, &takedowns))
         },
     )
     .into_response()
+}
+
+fn takedown_section(state: &AppState, takedowns: &[db::TakedownRow]) -> Markup {
+    html! {
+        h2 { "Takedowns" }
+        @match &state.signer {
+            Some(keys) => p.muted { "publishing kind 31064 as " code { (npub(&keys.public_key().to_hex())) } }
+            None => p.muted { "set BAKEMONO_INSTANCE_NSEC to publish takedowns to peers; hides apply locally either way" }
+        }
+        form method="post" action="/mod/takedown" class="takedown" {
+            select name="target_type" {
+                option value="e" { "event id" }
+                option value="x" { "file hash" }
+                option value="p" { "pubkey" }
+            }
+            input type="text" name="target" placeholder="target value (id / hash / npub or hex)" required;
+            input type="text" name="reason" placeholder="reason (dmca-us, csam, spam...)" required;
+            input type="text" name="explanation" placeholder="note (optional)";
+            button { "hide + publish" }
+        }
+        @if takedowns.is_empty() { p.muted { "no takedowns recorded" } }
+        ul.list {
+            @for t in takedowns {
+                li {
+                    div { code { (t.target_type) ":" (t.target) } }
+                    span.muted {
+                        (t.reason)
+                        @if !t.explanation.is_empty() { " - " (t.explanation) }
+                        " - via " (takedown_source(&t.source))
+                        @if !t.applied_at.is_empty() { " - " (pretty_date(&t.applied_at)) }
+                    }
+                    form method="post" action="/mod/untakedown" class="modform" {
+                        input type="hidden" name="d_tag" value=(t.d_tag);
+                        button { "undo" }
+                    }
+                }
+            }
+        }
+    }
 }
 
 async fn mod_approve(
@@ -184,9 +245,113 @@ async fn mod_reject(
     Redirect::to("/mod").into_response()
 }
 
+// record the hide locally first so it takes effect even if relays are unreachable, then sign and fan
+// the kind 31064 out to the relay set; a missing instance key keeps the hide local-only
+async fn mod_takedown(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<TakedownForm>,
+) -> Response {
+    if let Err(denied) = require_mod(&headers) {
+        return denied;
+    }
+    let value = form.target.trim().to_string();
+    let Some(target) = Target::from_parts(&form.target_type, value) else {
+        return (StatusCode::BAD_REQUEST, "unknown target type").into_response();
+    };
+    if target.parts().1.is_empty() {
+        return Redirect::to("/mod").into_response();
+    }
+    let takedown = Takedown {
+        target,
+        reason: non_empty(form.reason).unwrap_or_else(|| "unspecified".into()),
+        applied_at: Some(Utc::now().to_rfc3339()),
+        explanation: form.explanation.unwrap_or_default().trim().to_string(),
+    };
+    match &state.signer {
+        Some(keys) => publish_takedown(&state, keys, &takedown).await,
+        None => {
+            let _ = db::record_takedown(&state.pool, &takedown, "local", None).await;
+        }
+    }
+    Redirect::to("/mod").into_response()
+}
+
+async fn publish_takedown(state: &AppState, keys: &Keys, takedown: &Takedown) {
+    let event = match takedown.to_event(keys) {
+        Ok(event) => event,
+        Err(e) => {
+            eprintln!("takedown sign failed: {e}");
+            let _ = db::record_takedown(&state.pool, takedown, "local", None).await;
+            return;
+        }
+    };
+    let id = event.id.to_hex();
+    let _ = db::record_takedown(
+        &state.pool,
+        takedown,
+        &keys.public_key().to_hex(),
+        Some(&id),
+    )
+    .await;
+    if let Err(e) = send_to_relays(&state.relays, keys, &event).await {
+        eprintln!("takedown {id} publish failed (kept local): {e:#}");
+    }
+}
+
+async fn send_to_relays(relays: &[String], keys: &Keys, event: &Event) -> anyhow::Result<()> {
+    let client = Client::new(keys.clone());
+    for relay in relays {
+        client.add_relay(relay).await?;
+    }
+    client.connect().await;
+    client.send_event(event).await?;
+    client.disconnect().await;
+    Ok(())
+}
+
+async fn mod_untakedown(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Form(form): Form<UntakedownForm>,
+) -> Response {
+    if let Err(denied) = require_mod(&headers) {
+        return denied;
+    }
+    let _ = db::remove_takedown(&pool, &form.d_tag).await;
+    Redirect::to("/mod").into_response()
+}
+
 #[derive(serde::Deserialize)]
 struct ModForm {
     pubkey: String,
+}
+
+#[derive(serde::Deserialize)]
+struct TakedownForm {
+    target_type: String,
+    target: String,
+    reason: String,
+    explanation: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct UntakedownForm {
+    d_tag: String,
+}
+
+fn non_empty(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+// peer takedowns store the signer pubkey; render it as an npub, leave "local" as-is
+fn takedown_source(source: &str) -> String {
+    if source.len() == 64 && source.bytes().all(|b| b.is_ascii_hexdigit()) {
+        npub(source)
+    } else {
+        source.to_string()
+    }
 }
 
 // the mod routes require HTTP Basic auth with the password set in BAKEMONO_MOD_TOKEN
@@ -213,14 +378,15 @@ fn require_mod(headers: &HeaderMap) -> Result<(), Response> {
 fn basic_auth_password(headers: &HeaderMap) -> Option<String> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let encoded = value.strip_prefix("Basic ")?;
-    let decoded = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
     let creds = String::from_utf8(decoded).ok()?;
     creds.split_once(':').map(|(_, pass)| pass.to_string())
 }
 
 fn npub(pubkey_hex: &str) -> String {
-    use bakemono_core::nostr::ToBech32;
-    bakemono_core::nostr::PublicKey::from_hex(pubkey_hex)
+    PublicKey::from_hex(pubkey_hex)
         .ok()
         .and_then(|pk| pk.to_bech32().ok())
         .unwrap_or_else(|| pubkey_hex.to_string())
@@ -240,7 +406,12 @@ fn pretty_date(raw: &str) -> String {
     if let [year, month, day] = date.split('-').collect::<Vec<_>>()[..] {
         if let Ok(m) = month.parse::<usize>() {
             if (1..=12).contains(&m) {
-                return format!("{} {}, {}", MONTHS[m - 1], day.trim_start_matches('0'), year);
+                return format!(
+                    "{} {}, {}",
+                    MONTHS[m - 1],
+                    day.trim_start_matches('0'),
+                    year
+                );
             }
         }
     }
@@ -304,6 +475,8 @@ header { border-bottom: 1px solid #8884; margin-bottom: 1rem; padding-bottom: .5
 .magnet { margin-left: .4rem; text-decoration: none; opacity: .55; font-size: .9em }
 .magnet:hover { opacity: 1 }
 .modform { display: inline; margin: .4rem .4rem 0 0 }
+.takedown { display: flex; flex-wrap: wrap; gap: .4rem; margin: .6rem 0 1rem }
+.takedown input { flex: 1 1 12rem }
 code { word-break: break-all; font-size: .85em }
 a { color: #4488ff }
 ";
