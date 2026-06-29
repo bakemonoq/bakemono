@@ -43,6 +43,7 @@ pub fn run() {
             save_settings,
             set_stop_on_exit,
             app_paths,
+            open_path,
             sharing_stats,
             start_scrape,
             open_patreon_login,
@@ -158,6 +159,25 @@ fn app_paths() -> Paths {
         scrape_dir: scrape_dest().display().to_string(),
         log_dir: data.join("logs").display().to_string(),
     }
+}
+
+#[tauri::command]
+fn open_path(path: String) -> Result<(), String> {
+    open_in_file_manager(&path).map_err(stringify)
+}
+
+// open a directory in the OS file manager (Finder/Explorer/xdg)
+fn open_in_file_manager(path: &str) -> anyhow::Result<()> {
+    std::fs::create_dir_all(path).ok();
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(target_os = "windows") {
+        "explorer"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(program).arg(path).spawn()?;
+    Ok(())
 }
 
 #[tauri::command]

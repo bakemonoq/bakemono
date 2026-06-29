@@ -32,7 +32,7 @@ listen('progress', (e) => log('  ' + render(e.payload)))
 function setRunning(running) {
   $('stop').disabled = !running
   $('scrape').disabled = running
-  $('status').textContent = running ? '(running)' : ''
+  $('runState').textContent = running ? 'running' : ''
 }
 
 async function withJob(label, fn) {
@@ -57,9 +57,13 @@ function fmtBytes(n) {
 }
 
 async function refreshStats() {
-  const s = await invoke('sharing_stats')
-  $('stats').textContent =
-    `seeding ${s.files} file(s), ${fmtBytes(s.total_bytes)} shared across ${s.posts} post(s) from ${s.creators} creator(s)`
+  try {
+    const s = await invoke('sharing_stats')
+    $('mFiles').textContent = s.files
+    $('mBytes').textContent = fmtBytes(s.total_bytes)
+    $('mPosts').textContent = s.posts
+    $('mCreators').textContent = s.creators
+  } catch {}
 }
 
 async function refreshIdentity() {
@@ -82,11 +86,21 @@ async function refreshConfig() {
 
 const lines = (id) => $(id).value.split('\n').map((s) => s.trim()).filter(Boolean)
 
+function pathRow(label, path) {
+  return `<div class="kv"><span class="lbl2">${label}</span><code>${path}</code>` +
+    `<button class="open" data-path="${path}">Open</button></div>`
+}
+
 async function refreshPaths() {
   const p = await invoke('app_paths')
-  $('paths').innerHTML =
-    `scrapes: <code>${p.scrape_dir}</code><br>logs: <code>${p.log_dir}</code>`
+  $('paths').innerHTML = pathRow('scrapes', p.scrape_dir) + pathRow('logs', p.log_dir)
 }
+
+$('paths').addEventListener('click', (e) => {
+  const btn = e.target.closest('button.open')
+  if (!btn) return
+  invoke('open_path', { path: btn.dataset.path }).catch((err) => log('open failed: ' + err))
+})
 
 async function refreshDaemon() {
   try {
