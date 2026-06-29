@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tracing_subscriber::prelude::*;
 
 use bakemono_engine::config::AppConfig;
@@ -51,17 +51,29 @@ pub fn run() {
             restart_daemon,
             stop_daemon
         ])
+        // closing the window quits the gui (no tray); on macOS this does not fire ExitRequested,
+        // so stop the daemon here too when the user opted in, then exit the process
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                stop_daemon_if_configured();
+                window.app_handle().exit(0);
+            }
+        })
         .build(tauri::generate_context!())
         .expect("building tauri app")
         .run(|_app, event| {
             if let tauri::RunEvent::ExitRequested { .. } = event {
-                // daemon keeps seeding after the window closes unless the user opted out
-                if AppConfig::load().map(|c| c.stop_daemon_on_exit).unwrap_or(false) {
-                    shutdown_daemon_blocking();
-                    tracing::info!("stopped daemon on exit");
-                }
+                stop_daemon_if_configured();
             }
         });
+}
+
+// the daemon keeps seeding after the gui closes unless the user opted out
+fn stop_daemon_if_configured() {
+    if AppConfig::load().map(|c| c.stop_daemon_on_exit).unwrap_or(false) {
+        shutdown_daemon_blocking();
+        tracing::info!("stopped daemon on exit");
+    }
 }
 
 #[tauri::command]
