@@ -262,7 +262,7 @@ async fn post_page(
             h2 { (title) }
             @if !body.is_empty() { div.body { (PreEscaped(body)) } }
             @for f in &files {
-                div.file data-magnet=(f.magnet) data-mime=(f.mime) {
+                div.file data-magnet=(f.magnet) data-mime=(f.mime) data-hash=(f.file_hash) {
                     p.muted {
                         (f.filename.clone().unwrap_or_else(|| f.file_hash.clone())) " - " (f.size) " bytes"
                         a.magnet href=(f.magnet) title="magnet link" { "🧲" }
@@ -679,6 +679,10 @@ const secure = window.isSecureContext
 // iceServers from the board config (empty = host-only, fast on a LAN; set STUN/TURN for the internet)
 const iceServers = window.__bakemonoIce || []
 const client = secure ? new WebTorrent({ tracker: { rtcConfig: { iceServers } } }) : null
+async function sha256Hex(buf) {
+  const digest = await crypto.subtle.digest('SHA-256', buf)
+  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('')
+}
 for (const el of document.querySelectorAll('.file')) {
   const status = document.createElement('p')
   status.className = 'muted'
@@ -688,6 +692,7 @@ for (const el of document.querySelectorAll('.file')) {
     continue
   }
   status.textContent = 'connecting...'
+  const want = (el.dataset.hash || '').toLowerCase()
   const torrent = client.add(el.dataset.magnet)
   // tracker complete/incomplete counts include us and 20-min ghost peers, so they lie; numPeers is
   // the only honest 'a seeder is actually reachable' signal, and metadata never arrives without one
@@ -705,17 +710,34 @@ for (const el of document.querySelectorAll('.file')) {
       status.textContent = 'connecting...'
     }
   }, 500)
-  torrent.on('ready', () => {
+  // the magnet is attacker-controlled; only render bytes that match the signed sha256
+  torrent.on('ready', async () => {
+    let shown = false
     for (const file of torrent.files) {
-      file.blob().then((blob) => {
-        const isVideo = /\\.(mp4|webm|mov)$/i.test(file.name)
-        const node = document.createElement(isVideo ? 'video' : 'img')
-        if (isVideo) node.controls = true
-        node.src = URL.createObjectURL(blob)
-        el.appendChild(node)
-      }).catch((err) => { status.textContent = 'error: ' + err.message })
+      let buf
+      try {
+        buf = await file.arrayBuffer()
+      } catch (err) {
+        clearInterval(tick)
+        status.className = 'error'
+        status.textContent = 'error: ' + err.message
+        return
+      }
+      if (want && (await sha256Hex(buf)) !== want) continue
+      const isVideo = /\\.(mp4|webm|mov)$/i.test(file.name)
+      const node = document.createElement(isVideo ? 'video' : 'img')
+      if (isVideo) node.controls = true
+      node.src = URL.createObjectURL(new Blob([buf], { type: el.dataset.mime || '' }))
+      el.appendChild(node)
+      shown = true
+    }
+    clearInterval(tick)
+    if (shown) {
+      status.remove()
+    } else {
+      status.className = 'error'
+      status.textContent = 'integrity check failed - file does not match its signed hash'
     }
   })
-  torrent.on('done', () => { clearInterval(tick); status.remove() })
 }
 ";
