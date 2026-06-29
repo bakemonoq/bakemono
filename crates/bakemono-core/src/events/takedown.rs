@@ -42,12 +42,24 @@ impl Takedown {
 
     pub fn from_event(event: &Event) -> Result<Self> {
         expect_kind(event, KIND_TAKEDOWN)?;
-        Ok(Self {
+        let takedown = Self {
             target: Target::from_event(event)?,
             reason: tags::require(event, tags::REASON)?,
             applied_at: tags::first(event, tags::APPLIED_AT),
             explanation: event.content.clone(),
-        })
+        };
+        takedown.validate()?;
+        Ok(takedown)
+    }
+
+    fn validate(&self) -> Result<()> {
+        use crate::validation as v;
+        let (key, value) = self.target.parts();
+        v::hex_hash(key, value)?;
+        v::require_field(tags::REASON, &self.reason, v::MAX_REASON)?;
+        v::optional_field(tags::APPLIED_AT, &self.applied_at, v::MAX_TIMESTAMP)?;
+        v::within("explanation", &self.explanation, v::MAX_EXPLANATION)?;
+        Ok(())
     }
 
     fn sign(&self, keys: &Keys, created_at: Option<u64>) -> Result<Event> {

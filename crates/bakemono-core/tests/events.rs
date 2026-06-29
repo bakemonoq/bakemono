@@ -27,6 +27,75 @@ fn from_event_rejects_a_missing_required_tag() {
 }
 
 #[test]
+fn from_event_rejects_an_oversized_content_body() {
+    let keys = Keys::generate();
+    let mut manifest = sample_manifest();
+    manifest.content = "x".repeat(70_000);
+    let event = manifest.to_event(&keys).unwrap();
+
+    assert!(matches!(
+        Manifest::from_event(&event).unwrap_err(),
+        Error::TooLarge { field: "content" }
+    ));
+}
+
+#[test]
+fn from_event_rejects_a_non_hex_file_hash() {
+    let keys = Keys::generate();
+    let mut manifest = sample_manifest();
+    manifest.file_hash = "not-a-real-hash".into();
+    let event = manifest.to_event(&keys).unwrap();
+
+    assert!(matches!(
+        Manifest::from_event(&event).unwrap_err(),
+        Error::MalformedTag { tag: "x", .. }
+    ));
+}
+
+#[test]
+fn from_event_rejects_a_non_magnet_uri() {
+    let keys = Keys::generate();
+    let mut manifest = sample_manifest();
+    manifest.magnet = "https://example.com/evil".into();
+    let event = manifest.to_event(&keys).unwrap();
+
+    assert!(matches!(
+        Manifest::from_event(&event).unwrap_err(),
+        Error::MalformedTag { tag: "magnet", .. }
+    ));
+}
+
+#[test]
+fn from_event_rejects_a_topic_flood() {
+    let keys = Keys::generate();
+    let mut manifest = sample_manifest();
+    manifest.topics = vec!["spam".into(); 64];
+    let event = manifest.to_event(&keys).unwrap();
+
+    assert!(matches!(
+        Manifest::from_event(&event).unwrap_err(),
+        Error::TooLarge { .. }
+    ));
+}
+
+#[test]
+fn from_event_rejects_a_takedown_with_a_non_hex_target() {
+    let keys = Keys::generate();
+    let takedown = Takedown {
+        target: Target::FileHash("abc".into()),
+        reason: "csam".into(),
+        applied_at: None,
+        explanation: String::new(),
+    };
+    let event = takedown.to_event(&keys).unwrap();
+
+    assert!(matches!(
+        Takedown::from_event(&event).unwrap_err(),
+        Error::MalformedTag { tag: "x", .. }
+    ));
+}
+
+#[test]
 fn newer_event_replaces_older_for_same_pubkey_kind_d() {
     let keys = Keys::generate();
     let manifest = sample_manifest();

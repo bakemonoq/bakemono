@@ -111,7 +111,7 @@ mod tests {
         let operator = Keys::generate();
         let contributor = Keys::generate();
         let creator_id = format!("peer-td-{}", std::process::id());
-        let hash = format!("{:0<64}", creator_id.replace('-', ""));
+        let hash = format!("{:0<64}", creator_id.replace(|c: char| !c.is_ascii_hexdigit(), ""));
 
         let indexer = tokio::spawn(run(
             pool.clone(),

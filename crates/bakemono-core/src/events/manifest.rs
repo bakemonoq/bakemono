@@ -50,7 +50,7 @@ impl Manifest {
     pub fn from_event(event: &Event) -> Result<Self> {
         expect_kind(event, KIND_MANIFEST)?;
         let d = tags::require(event, tags::D)?;
-        Ok(Self {
+        let manifest = Self {
             platform: tags::require(event, tags::PLATFORM)?,
             creator: tags::require(event, tags::CREATOR)?,
             creator_id: tags::require(event, tags::CREATOR_ID)?,
@@ -67,7 +67,36 @@ impl Manifest {
             topics: tags::all(event, tags::TOPIC),
             thumb: tags::first(event, tags::THUMB),
             content: event.content.clone(),
-        })
+        };
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    fn validate(&self) -> Result<()> {
+        use crate::validation as v;
+        v::require_field(tags::PLATFORM, &self.platform, v::MAX_PLATFORM)?;
+        v::require_field(tags::CREATOR, &self.creator, v::MAX_CREATOR)?;
+        v::require_field(tags::CREATOR_ID, &self.creator_id, v::MAX_ID)?;
+        v::require_field(tags::POST_ID, &self.post_id, v::MAX_ID)?;
+        v::hex_hash(tags::X, &self.file_hash)?;
+        v::require_field(tags::MIME, &self.mime, v::MAX_MIME)?;
+        v::magnet(&self.magnet)?;
+        if self.size > v::MAX_FILE_SIZE {
+            return Err(Error::TooLarge { field: tags::SIZE });
+        }
+        v::optional_field(tags::FILENAME, &self.filename, v::MAX_FILENAME)?;
+        v::optional_field(tags::POST_TITLE, &self.post_title, v::MAX_TITLE)?;
+        v::optional_field(tags::POSTED_AT, &self.posted_at, v::MAX_TIMESTAMP)?;
+        v::optional_field(tags::TIER, &self.tier, v::MAX_TIER)?;
+        v::optional_field(tags::THUMB, &self.thumb, v::MAX_THUMB)?;
+        if self.topics.len() > v::MAX_TOPICS {
+            return Err(Error::TooLarge { field: tags::TOPIC });
+        }
+        for topic in &self.topics {
+            v::require_field(tags::TOPIC, topic, v::MAX_TOPIC)?;
+        }
+        v::within("content", &self.content, v::MAX_CONTENT)?;
+        Ok(())
     }
 
     fn sign(&self, keys: &Keys, created_at: Option<u64>) -> Result<Event> {

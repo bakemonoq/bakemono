@@ -8,6 +8,8 @@ pub enum Error {
     WrongKind { expected: u16, got: u16 },
     #[error("malformed `{tag}` tag value: {value}")]
     MalformedTag { tag: &'static str, value: String },
+    #[error("`{field}` exceeds its size limit")]
+    TooLarge { field: &'static str },
     #[error("event signature verification failed")]
     BadSignature,
     #[error("event build failed: {0}")]
