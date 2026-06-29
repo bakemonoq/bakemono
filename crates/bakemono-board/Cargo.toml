@@ -14,3 +14,5 @@ axum.workspace = true
 maud.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+serde = { version = "1", features = ["derive"] }
+base64 = "0.22"

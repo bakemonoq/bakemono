@@ -12,6 +12,25 @@ pub async fn connect(url: &str) -> Result<PgPool> {
 
 pub async fn upsert(pool: &PgPool, event: &Event, manifest: &Manifest) -> Result<()> {
     let created_at = event.created_at.as_secs() as i64;
+    let pubkey = event.pubkey.to_hex();
+    // first sighting of a pubkey lands it in the mod queue as pending
+    sqlx::query(
+        "INSERT INTO pubkeys (pubkey, status, first_seen)
+         VALUES ($1, 'pending', EXTRACT(EPOCH FROM now())::bigint)
+         ON CONFLICT (pubkey) DO NOTHING",
+    )
+    .bind(&pubkey)
+    .execute(pool)
+    .await?;
+    // drop events from rejected pubkeys instead of storing them hidden
+    let rejected: bool =
+        sqlx::query_scalar("SELECT status = 'rejected' FROM pubkeys WHERE pubkey = $1")
+            .bind(&pubkey)
+            .fetch_one(pool)
+            .await?;
+    if rejected {
+        return Ok(());
+    }
     // NIP-33: a newer event with the same (pubkey, d) replaces the older one
     sqlx::query("DELETE FROM manifests WHERE pubkey = $1 AND d_tag = $2 AND created_at < $3")
         .bind(event.pubkey.to_hex())
@@ -47,7 +66,9 @@ pub async fn creators(pool: &PgPool) -> Result<Vec<CreatorRow>> {
     let rows = sqlx::query_as::<_, CreatorRow>(
         "SELECT platform, creator_id, MAX(creator) AS creator,
                 COUNT(DISTINCT post_id) AS posts, COUNT(DISTINCT file_hash) AS files
-         FROM manifests GROUP BY platform, creator_id ORDER BY creator",
+         FROM manifests
+         WHERE pubkey IN (SELECT pubkey FROM pubkeys WHERE status = 'approved')
+         GROUP BY platform, creator_id ORDER BY creator",
     )
     .fetch_all(pool)
     .await?;
@@ -63,7 +84,9 @@ pub async fn posts_by_creator(
         "SELECT platform, creator_id, post_id, MAX(creator) AS creator,
                 MAX(post_title) AS post_title, MAX(posted_at) AS posted_at,
                 COUNT(DISTINCT file_hash) AS files
-         FROM manifests WHERE platform = $1 AND creator_id = $2
+         FROM manifests
+         WHERE platform = $1 AND creator_id = $2
+           AND pubkey IN (SELECT pubkey FROM pubkeys WHERE status = 'approved')
          GROUP BY platform, creator_id, post_id
          ORDER BY MAX(posted_at) DESC NULLS LAST, MAX(created_at) DESC",
     )
@@ -85,6 +108,7 @@ pub async fn post_files(
         "SELECT * FROM (
              SELECT DISTINCT ON (file_hash) * FROM manifests
              WHERE platform = $1 AND creator_id = $2 AND post_id = $3
+               AND pubkey IN (SELECT pubkey FROM pubkeys WHERE status = 'approved')
              ORDER BY file_hash, created_at DESC
          ) t ORDER BY file_index",
     )
@@ -99,13 +123,57 @@ pub async fn post_files(
 pub async fn recent(pool: &PgPool, limit: i64) -> Result<Vec<ManifestRow>> {
     let rows = sqlx::query_as::<_, ManifestRow>(
         "SELECT * FROM (
-             SELECT DISTINCT ON (file_hash) * FROM manifests ORDER BY file_hash, created_at DESC
+             SELECT DISTINCT ON (file_hash) * FROM manifests
+             WHERE pubkey IN (SELECT pubkey FROM pubkeys WHERE status = 'approved')
+             ORDER BY file_hash, created_at DESC
          ) t ORDER BY created_at DESC LIMIT $1",
     )
     .bind(limit)
     .fetch_all(pool)
     .await?;
     Ok(rows)
+}
+
+pub async fn pending_pubkeys(pool: &PgPool) -> Result<Vec<PendingRow>> {
+    let rows = sqlx::query_as::<_, PendingRow>(
+        "SELECT p.pubkey, COUNT(m.event_id) AS files,
+                MAX(m.creator) AS creator, MAX(m.post_title) AS sample
+         FROM pubkeys p LEFT JOIN manifests m ON m.pubkey = p.pubkey
+         WHERE p.status = 'pending'
+         GROUP BY p.pubkey, p.first_seen
+         ORDER BY p.first_seen DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+pub async fn approve_pubkey(pool: &PgPool, pubkey: &str) -> Result<()> {
+    sqlx::query("UPDATE pubkeys SET status = 'approved' WHERE pubkey = $1")
+        .bind(pubkey)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn reject_pubkey(pool: &PgPool, pubkey: &str) -> Result<()> {
+    sqlx::query("UPDATE pubkeys SET status = 'rejected' WHERE pubkey = $1")
+        .bind(pubkey)
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM manifests WHERE pubkey = $1")
+        .bind(pubkey)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+#[derive(sqlx::FromRow)]
+pub struct PendingRow {
+    pub pubkey: String,
+    pub files: i64,
+    pub creator: Option<String>,
+    pub sample: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -176,6 +244,16 @@ CREATE INDEX IF NOT EXISTS manifests_creator ON manifests (platform, creator_id)
 CREATE INDEX IF NOT EXISTS manifests_post ON manifests (platform, creator_id, post_id);
 CREATE INDEX IF NOT EXISTS manifests_hash ON manifests (file_hash);
 CREATE INDEX IF NOT EXISTS manifests_recent ON manifests (created_at DESC);
+
+CREATE TABLE IF NOT EXISTS pubkeys (
+    pubkey     TEXT PRIMARY KEY,
+    status     TEXT NOT NULL DEFAULT 'pending',
+    first_seen BIGINT NOT NULL
+);
+-- grandfather pubkeys already indexed into the queue (one-time, idempotent)
+INSERT INTO pubkeys (pubkey, status, first_seen)
+SELECT pubkey, 'pending', MIN(created_at) FROM manifests GROUP BY pubkey
+ON CONFLICT (pubkey) DO NOTHING;
 ";
 
 const INSERT: &str = "

@@ -1,8 +1,9 @@
-use axum::extract::{Path, State};
-use axum::http::header;
-use axum::response::{Html, IntoResponse};
-use axum::routing::get;
+use axum::extract::{Form, Path, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::routing::{get, post};
 use axum::Router;
+use base64::Engine;
 use maud::{html, Markup, PreEscaped, DOCTYPE};
 use sqlx::postgres::PgPool;
 
@@ -13,6 +14,9 @@ pub fn router(pool: PgPool) -> Router {
         .route("/", get(home))
         .route("/c/{platform}/{creator_id}", get(creator_page))
         .route("/p/{platform}/{creator_id}/{post_id}", get(post_page))
+        .route("/mod", get(mod_queue))
+        .route("/mod/approve", post(mod_approve))
+        .route("/mod/reject", post(mod_reject))
         .route("/webtorrent.min.js", get(webtorrent_js))
         .with_state(pool)
 }
@@ -117,6 +121,111 @@ async fn post_page(
     )
 }
 
+async fn mod_queue(State(pool): State<PgPool>, headers: HeaderMap) -> Response {
+    if let Err(denied) = require_mod(&headers) {
+        return denied;
+    }
+    let pending = db::pending_pubkeys(&pool).await.unwrap_or_default();
+    render(
+        "mod queue",
+        html! {
+            p { a href="/" { "< home" } }
+            h2 { "Mod queue" }
+            p.muted { "first-seen pubkeys wait here; approve to publish their files, reject to drop them" }
+            @if pending.is_empty() { p.muted { "nothing awaiting review" } }
+            ul.list {
+                @for p in &pending {
+                    li {
+                        div { code { (npub(&p.pubkey)) } }
+                        span.muted {
+                            (p.files) " file(s)"
+                            @if let Some(c) = &p.creator { " - " (c) }
+                            @if let Some(s) = &p.sample { " - " (s) }
+                        }
+                        div {
+                            form method="post" action="/mod/approve" class="modform" {
+                                input type="hidden" name="pubkey" value=(p.pubkey);
+                                button { "approve" }
+                            }
+                            form method="post" action="/mod/reject" class="modform" {
+                                input type="hidden" name="pubkey" value=(p.pubkey);
+                                button { "reject" }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    )
+    .into_response()
+}
+
+async fn mod_approve(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Form(form): Form<ModForm>,
+) -> Response {
+    if let Err(denied) = require_mod(&headers) {
+        return denied;
+    }
+    let _ = db::approve_pubkey(&pool, &form.pubkey).await;
+    Redirect::to("/mod").into_response()
+}
+
+async fn mod_reject(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Form(form): Form<ModForm>,
+) -> Response {
+    if let Err(denied) = require_mod(&headers) {
+        return denied;
+    }
+    let _ = db::reject_pubkey(&pool, &form.pubkey).await;
+    Redirect::to("/mod").into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct ModForm {
+    pubkey: String,
+}
+
+// the mod routes require HTTP Basic auth with the password set in BAKEMONO_MOD_TOKEN
+fn require_mod(headers: &HeaderMap) -> Result<(), Response> {
+    let token = std::env::var("BAKEMONO_MOD_TOKEN").unwrap_or_default();
+    if token.is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "mod queue disabled; set BAKEMONO_MOD_TOKEN on the board",
+        )
+            .into_response());
+    }
+    if basic_auth_password(headers).as_deref() == Some(token.as_str()) {
+        return Ok(());
+    }
+    Err((
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Basic realm=\"bakemono mod\"")],
+        "authentication required",
+    )
+        .into_response())
+}
+
+fn basic_auth_password(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let encoded = value.strip_prefix("Basic ")?;
+    let decoded = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+    let creds = String::from_utf8(decoded).ok()?;
+    creds.split_once(':').map(|(_, pass)| pass.to_string())
+}
+
+fn npub(pubkey_hex: &str) -> String {
+    use bakemono_core::nostr::ToBech32;
+    bakemono_core::nostr::PublicKey::from_hex(pubkey_hex)
+        .ok()
+        .and_then(|pk| pk.to_bech32().ok())
+        .unwrap_or_else(|| pubkey_hex.to_string())
+}
+
 // BAKEMONO_ICE_SERVERS is a JSON array of RTCIceServer objects, default none (host-only)
 fn ice_servers_json() -> String {
     std::env::var("BAKEMONO_ICE_SERVERS").unwrap_or_else(|_| "[]".to_string())
@@ -194,6 +303,8 @@ header { border-bottom: 1px solid #8884; margin-bottom: 1rem; padding-bottom: .5
 .file img, .file video { max-width: 100%; display: block; margin-top: .5rem }
 .magnet { margin-left: .4rem; text-decoration: none; opacity: .55; font-size: .9em }
 .magnet:hover { opacity: 1 }
+.modform { display: inline; margin: .4rem .4rem 0 0 }
+code { word-break: break-all; font-size: .85em }
 a { color: #4488ff }
 ";
 
