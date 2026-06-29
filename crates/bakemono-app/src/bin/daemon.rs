@@ -11,6 +11,12 @@ use bakemono_daemon::{ipc, logging};
 #[tokio::main]
 async fn main() -> Result<()> {
     let _log_guard = logging::init("daemon");
+    // one daemon per machine: if another is already serving, do nothing
+    if ipc::is_running().await {
+        tracing::info!("a daemon is already running, exiting");
+        return Ok(());
+    }
+
     let config = AppConfig::load().unwrap_or_default();
     let identity = Identity::load_or_generate(&key_path())?;
     tracing::info!(npub = %identity.npub().unwrap_or_default(), "starting bakemono daemon");

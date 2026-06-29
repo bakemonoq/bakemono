@@ -75,6 +75,9 @@ async function refreshConfig() {
   $('relays').value = cfg.relays.join('\n')
   $('trackers').value = cfg.trackers.join('\n')
   $('stun').value = cfg.stun.join('\n')
+  $('maxUp').value = cfg.max_up_mbit
+  $('maxDown').value = cfg.max_down_mbit
+  $('stopOnExit').checked = !!cfg.stop_daemon_on_exit
 }
 
 const lines = (id) => $(id).value.split('\n').map((s) => s.trim()).filter(Boolean)
@@ -88,13 +91,16 @@ async function refreshPaths() {
 async function refreshDaemon() {
   try {
     const s = await invoke('daemon_status')
+    $('ddot').className = 'dot up'
     $('dstatus').textContent = s.running ? 'running a job' : (s.seeding ? 'seeding' : 'idle')
   } catch {
+    $('ddot').className = 'dot down'
     $('dstatus').textContent = 'stopped'
   }
 }
 
 $('drestart').onclick = async () => {
+  $('ddot').className = 'dot'
   $('dstatus').textContent = 'restarting...'
   try { await invoke('restart_daemon') } catch (e) { log('restart failed: ' + e) }
   refreshDaemon()
@@ -103,6 +109,10 @@ $('drestart').onclick = async () => {
 $('dstop').onclick = async () => {
   try { await invoke('stop_daemon') } catch (e) { log('stop failed: ' + e) }
   refreshDaemon()
+}
+
+$('stopOnExit').onchange = async () => {
+  try { await invoke('set_stop_on_exit', { value: $('stopOnExit').checked }) } catch (e) { log('failed: ' + e) }
 }
 
 // identity/relay changes only take effect once the daemon reloads them
@@ -139,8 +149,10 @@ $('saveSettings').onclick = async () => {
   const relays = lines('relays')
   const trackers = lines('trackers')
   const stun = lines('stun')
-  await invoke('save_settings', { relays, trackers, stun })
-  log(`saved settings: ${relays.length} relay(s), ${trackers.length} tracker(s), ${stun.length} STUN; restarting daemon`)
+  const maxUpMbit = Number($('maxUp').value) || 0
+  const maxDownMbit = Number($('maxDown').value) || 0
+  await invoke('save_settings', { relays, trackers, stun, maxUpMbit, maxDownMbit })
+  log(`saved settings; restarting daemon`)
   applyToDaemon()
 }
 
@@ -164,4 +176,6 @@ refreshIdentity()
 refreshConfig()
 refreshPaths()
 refreshStats()
-refreshDaemon()
+// start the daemon if it isn't already up, then keep the status dot live
+invoke('start_daemon').catch((e) => log('daemon start failed: ' + e)).finally(refreshDaemon)
+setInterval(refreshDaemon, 3000)

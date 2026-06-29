@@ -97,6 +97,16 @@ where
 }
 
 #[cfg(unix)]
+pub async fn is_running() -> bool {
+    tokio::net::UnixStream::connect(socket_path()).await.is_ok()
+}
+
+#[cfg(not(unix))]
+pub async fn is_running() -> bool {
+    false
+}
+
+#[cfg(unix)]
 pub async fn serve<C: ContentSource>(daemon: Arc<Daemon<C>>) -> Result<()> {
     use tokio_util::sync::CancellationToken;
 
@@ -104,7 +114,11 @@ pub async fn serve<C: ContentSource>(daemon: Arc<Daemon<C>>) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let _ = std::fs::remove_file(&path); // clear a stale socket from a previous run
+    // single instance: if something already answers on the socket, another daemon owns it
+    if tokio::net::UnixStream::connect(&path).await.is_ok() {
+        bail!("a daemon is already running at {}", path.display());
+    }
+    let _ = std::fs::remove_file(&path); // clear a stale socket from a crashed run
     let listener = tokio::net::UnixListener::bind(&path)
         .with_context(|| format!("binding {}", path.display()))?;
     tracing::info!(socket = %path.display(), "ipc listening");

@@ -43,11 +43,13 @@ pub fn run() {
             export_nsec,
             get_config,
             save_settings,
+            set_stop_on_exit,
             app_paths,
             sharing_stats,
             start_scrape,
             cancel_job,
             daemon_status,
+            start_daemon,
             restart_daemon,
             stop_daemon
         ])
@@ -104,15 +106,31 @@ fn save_settings(
     relays: Vec<String>,
     trackers: Vec<String>,
     stun: Vec<String>,
+    max_up_mbit: u32,
+    max_down_mbit: u32,
     state: State<AppState>,
 ) -> Result<AppConfig, String> {
     let mut guard = state.lock();
     guard.config.relays = relays;
     guard.config.trackers = trackers;
     guard.config.stun = stun;
+    guard.config.max_up_mbit = max_up_mbit;
+    guard.config.max_down_mbit = max_down_mbit;
     guard.config.save().map_err(stringify)?;
     tracing::info!(relays = guard.config.relays.len(), "saved settings");
     Ok(guard.config.clone())
+}
+
+#[tauri::command]
+fn set_stop_on_exit(value: bool, state: State<AppState>) -> Result<(), String> {
+    let mut guard = state.lock();
+    guard.config.stop_daemon_on_exit = value;
+    guard.config.save().map_err(stringify)
+}
+
+#[tauri::command]
+async fn start_daemon() -> Result<(), String> {
+    ensure_daemon().await.map_err(stringify)
 }
 
 #[tauri::command]

@@ -21,6 +21,11 @@
     #log { background: #0001; border-radius: 6px; padding: .6rem; height: 16rem; overflow: auto; white-space: pre-wrap; font-family: monospace; font-size: .8rem }
     summary { cursor: pointer; font-weight: 600 }
     .hint { font-size: .8rem; opacity: .6; margin: .3rem 0 }
+    input[type=checkbox] { width: auto }
+    .check { display: flex; align-items: center; gap: .4rem; font-size: .85rem; margin: .6rem 0 }
+    .dot { display: inline-block; width: .7rem; height: .7rem; border-radius: 50%; background: #888; margin-right: .4rem; vertical-align: middle }
+    .dot.up { background: #3ba55d }
+    .dot.down { background: #e4564a }
   </style>
 </head>
 <body>
@@ -32,8 +37,10 @@
   </section>
 
   <section>
-    <h2>Daemon <span id="dstatus" class="hint"></span></h2>
+    <h2>Daemon</h2>
+    <div><span id="ddot" class="dot"></span><span id="dstatus">checking...</span></div>
     <p class="hint">the daemon keeps seeding in the background after this window closes</p>
+    <label class="check"><input type="checkbox" id="stopOnExit"> stop the daemon when the app closes</label>
     <button id="drestart">Restart</button>
     <button id="dstop">Stop</button>
   </section>
@@ -61,6 +68,16 @@
       <textarea id="trackers"></textarea>
       <label>STUN servers (one per line)</label>
       <textarea id="stun"></textarea>
+      <div class="row">
+        <div>
+          <label>max upload (Mbit/s, 0 = unlimited)</label>
+          <input id="maxUp" type="number" min="0">
+        </div>
+        <div>
+          <label>max download (Mbit/s, 0 = unlimited)</label>
+          <input id="maxDown" type="number" min="0">
+        </div>
+      </div>
       <button id="saveSettings">Save</button>
       <p class="hint">saving restarts the daemon so the new relays/trackers/STUN take effect</p>
     </details>
