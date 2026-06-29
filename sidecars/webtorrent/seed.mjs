@@ -35,6 +35,12 @@ if (process.env.BAKEMONO_STUN) {
   rtcConfig.iceServers = process.env.BAKEMONO_STUN.split(',').map((urls) => ({ urls: urls.trim() }))
 }
 const opts = { tracker: { rtcConfig } }
+// BAKEMONO_MAX_UP/DOWN are Mbit/s caps (0 or unset = unlimited); webtorrent wants bytes/s
+const MBIT = 125000
+const up = Number(process.env.BAKEMONO_MAX_UP) || 0
+const down = Number(process.env.BAKEMONO_MAX_DOWN) || 0
+if (up > 0) opts.uploadLimit = Math.round(up * MBIT)
+if (down > 0) opts.downloadLimit = Math.round(down * MBIT)
 if (isolate) {
   opts.dht = false
   opts.lsd = false

@@ -18,13 +18,19 @@ impl SeederHandle {
         Self::default()
     }
 
-    pub async fn ensure_started(&self, trackers: &[String], stun: &[String]) -> Result<()> {
+    pub async fn ensure_started(
+        &self,
+        trackers: &[String],
+        stun: &[String],
+        max_up_mbit: u32,
+        max_down_mbit: u32,
+    ) -> Result<()> {
         let mut guard = self.inner.lock().await;
         if guard.is_none() {
             // stage on the data volume so hardlinks to scraped files never fall back to copying
             let staging = super::data_dir().join("staging");
-            let seeder =
-                Seeder::from_env_with(&swarm_env(trackers, stun), Some(&staging)).await?;
+            let env = swarm_env(trackers, stun, max_up_mbit, max_down_mbit);
+            let seeder = Seeder::from_env_with(&env, Some(&staging)).await?;
             *guard = Some(seeder);
             tracing::info!("webtorrent seeder started");
         }
@@ -57,13 +63,24 @@ impl SeederHandle {
 }
 
 // config supplies the swarm settings, but a launch-time env var (used for testing) wins
-fn swarm_env(trackers: &[String], stun: &[String]) -> Vec<(String, String)> {
+fn swarm_env(
+    trackers: &[String],
+    stun: &[String],
+    max_up_mbit: u32,
+    max_down_mbit: u32,
+) -> Vec<(String, String)> {
     let mut env = Vec::new();
     if std::env::var_os("BAKEMONO_TRACKERS").is_none() && !trackers.is_empty() {
         env.push(("BAKEMONO_TRACKERS".to_string(), trackers.join(",")));
     }
     if std::env::var_os("BAKEMONO_STUN").is_none() && !stun.is_empty() {
         env.push(("BAKEMONO_STUN".to_string(), stun.join(",")));
+    }
+    if std::env::var_os("BAKEMONO_MAX_UP").is_none() && max_up_mbit > 0 {
+        env.push(("BAKEMONO_MAX_UP".to_string(), max_up_mbit.to_string()));
+    }
+    if std::env::var_os("BAKEMONO_MAX_DOWN").is_none() && max_down_mbit > 0 {
+        env.push(("BAKEMONO_MAX_DOWN".to_string(), max_down_mbit.to_string()));
     }
     env
 }
