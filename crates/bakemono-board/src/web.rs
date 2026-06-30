@@ -692,7 +692,7 @@ const REPO: &str = env!("CARGO_PKG_REPOSITORY");
 // per-OS desktop builds, served by GitHub's stable latest-release redirect; names track Tauri's bundles
 const DOWNLOADS: &[(&str, &str)] = &[
     ("Windows", "Bakemono_x64-setup.exe"),
-    ("macOS", "Bakemono_universal.dmg"),
+    ("macOS (Apple Silicon)", "Bakemono_aarch64.dmg"),
     ("Linux", "Bakemono_amd64.AppImage"),
 ];
 
