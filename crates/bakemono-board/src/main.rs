@@ -7,6 +7,7 @@ use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let database_url = env_or(
         "DATABASE_URL",
         "postgres://postgres:postgres@127.0.0.1:5432/bakemono?sslmode=disable",

@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 bakemono-core = { path = "../bakemono-core" }
 nostr-sdk.workspace = true
+rustls.workspace = true
 sqlx.workspace = true
 axum.workspace = true
 maud.workspace = true

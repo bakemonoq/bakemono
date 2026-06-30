@@ -10,6 +10,7 @@ use bakemono_engine::{ipc, logging};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let _log_guard = logging::init("daemon");
     bakemono_engine::version::spawn_log_check(env!("CARGO_PKG_VERSION"));
     // one daemon per machine: if another is already serving, do nothing

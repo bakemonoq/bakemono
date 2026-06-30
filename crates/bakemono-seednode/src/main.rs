@@ -13,6 +13,7 @@ use source::FarmContentSource;
 // the seednode is config-driven and autonomous: no IPC, no CLI - it runs a loop under systemd
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let _log_guard = logging::init("seednode");
     bakemono_engine::version::spawn_log_check(env!("CARGO_PKG_VERSION"));
     let config = AppConfig::load().unwrap_or_default();
