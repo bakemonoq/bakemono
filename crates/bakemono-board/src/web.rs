@@ -737,6 +737,8 @@ a { color: #4488ff }
 
 const PLAYER_JS: &str = "
 import WebTorrent from '/webtorrent.min.js'
+// the bundle probes OPFS on import to clear stale chunks; we keep data in memory, so swallow that SecurityError
+window.addEventListener('unhandledrejection', (e) => { if (e.reason && e.reason.name === 'SecurityError') e.preventDefault() })
 // WebTorrent needs Web Crypto, which only exists in a secure context (https or http://localhost)
 const secure = window.isSecureContext
 // iceServers from the board config (empty = host-only, fast on a LAN; set STUN/TURN for the internet)
@@ -750,7 +752,7 @@ async function sha256Hex(buf) {
 // the magnet is attacker-controlled, so bytes that fail the signed sha256 are never rendered
 function fetchVerified(magnet, wantHash, status, onReady) {
   const want = (wantHash || '').toLowerCase()
-  const torrent = client.add(magnet)
+  const torrent = client.add(magnet, { store: MemChunkStore })
   // tracker peer counts include us and 20-min ghosts, so they lie; numPeers is the only honest
   // 'a seeder is actually reachable' signal, and metadata never arrives without one
   let deadline = Date.now() + 30000
@@ -795,6 +797,31 @@ function mediaNode(buf, name, mime) {
   if (isVideo) node.controls = true
   node.src = URL.createObjectURL(new Blob([buf], { type: mime || '' }))
   return node
+}
+// abstract-chunk-store kept in memory, so previews never touch OPFS (blocked in private windows and strict-privacy profiles)
+class MemChunkStore {
+  constructor(chunkLength, opts = {}) {
+    this.chunkLength = Number(chunkLength)
+    this.chunks = []
+    this.length = Number(opts.length) || Infinity
+    this.lastChunkLength = (this.length % this.chunkLength) || this.chunkLength
+    this.lastChunkIndex = Math.ceil(this.length / this.chunkLength) - 1
+  }
+  put(i, buf, cb = () => {}) {
+    this.chunks[i] = buf
+    queueMicrotask(() => cb(null))
+  }
+  get(i, opts, cb = () => {}) {
+    if (typeof opts === 'function') return this.get(i, null, opts)
+    const buf = this.chunks[i]
+    if (!buf) return queueMicrotask(() => { const e = new Error('Chunk not found'); e.notFound = true; cb(e) })
+    if (!opts) return queueMicrotask(() => cb(null, buf))
+    const offset = opts.offset || 0
+    const len = opts.length || (buf.length - offset)
+    queueMicrotask(() => cb(null, buf.slice(offset, offset + len)))
+  }
+  close(cb = () => {}) { queueMicrotask(() => cb(null)) }
+  destroy(cb = () => {}) { this.chunks = []; queueMicrotask(() => cb(null)) }
 }
 for (const el of document.querySelectorAll('.file')) {
   const status = document.createElement('p')
