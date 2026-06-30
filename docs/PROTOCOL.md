@@ -19,19 +19,19 @@ A Bakemono manifest is a Nostr event of **kind 31063** (in the parameterized-rep
   "pubkey": "<32-byte secp256k1 x-only pubkey, hex>",
   "created_at": 1717527612,
   "tags": [
-    ["d", "patreon:12345:67890:0"],
+    ["d", "<platform>:<creator_id>:<post_id>:0"],
     ["x", "<sha256-hex-of-file>"],
     ["size", "245760"],
     ["m", "image/jpeg"],
     ["filename", "post123_image.jpg"],
     ["magnet", "magnet:?xt=urn:btih:<sha1-hex-of-info-dict>&dn=..."],
-    ["platform", "patreon"],
-    ["creator", "BoxOfMittens"],
-    ["creator_id", "12345"],
-    ["post_id", "67890"],
+    ["platform", "<source-extractor-id>"],
+    ["creator", "<source-handle>"],
+    ["creator_id", "<source-id>"],
+    ["post_id", "<post-id>"],
     ["post_title", "March art dump"],
     ["posted_at", "2026-03-14T10:00:00Z"],
-    ["tier", "paid"]
+    ["tier", "subscriber"]
   ],
   "content": "post body text, if any. plain text or markdown.",
   "sig": "<128-hex-char Schnorr signature>"
@@ -45,17 +45,17 @@ A Bakemono manifest is a Nostr event of **kind 31063** (in the parameterized-rep
 - `size` - file size in bytes as a decimal string.
 - `m` - MIME type from the file's magic bytes, not extension.
 - `magnet` - BitTorrent v1 magnet link, full URI. Format: `magnet:?xt=urn:btih:<sha1-of-bencoded-info-dict>&dn=<filename>&tr=...`. The infohash is sha1 because that is what BT v1 uses and what the `webtorrent` package (BT v1 + WebRTC) produces. The `x` tag above is sha256 of the file bytes and is independent of the infohash; the two coexist (one identifies the torrent, the other identifies the file content for dedup).
-- `platform` - lowercase platform identifier. v1 supports: `patreon`, `fanbox`, `fantia`, `subscribestar`, `gumroad`, `pixiv-fanbox`, `ci-en`, `boosty`.
-- `creator` - human-readable creator handle.
-- `creator_id` - platform-specific creator id.
-- `post_id` - platform-specific post id.
+- `platform` - lowercase identifier matching the source extractor name. Clients SHOULD use the gallery-dl extractor identifier for interoperability. Any non-empty lowercase string is valid; indexers MUST treat unknown values as opaque.
+- `creator` - human-readable source handle.
+- `creator_id` - source-specific creator identifier.
+- `post_id` - source-specific post identifier.
 
 ### Optional tags
 
 - `filename` - original filename if known.
 - `post_title` - title of the source post.
 - `posted_at` - ISO 8601 timestamp of when the source post was published.
-- `tier` - `free`, `paid`, or `unknown`. Whether this content required a paid subscription.
+- `tier` - `free`, `subscriber`, or `unknown`. Whether the source content required an authenticated subscription.
 - `t` - free-form topic tags per NIP-12. Multiple `t` tags allowed. E.g., `["t", "furry"]`, `["t", "art"]`.
 - `thumb` - inline thumbnail as a base64 `data:` URL. Only for very small previews (target a few KB). Lets a board render a placeholder with zero swarm fetch. See Thumbnails below.
 - `thumb_x` - sha256 of a separately-seeded thumbnail file, used when the preview is too large to inline. Same encoding as `x`.

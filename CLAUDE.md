@@ -1,8 +1,8 @@
 # Bakemono
 
-P2P-backed open-source successor to Kemono. Federated archive of paywalled creator content (Patreon, Fanbox, Fantia, etc) with browser-native preview via WebTorrent and per-instance DMCA jurisdiction.
+Open-source peer-to-peer content archive protocol. Federated metadata layer over signed Nostr events, content layer over BitTorrent v1 + WebRTC for browser-native preview, with operator-level moderation autonomy per instance.
 
-The name continues the Kemono lineage. Bakemono (化け物) shares the -mono suffix and means "shapeshifter": one piece of content, many forms across many instances.
+The name Bakemono (化け物) means "shapeshifter": one piece of content, many forms across many instances.
 
 ## Status
 
@@ -10,7 +10,7 @@ Pre-MVP. Architecture decided, no code written yet. See `docs/MVP.md` for the bu
 
 ## Core idea in one paragraph
 
-Kemono failed because content storage was centralized on a single IP block. Bakemono separates the system into three loosely coupled layers: (1) content lives in a BitTorrent v2 / WebTorrent swarm, addressed by sha256 so the file's identity is what it is, not where it lives; (2) metadata is published as signed Nostr events (custom kind 31063) to many independent relays, so losing any one relay or instance does not lose the index; (3) each board runs its own embedded relay plus a postgres indexer and web UI, picks its own DMCA posture, and inherits Nostr's relay-based federation for free. A cross-platform desktop client lets users scrape their own paid subscriptions, contribute the bytes to the swarm, and publish signed events to multiple relays at once.
+Centralized content archives concentrate file storage and index in one administrative boundary, making them brittle to single-host failure. Bakemono separates the system into three loosely coupled layers: (1) content lives in a BitTorrent v1 + WebRTC swarm, addressed by sha256 so the file's identity is what it is, not where it lives; (2) metadata is published as signed Nostr events (custom kind 31063) to many independent relays, so losing any one relay or instance does not lose the index; (3) each board runs its own embedded relay plus a postgres indexer and web UI, sets its own local moderation policy, and inherits Nostr's relay-based federation for free. A cross-platform desktop client lets users back up their own subscribed content, contribute the bytes to the swarm, and publish signed events to multiple relays at once.
 
 ## Components
 
@@ -18,14 +18,14 @@ The repo is a single Cargo workspace. Three rust crates plus docs.
 
 - `bakemono-core` - shared library crate. Bakemono Nostr event types (kind 31063 manifest, kind 31064 takedown), tag schema helpers, event-building and validation routines, protocol version constants. Wraps the `nostr` crate from rust-nostr.org. Pure logic, zero I/O. Imported by both `bakemono-app` and `bakemono-board` so the wire protocol cannot drift between client and server. Unit-tested in isolation.
 - `bakemono-board` - the self-hostable web instance. Runs a `nostr-rs-relay` sidecar, runs an indexer that subscribes to a configured relay set and ingests kind 31063 events into postgres, serves search/browse UI, runs a warm cache for popular previews. Rust: axum + sqlx + maud (SSR templates) + Postgres. Depends on `bakemono-core`.
-- `bakemono-app` - cross-platform desktop client. Tauri (rust + web frontend). Three thin pieces around one shared backend: a daemon (DHT, BT v2 seeder, scraping queue, Nostr event signing and multi-relay publish), a GUI (configure scrapes, manage keypair and relay list, see contribution stats), a tray icon (quick status, pause/resume). Depends on `bakemono-core`. Wraps gallery-dl for art/post sites and yt-dlp for video, both invoked from the rust daemon as Tauri sidecar binaries (Python runtime bundled). Uses an embedded webview to let the user log into Patreon themselves; session stays local, never sent to any server.
+- `bakemono-app` - cross-platform desktop client. Tauri (rust + web frontend). Three thin pieces around one shared backend: a daemon (DHT, BT seeder, retrieval queue, Nostr event signing and multi-relay publish), a GUI (configure archive jobs, manage keypair and relay list, see contribution stats), a tray icon (quick status, pause/resume). Depends on `bakemono-core`. Wraps gallery-dl for image/post sources and yt-dlp for video, both invoked from the rust daemon as Tauri sidecar binaries (Python runtime bundled). Uses an embedded webview so the user signs in to source platforms themselves; sessions stay local, never sent to any server.
 
 ## Tech stack (decided)
 
 | Concern | Choice |
 |---|---|
 | Desktop app shell | Tauri + rust |
-| Scraping | gallery-dl, yt-dlp (Python sidecars invoked from rust) |
+| Source retrieval | gallery-dl, yt-dlp (Python sidecars invoked from rust) |
 | Seeding (desktop + board warm cache) | `webtorrent` >=2.3.0 (Node sidecar; BT v1 over TCP/uTP + native WebRTC) |
 | Browser preview | `webtorrent` >=2.3.0 (same package, runs in the browser via WebRTC) |
 | Board backend | rust: axum + sqlx + maud + Postgres |
@@ -42,7 +42,7 @@ The repo is a single Cargo workspace. Three rust crates plus docs.
 
 - One reference board running at a single domain, with its own embedded relay
 - Desktop app for Windows / macOS / Linux that publishes to 5+ relays by default
-- Single-creator-at-a-time scraping for Patreon (gallery-dl already supports the rest, exposed in v1)
+- Single-source-at-a-time retrieval via one gallery-dl extractor in v0 (additional extractors exposed in v1)
 - Kind 31063 manifest events, in-browser WebTorrent preview for images and short video
 - Warm cache on the board for top-popular files
 - Manual mod queue on the board's indexer for first-time-seen pubkeys
@@ -64,11 +64,11 @@ Most home users are NAT'd. WebRTC's ICE handles it: STUN servers (public free on
 
 ## Threat model and ethics
 
-- DMCA handling is per-board. Each operator decides posture based on jurisdiction. Takedowns are published as kind 31064 Nostr events signed by the operator's instance keypair, providing a built-in transparency log.
-- Takedowns propagate via the Nostr relay network. Peer boards subscribe to takedown events from operators they trust and apply (or ignore) per local policy.
+- Moderation is per-board. Each operator sets local policy in line with their own legal obligations. Takedowns are published as kind 31064 Nostr events signed by the operator's instance keypair, providing a built-in transparency log.
+- Takedowns propagate via the Nostr relay network. Peer boards subscribe to takedown events from operators they trust and apply per local policy.
 - CSAM and other categorically illegal content is actively moderated at every board. No operator runs without moderation. Boards that refuse to honor `csam`-reason takedowns get dropped from peer trust lists.
-- Manifest events on relays we do not operate are not under our takedown control. The Nostr ecosystem's relay diversity is intentional and we cannot guarantee global removal of any event. Operators take their own legal posture.
-- User session cookies for Patreon etc. stay on the user's machine, never sent to any server, never exfiltrated by the scraper. This is non-negotiable for the project's social licence.
+- Events on independently-operated relays are subject to those relays' own retention and moderation policies, not any single operator's. This is an inherent property of decentralized federation, shared across the Nostr ecosystem broadly.
+- User session credentials stay on the user's machine, never sent to any server, never exfiltrated by the client. This is non-negotiable for the project's social licence.
 
 ## Style rules (apply to all files in this repo)
 

@@ -41,13 +41,13 @@ Quick reference for terms used throughout the Bakemono docs and code.
 - **Indexer**: the board component that subscribes to Nostr relays, ingests kind 31063 events, dedupes, and writes them to postgres for fast search and browse.
 - **Warm cache**: small disk cache on the board holding the most-viewed files for instant preview. Compromise toward centralization on hot content only.
 - **Mod queue**: queue of events from first-seen pubkeys awaiting human review on a given board. Anti-spam wall.
-- **Kudos**: contribution credit accruing to a pubkey. Bytes contributed, novelty bonuses, first-to-archive badges. Social currency, not access control.
+- **Kudos**: archival contribution credit accruing to a pubkey. Bytes contributed, breadth of indexed sources. Display-only stat; not access control.
 - **Operator pubkey**: each board operator holds an instance-level Nostr keypair, used to sign kind 31064 takedown events.
 
 ## Tooling
 
-- **gallery-dl**: existing Python scraper supporting Patreon, Fanbox, etc. We wrap it as our scraping engine.
-- **yt-dlp**: existing Python video extractor. Handles Patreon embedded video.
+- **gallery-dl**: existing Python content extractor supporting many source platforms. We wrap it as our retrieval engine.
+- **yt-dlp**: existing Python video extractor. Handles embedded video on supported source platforms.
 - **Tauri**: rust framework for cross-platform desktop apps with a web frontend. Smaller and faster than Electron. Our desktop app framework.
 - **bakemono-core**: shared rust crate holding Bakemono event types, tag helpers, validation, and protocol constants. Wraps the `nostr` crate. Imported by both `bakemono-app` and `bakemono-board` to guarantee the wire format cannot drift. Pure logic, no I/O.
 - **librqbit / rqbit**: rust BitTorrent client and library by ikatson. Initially considered for the daemon's seeder, but BT v2 only and no native WebRTC, so it cannot serve browsers directly. Parked as a candidate for a v2+ rust-native rewrite once a WebRTC-capable rust BT library matures. Not used in v0.

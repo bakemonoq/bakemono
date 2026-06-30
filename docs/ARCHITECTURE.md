@@ -24,15 +24,15 @@ Each Bakemono board runs an indexer that subscribes to a configured set of Nostr
 
 The end-to-end flow of one file from scrape to view in another user's browser. Reference for the entire system.
 
-1. **Scrape.** Alice runs the desktop app. She is logged into Patreon as a paying subscriber to creator "BoxOfMittens". The app uses her local cookies to fetch posts; cookies never leave her machine. It downloads `post123_image.jpg` (240 KB) to her hard drive.
+1. **Retrieve.** Alice runs the desktop app. She has an active subscription on a source platform and is signed in via the embedded webview. The app uses her local session to retrieve content she already has access to; credentials never leave her machine. It writes `post123_image.jpg` (240 KB) to her hard drive.
 
-2. **Hash and build event.** App computes sha256, gets `a3f8d2e1...`. Reads post metadata (creator, post id, title, timestamp). Generates a small preview client-side (downscaled image, or a poster frame for video) and either inlines it in the `thumb` tag or seeds it as its own tiny file referenced by `thumb_x` + `thumb_magnet`, so a board can show previews without ever fetching the full file. Builds a Nostr event of kind 31063 with tags `x`, `size`, `m`, `magnet`, `platform`, `creator`, `post_id`, etc. Signs with Alice's secp256k1 private key using BIP-340 Schnorr (one call via the `nostr` rust crate).
+2. **Hash and build event.** App computes sha256, gets `a3f8d2e1...`. Reads source metadata (source handle, post id, title, timestamp). Generates a small preview client-side (downscaled image, or a poster frame for video) and either inlines it in the `thumb` tag or seeds it as its own tiny file referenced by `thumb_x` + `thumb_magnet`, so a board can show previews without ever fetching the full file. Builds a Nostr event of kind 31063 with tags `x`, `size`, `m`, `magnet`, `platform`, `creator`, `post_id`, etc. Signs with Alice's secp256k1 private key using BIP-340 Schnorr (one call via the `nostr` rust crate).
 
 3. **Seed.** App spins up a BitTorrent v2 client locally. Joins the DHT. Announces "I have hash a3f8 at my IP:port". Alice's computer is now a peer in the swarm for this file.
 
 4. **Publish to relays.** App fans out the event to its full configured relay set in parallel: our `wss://relay.bakemono.app`, plus public Nostr relays (relay.damus.io, nos.lol, nostr.wine, etc). Each relay verifies the signature, stores the event, and starts streaming it to its subscribers. NO bytes go to any relay, only the event.
 
-5. **Browse.** Bob lands on a Bakemono board from a Reddit post. He searches "BoxOfMittens". The board's postgres (filled by its indexer subscribing to the same relays Alice published to) returns Alice's event. Page renders with post title, text, image placeholder.
+5. **Browse.** Bob lands on a Bakemono board and searches for a source handle. The board's postgres (filled by its indexer subscribing to the same relays Alice published to) returns Alice's event. Page renders with post title, text, image placeholder.
 
 6. **Preview.** Page JS sees an image with hash `a3f8`. Spins up a WebTorrent client in Bob's browser (no plugin; uses WebRTC). WebTorrent contacts the DHT, finds Alice (and any other seeders), opens a WebRTC data channel directly to her seeder, downloads 240 KB into a Blob, creates an object URL, swaps it into `<img src>`. Image appears.
 
@@ -158,15 +158,15 @@ Instance operators are themselves first-class Nostr identities, holding their ow
 
 A takedown does NOT delete the original event from any relay. It records that this instance has chosen to hide a particular event for a particular reason. Relays we do not operate are unaffected. The event lives wherever it was published.
 
-This is intentional. The whole point is that no single operator can globally erase content. Operators take their own legal posture; the rest of the network is not bound by it.
+This reflects the federated model: no single operator holds global authority over the network. Each operator's moderation decisions apply within their own boundary; other operators apply their own policies independently.
 
 ### Why this is better than the custom federation we originally specced
 
 - Day-1 federation, not v1. Manifests are redundantly stored across many independent relays from the moment they are published.
 - No custom HTTP polling logic to write or maintain.
 - Existing infrastructure does the work: nostr-rs-relay handles event storage and subscription; the `nostr` rust crate handles client publishing and verification.
-- The system is genuinely uncentralizable. No relay is privileged, including ours.
-- Bakemono can be resurrected by anyone, anywhere, by spinning up an indexer pointed at the relay set. The archive outlives the operator.
+- No relay is privileged, including ours; the protocol does not designate a coordinating authority.
+- Bakemono can be reconstituted by anyone, anywhere, by running an indexer pointed at the relay set. The archive does not depend on any single operator's continued participation.
 
 ## Identity and auth
 
@@ -189,7 +189,7 @@ The system has three independent surfaces, each with its own scope:
 
 1. **Board's postgres index**: operator marks the event hidden for its local users. Content no longer appears in search or browse on this board. Affects only this board.
 2. **Kind 31064 takedown event**: operator publishes a signed takedown to relays. Peer boards subscribing to this operator's takedowns receive it and decide whether to honor it based on jurisdiction. Relays themselves do not automatically delete the targeted event; they just carry the takedown alongside it.
-3. **Relays and swarm**: not addressable by us. Relays we do not operate keep the original event as long as their retention policy allows. The BitTorrent swarm keeps the file as long as one peer seeds it. The hash can be rediscovered via the event on any relay carrying it, any contributor's local app, or any third-party mirror.
+3. **Network-wide content layer**: not under any single operator's control. Independently-operated relays apply their own retention policies. The BitTorrent swarm persists as long as peers continue to seed. This is an inherent property of decentralized protocol design, shared by federated and peer-to-peer systems generally.
 
 Every takedown is itself a signed Nostr event, providing a built-in transparency log. Anyone can subscribe to kind 31064 from a given operator's pubkey and audit their takedown history.
 
@@ -197,10 +197,10 @@ CSAM and other categorically illegal content is moderated proactively at every b
 
 ## What this architecture buys us
 
-- **No central content host.** No equivalent of kemono's n1-n4 single-IP-block failure.
+- **No central content host.** No single-IP-block failure mode that has historically taken centralized archives offline.
 - **No central metadata host either.** Manifests live on many independent Nostr relays from the first publish. The archive is genuinely distributed.
-- **Per-jurisdiction posture.** Boards pick their own DMCA stance. Takedowns are per-board, not global. No relay we do not operate is bound by our decisions.
+- **Per-jurisdiction posture.** Each operator determines their own moderation posture in line with local legal obligations. Takedowns are per-board, not global. Relays operated by other parties are not bound by any single operator's decisions.
 - **Real browser previews.** WebTorrent makes content viewable in browser without a plugin or torrent client.
 - **User-owned identity.** Standard Nostr keypair stays with the user across boards and across the broader Nostr ecosystem. Backup-able in any Nostr client.
-- **Bring-your-own scraping.** Each user uses their own paid subscription; no shared scraper cookies to detect and ban.
+- **Bring-your-own credentials.** Each user authenticates to source platforms with their own session; no shared credentials, no pooled access infrastructure.
 - **Outlives the founders.** Even if every Bakemono operator quits, the events on relays remain queryable. Anyone can spin up a new board and resurrect the experience

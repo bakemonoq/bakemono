@@ -8,8 +8,8 @@ See `MVP.md`. One reference board (with its own embedded relay), one desktop app
 
 ## v1: Second board, multi-source scraping, kudos UI
 
-- Spin up a second Bakemono board ourselves in a different jurisdiction (Iceland, Switzerland, or Panama). Different operator keypair, different DMCA posture, same event kind.
-- Expose Fanbox, Fantia, SubscribeStar, Ci-en, Boosty in the desktop app's source picker. gallery-dl already supports these; we just wire them in.
+- Operate a second board in a different jurisdiction. Different operator keypair, independent local moderation policy, same event kind.
+- Expose additional source platforms in the desktop app's picker. The gallery-dl ecosystem already supports many; we just wire them in.
 - Federated kudos: byte counter aggregates contributions across pubkey, fetched from any board that has indexed our events.
 - Leaderboards per board and across boards.
 - Replace first-seen-pubkey mod queue with automated reputation thresholds (auto-approve after N approved events; relay-side spam-rate scoring).
@@ -41,7 +41,7 @@ See `MVP.md`. One reference board (with its own embedded relay), one desktop app
 
 ## Things we will not build
 
-- A payment system that compensates original creators. This is an archive, not a Patreon competitor; trying to add monetization invites all the same legal vectors that killed kemono.
+- A payment system that compensates source creators. This is an archive utility, not a payments platform; monetization introduces a category of legal and accounting complexity orthogonal to the archival mission.
 - Live streaming, comments, votes, follow graph. Not what this is for.
 - Account recovery via email or password. Pubkey identity is the model; users back up their own `nsec`.
 - Cloud sync of user data. Local-first or not at all.

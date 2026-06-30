@@ -1,26 +1,25 @@
 # Bakemono
 
-A federated, P2P-backed archive of creators content. Spiritual successor to Kemono, designed to survive
-single-server failure and per-jurisdiction takedowns.
+A federated, peer-to-peer content archive protocol with reference implementations. Designed for resilience to
+single-host failure with operator-level moderation autonomy.
 
 ## How it works
 
 - Content (images, audio, video, files) lives in a BitTorrent v1 + WebRTC swarm via the `webtorrent` package. No central
   CDN.
 - Metadata is published as signed Nostr events (custom kind 31063) to many independent relays. No central index.
-- Users scrape their own subscriptions via a desktop app, contribute the bytes to the swarm, and fan signed events
-  out to multiple relays at once.
+- Users archive their own subscribed content via a desktop app, contribute the bytes to the swarm, and fan signed
+  events out to multiple relays at once.
 - Browsers preview content directly via WebTorrent. No plugin, no torrent client needed for normal viewing.
 - A "board" is a self-hostable web instance: it runs its own relay, an indexer over a configured relay set, postgres for
   search, and a maud SSR UI. Anyone can spin one up.
 
 ## Why it exists
 
-Kemono had a single point of failure at its file servers (the n1-n4 subdomains, one IP block, one upstream provider).
-When that broke, the entire archive went dark for months. Bakemono separates content from index, publishes the index
-across many Nostr relays operated independently, and addresses content by hash so any peer can serve any file. Taking
-down any one operator does not take down the system. The archive can be resurrected by a stranger pointing a fresh
-indexer at the relay set.
+Centralized content archives concentrate file storage and metadata in one administrative boundary, making them brittle
+to single-host failure. Bakemono separates content from index, publishes the index across many Nostr relays operated
+independently, and addresses content by hash so any peer can serve any file. The loss of any single operator does not
+take down the system. The archive can be reconstituted by anyone pointing a fresh indexer at the relay set.
 
 ## Try it
 
@@ -45,9 +44,9 @@ after that.
 ## Contribute bytes
 
 1. Open the app and let it generate your key (saved locally as an `nsec`; back it up).
-2. Sign in to a creator site you pay for, in the app's built-in window. The session stays on your machine.
-3. Pick a creator you subscribe to and start. The app downloads your paid posts, hashes and seeds them over WebTorrent,
-   and publishes a signed manifest event to the default relay set.
+2. Sign in to a source platform in the app's built-in window. The session stays on your machine.
+3. Pick the subscribed content you wish to back up and start. The app retrieves the files, hashes and seeds them over
+   WebTorrent, and publishes a signed manifest event to the default relay set.
 4. Leave it running. Closing the window keeps the daemon seeding in the background, so the files you shared stay
    previewable for everyone on the board.
 
