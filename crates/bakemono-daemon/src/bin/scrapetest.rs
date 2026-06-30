@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -68,7 +68,7 @@ async fn main() -> Result<()> {
         identity,
     };
     let (content_dir, job) = job_from_mode(&opts.mode);
-    let daemon = Daemon::new(config, content_dir, source);
+    let daemon = Daemon::new(config, content_dir.clone(), source);
 
     let progress = |event: Value| {
         if let Ok(p) = serde_json::from_value::<Progress>(event) {
@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
     daemon.shutdown().await;
     let summary: RunSummary = serde_json::from_value(result?)?;
 
-    verify(&url, &summary).await?;
+    verify(&url, &summary, &content_dir, opts.seed).await?;
     println!(
         "\nPASS: {} event(s) published and verified on the relay",
         summary.event_ids.len()
@@ -100,6 +100,7 @@ async fn run_ipc_test(dir: PathBuf, config: AppConfig) -> Result<()> {
         relays: vec![url.clone()],
         identity: Identity::generate(),
     };
+    let seed = config.seed;
     let daemon = Arc::new(Daemon::new(config, dir.clone(), source));
     let server = {
         let daemon = daemon.clone();
@@ -127,7 +128,7 @@ async fn run_ipc_test(dir: PathBuf, config: AppConfig) -> Result<()> {
     let result = ipc::call(job, progress).await?;
     let summary: RunSummary = serde_json::from_value(result)?;
 
-    verify(&url, &summary).await?;
+    verify(&url, &summary, &dir, seed).await?;
     let _ = ipc::call(json!({"cmd": "shutdown"}), |_| {}).await;
     let _ = server.await;
     let _ = std::fs::remove_dir_all(&tmp);
@@ -168,7 +169,7 @@ fn job_from_mode(mode: &Mode) -> (PathBuf, Value) {
     }
 }
 
-async fn verify(url: &str, summary: &RunSummary) -> Result<()> {
+async fn verify(url: &str, summary: &RunSummary, content_dir: &Path, seed: bool) -> Result<()> {
     let client = Client::new(Keys::generate());
     client.add_relay(url).await?;
     client.connect().await;
@@ -180,6 +181,7 @@ async fn verify(url: &str, summary: &RunSummary) -> Result<()> {
         .await?;
     client.disconnect().await;
 
+    let mut manifests = Vec::new();
     for id_hex in &summary.event_ids {
         let event = events
             .iter()
@@ -188,10 +190,94 @@ async fn verify(url: &str, summary: &RunSummary) -> Result<()> {
         if event.verify().is_err() {
             bail!("event {id_hex} failed signature verification");
         }
-        Manifest::from_event(event)
+        let manifest = Manifest::from_event(event)
             .with_context(|| format!("event {id_hex} did not parse back into a manifest"))?;
+        manifests.push(manifest);
+    }
+    verify_thumbnails(content_dir, &manifests, seed).await
+}
+
+// end to end preview check: with seeding + ffmpeg on, every image/video manifest must reference a
+// seeded thumbnail whose on-disk bytes hash to the thumb_x the signed event carries
+async fn verify_thumbnails(content_dir: &Path, manifests: &[Manifest], seed: bool) -> Result<()> {
+    if !seed {
+        println!("thumbnails: skipped (--no-seed)");
+        return Ok(());
+    }
+    if !ffmpeg_available().await {
+        println!("thumbnails: skipped (ffmpeg not found; set BAKEMONO_FFMPEG to require previews)");
+        return Ok(());
+    }
+    let mut verified = 0;
+    for m in manifests {
+        if !(m.mime.starts_with("image/") || m.mime.starts_with("video/")) {
+            continue;
+        }
+        let thumb_x = m.thumb_x.as_deref().with_context(|| {
+            format!("{}: no thumb_x, but ffmpeg is present and mime is {}", m.d_tag(), m.mime)
+        })?;
+        let magnet = m
+            .thumb_magnet
+            .as_deref()
+            .with_context(|| format!("{}: thumb_x set but thumb_magnet missing", m.d_tag()))?;
+        if !magnet.starts_with("magnet:?") {
+            bail!("{}: thumb_magnet is not a magnet uri: {magnet}", m.d_tag());
+        }
+        let filename = m
+            .filename
+            .as_deref()
+            .with_context(|| format!("{}: manifest has no filename to locate its thumbnail", m.d_tag()))?;
+        let thumb = find_thumb(content_dir, filename).with_context(|| {
+            format!("thumbnail file {filename}.thumb.jpg not found under {}", content_dir.display())
+        })?;
+        let got = hash_hex(&std::fs::read(&thumb)?);
+        if got != thumb_x {
+            bail!("{filename}: thumbnail file hash {got} != signed thumb_x {thumb_x}");
+        }
+        verified += 1;
+    }
+    if verified == 0 {
+        println!("thumbnails: no image/video manifests in this run");
+    } else {
+        println!("thumbnails: verified {verified} seeded preview(s); on-disk bytes match signed thumb_x");
     }
     Ok(())
+}
+
+async fn ffmpeg_available() -> bool {
+    let bin = std::env::var_os("BAKEMONO_FFMPEG").unwrap_or_else(|| "ffmpeg".into());
+    tokio::process::Command::new(bin)
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn find_thumb(dir: &Path, media_filename: &str) -> Option<PathBuf> {
+    let target = format!("{media_filename}.thumb.jpg");
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if entry.file_name().to_string_lossy() == target {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn hash_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(bytes))
 }
 
 fn render(p: &Progress) -> String {
