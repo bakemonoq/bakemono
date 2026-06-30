@@ -4,10 +4,6 @@ Open-source peer-to-peer content archive protocol. Federated metadata layer over
 
 The name Bakemono (化け物) means "shapeshifter": one piece of content, many forms across many instances.
 
-## Status
-
-Pre-MVP. Architecture decided, no code written yet. See `docs/MVP.md` for the build plan and `docs/ARCHITECTURE.md` for the full technical picture.
-
 ## Core idea in one paragraph
 
 Centralized content archives concentrate file storage and index in one administrative boundary, making them brittle to single-host failure. Bakemono separates the system into three loosely coupled layers: (1) content lives in a BitTorrent v1 + WebRTC swarm, addressed by sha256 so the file's identity is what it is, not where it lives; (2) metadata is published as signed Nostr events (custom kind 31063) to many independent relays, so losing any one relay or instance does not lose the index; (3) each board runs its own embedded relay plus a postgres indexer and web UI, sets its own local moderation policy, and inherits Nostr's relay-based federation for free. A cross-platform desktop client lets users back up their own subscribed content, contribute the bytes to the swarm, and publish signed events to multiple relays at once.
