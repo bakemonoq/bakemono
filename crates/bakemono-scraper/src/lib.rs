@@ -182,13 +182,7 @@ impl Scraper {
     }
 
     fn run(&self, args: &[String]) -> Result<Vec<u8>, Error> {
-        let output = Command::new(&self.binary)
-            .args(args)
-            .output()
-            .map_err(|source| Error::Spawn {
-                binary: self.binary.to_string_lossy().into_owned(),
-                source,
-            })?;
+        let output = self.output_with_retry(args)?;
         if output.status.success() {
             Ok(output.stdout)
         } else {
@@ -196,6 +190,25 @@ impl Scraper {
                 status: status_label(&output.status),
                 stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
             })
+        }
+    }
+
+    // a just-written binary can report ETXTBSY while another thread is mid fork+exec; retry briefly
+    fn output_with_retry(&self, args: &[String]) -> Result<std::process::Output, Error> {
+        let mut attempts = 0;
+        loop {
+            match Command::new(&self.binary).args(args).output() {
+                Err(e) if e.raw_os_error() == Some(26) && attempts < 50 => {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                other => {
+                    return other.map_err(|source| Error::Spawn {
+                        binary: self.binary.to_string_lossy().into_owned(),
+                        source,
+                    });
+                }
+            }
         }
     }
 }
