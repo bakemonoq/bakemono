@@ -31,11 +31,12 @@ const isolate = process.env.BAKEMONO_ISOLATE === '1'
 // BAKEMONO_RTC_BIND pins WebRTC to one interface so we don't advertise VPN addresses to browsers
 const rtcConfig = {}
 if (process.env.BAKEMONO_RTC_BIND) rtcConfig.bindAddress = process.env.BAKEMONO_RTC_BIND
-// BAKEMONO_RTC_PORTS=begin-end pins the WebRTC UDP range so a firewalled host opens only that range
+// BAKEMONO_RTC_PORTS pins WebRTC to one muxed UDP port; a port range exhausts under many torrents and aborts the sidecar
 if (process.env.BAKEMONO_RTC_PORTS) {
-  const [begin, end] = process.env.BAKEMONO_RTC_PORTS.split('-').map(Number)
+  const begin = Number(process.env.BAKEMONO_RTC_PORTS.split('-')[0])
   rtcConfig.portRangeBegin = begin
-  rtcConfig.portRangeEnd = end
+  rtcConfig.portRangeEnd = begin
+  rtcConfig.enableIceUdpMux = true
 }
 if (process.env.BAKEMONO_STUN) {
   rtcConfig.iceServers = process.env.BAKEMONO_STUN.split(',').map((urls) => ({ urls: urls.trim() }))
