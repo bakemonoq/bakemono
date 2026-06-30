@@ -65,7 +65,7 @@ jobs:
           PKG="bakemono-server-$TARGET"
           rm -rf "$PKG"; mkdir -p "$PKG/bin" "$PKG/sidecars"
           cp "target/$TARGET/release/bakemono-daemon" "$PKG/bin/bakemono-daemon"
-          cp "target/$TARGET/release/bakemono-cli"    "$PKG/bin/bakemono-cli"
+          cp "target/$TARGET/release/bakemono"        "$PKG/bin/bakemono-cli"
           cp "$(command -v node)"                     "$PKG/bin/node"
           cp "dist/gallery-dl"                        "$PKG/bin/gallery-dl"
           npm i --no-save ffmpeg-static
