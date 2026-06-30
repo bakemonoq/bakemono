@@ -69,6 +69,8 @@ The UI comes up at `http://localhost:3000`. Configure it with environment variab
 |----------------------------------------------|---------------------------------------------------------------------------------------------|
 | `BAKEMONO_RELAYS`                            | comma-separated relay URLs the indexer subscribes to (default: the bundled relay container) |
 | `BAKEMONO_ICE_SERVERS`                       | JSON array of STUN/TURN servers handed to the browser player                                |
+| `BAKEMONO_TURN_URLS` / `BAKEMONO_TURN_SECRET`| optional TURN: comma-separated relay URLs plus the coturn shared secret, appended to the ice servers with short-lived per-load creds; both unset means no TURN |
+| `BAKEMONO_TURN_TTL`                          | lifetime of a minted TURN credential in seconds (default 3600)                              |
 | `BAKEMONO_BOARD_NAME`                        | title shown in the header and browser tab                                                   |
 | `BAKEMONO_MOD_TOKEN`                         | password for the `/mod` queue (HTTP Basic); unset disables `/mod`                           |
 | `BAKEMONO_INSTANCE_NSEC`                     | instance key that signs kind 31064 takedowns; unset keeps hides local-only                  |

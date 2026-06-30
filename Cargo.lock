@@ -259,11 +259,13 @@ dependencies = [
  "bakemono-core",
  "base64 0.22.1",
  "chrono",
+ "hmac",
  "maud",
  "nostr-relay-builder",
  "nostr-sdk",
  "rustls",
  "serde",
+ "sha1",
  "sqlx",
  "tokio",
 ]

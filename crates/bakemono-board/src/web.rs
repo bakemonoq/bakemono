@@ -589,9 +589,71 @@ fn npub(pubkey_hex: &str) -> String {
         .unwrap_or_else(|| pubkey_hex.to_string())
 }
 
-// BAKEMONO_ICE_SERVERS is a JSON array of RTCIceServer objects, default none (host-only)
+// BAKEMONO_ICE_SERVERS is a JSON array of RTCIceServer objects, default none (host-only).
+// A TURN entry with freshly minted short-lived creds is appended when BAKEMONO_TURN_* is set.
 fn ice_servers_json() -> String {
-    std::env::var("BAKEMONO_ICE_SERVERS").unwrap_or_else(|_| "[]".to_string())
+    let mut entries: Vec<String> = Vec::new();
+    if let Some(raw) = env_opt("BAKEMONO_ICE_SERVERS") {
+        let inner = raw
+            .trim()
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .map(str::trim)
+            .unwrap_or("");
+        if !inner.is_empty() {
+            entries.push(inner.to_string());
+        }
+    }
+    if let Some(turn) = turn_ice_entry() {
+        entries.push(turn);
+    }
+    format!("[{}]", entries.join(","))
+}
+
+// TURN stays optional: nothing is emitted unless both the relay URLs and the shared secret are set,
+// so a board runs fine with no TURN at all
+fn turn_ice_entry() -> Option<String> {
+    let secret = env_opt("BAKEMONO_TURN_SECRET")?;
+    let urls: Vec<String> = env_opt("BAKEMONO_TURN_URLS")?
+        .split(',')
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(|u| format!("\"{}\"", json_escape(u)))
+        .collect();
+    if urls.is_empty() {
+        return None;
+    }
+    let ttl = env_opt("BAKEMONO_TURN_TTL")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(3600);
+    let username = (now_unix() + ttl).to_string();
+    let credential = turn_credential(&secret, &username);
+    Some(format!(
+        "{{\"urls\":[{}],\"username\":\"{username}\",\"credential\":\"{}\"}}",
+        urls.join(","),
+        json_escape(&credential)
+    ))
+}
+
+// coturn use-auth-secret REST mechanism: password = base64(HMAC-SHA1(secret, username))
+fn turn_credential(secret: &str, username: &str) -> String {
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    use sha1::Sha1;
+    let mut mac = Hmac::<Sha1>::new_from_slice(secret.as_bytes()).expect("hmac takes any key length");
+    mac.update(username.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 // wss trackers the browser also announces to, so the preview finds our seeder even when the stored
@@ -688,13 +750,22 @@ fn render(title: &str, body: Markup) -> Html<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::pretty_date;
+    use super::{pretty_date, turn_credential};
 
     #[test]
     fn formats_iso_dates_and_passes_junk_through() {
         assert_eq!(pretty_date("2026-06-23T17:46:49.000+00:00"), "Jun 23, 2026");
         assert_eq!(pretty_date("2026-01-03 10:00:00"), "Jan 3, 2026");
         assert_eq!(pretty_date("whenever"), "whenever");
+    }
+
+    #[test]
+    fn turn_credential_matches_coturn_rest_format() {
+        // base64(HMAC-SHA1(secret, username)), cross-checked against openssl dgst -sha1 -hmac
+        assert_eq!(
+            turn_credential("test-secret", "1751280000"),
+            "Y35wv4+JSUCzBzfwPVS34zWiKCM="
+        );
     }
 }
 
