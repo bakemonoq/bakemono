@@ -9,6 +9,7 @@ Pushing a tag `v*` runs `.github/workflows/release.yml`, which builds the Tauri 
 - Per-OS installers: `.dmg` (macOS arm64), `.deb` + `.rpm` (Linux x64), NSIS `-setup.exe` + `.msi` (Windows x64)
 - `latest.json` plus per-platform `.sig` files for the auto-updater on macOS and Windows; the Linux `.deb` updates through the system package manager, not the in-app updater
 - Stable, versionless copies of each installer (`Bakemono_aarch64.dmg`, `Bakemono_amd64.deb`, `Bakemono_x64-setup.exe`) so `releases/latest/download/<name>` keeps resolving across versions
+- A headless server bundle per desktop platform (`bakemono-server-<target>.tar.gz`, Linux x64 + macOS arm64): the daemon + cli plus the same bundled node / gallery-dl / ffmpeg / webtorrent, so a server can untar and run scrape + seed from the console without Docker
 
 The release is a draft. Review the artifacts, then publish it.
 

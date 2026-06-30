@@ -123,3 +123,50 @@ jobs:
           if [ -z "$built" ]; then echo "no bundle matched ${{ matrix.bundle_glob }}"; exit 0; fi
           cp "$built" "${{ matrix.stable_asset }}"
           gh release upload "${{ github.ref_name }}" "${{ matrix.stable_asset }}" --clobber
+
+      # headless server bundle: daemon + cli + the same node/gallery-dl/ffmpeg/webtorrent the app ships,
+      # zipped so a server can untar and run without docker. desktop only (no windows server use yet)
+      - name: Package headless server bundle
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TARGET="${{ matrix.target }}"
+          APP=crates/bakemono-app
+          cargo build --release -p bakemono-cli --target "$TARGET"
+          PKG="bakemono-server-$TARGET"
+          rm -rf "$PKG"; mkdir -p "$PKG/bin" "$PKG/sidecars"
+          cp "$APP/binaries/bakemono-daemon-$TARGET" "$PKG/bin/bakemono-daemon"
+          cp "target/$TARGET/release/bakemono-cli"   "$PKG/bin/bakemono-cli"
+          cp "$APP/binaries/node-$TARGET"            "$PKG/bin/node"
+          cp "$APP/binaries/gallery-dl-$TARGET"      "$PKG/bin/gallery-dl"
+          cp "$APP/binaries/ffmpeg-$TARGET"          "$PKG/bin/ffmpeg"
+          cp -R "$APP/sidecars/webtorrent"           "$PKG/sidecars/webtorrent"
+          chmod +x "$PKG/bin/"*
+          for entry in bakemono-daemon bakemono-cli; do
+            launcher="bakemonod"; [ "$entry" = bakemono-cli ] && launcher="bakemono"
+            cat > "$PKG/$launcher" <<LAUNCH
+          #!/bin/sh
+          DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+          export BAKEMONO_NODE="\$DIR/bin/node"
+          export BAKEMONO_WEBTORRENT="\$DIR/sidecars/webtorrent/seed.mjs"
+          export BAKEMONO_GALLERY_DL="\$DIR/bin/gallery-dl"
+          export BAKEMONO_FFMPEG="\$DIR/bin/ffmpeg"
+          exec "\$DIR/bin/$entry" "\$@"
+          LAUNCH
+            chmod +x "$PKG/$launcher"
+          done
+          cat > "$PKG/README.txt" <<'DOC'
+          Bakemono headless server bundle.
+
+          ./bakemonod &                                      run the daemon (seeds + scrape queue + Nostr publish)
+          ./bakemono scrape <creator> --cookies cookies.txt  queue a scrape (paid posts need a cookies.txt)
+          ./bakemono status | stats | stop                   control the running daemon
+
+          Identity, config and seeded cache live under ~/.bakemono. Cookies never leave this machine.
+          macOS: clear quarantine once with  xattr -dr com.apple.quarantine .
+          DOC
+          tar czf "$PKG.tar.gz" "$PKG"
+          gh release upload "${{ github.ref_name }}" "$PKG.tar.gz" --clobber
