@@ -4,12 +4,12 @@ How desktop installers are built and shipped.
 
 ## What a release produces
 
-Pushing a tag `v*` runs `.github/workflows/release.yml`, which builds the Tauri app on three runners and drafts a GitHub release with:
+Pushing a tag `v*` runs two workflows that attach to one draft release: `release.yml` (the GUI installers) and `server.yml` (the server bundles). Together they produce:
 
 - Per-OS installers: `.dmg` (macOS arm64), `.deb` + `.rpm` (Linux x64), NSIS `-setup.exe` + `.msi` (Windows x64)
 - `latest.json` plus per-platform `.sig` files for the auto-updater on macOS and Windows; the Linux `.deb` updates through the system package manager, not the in-app updater
 - Stable, versionless copies of each installer (`Bakemono_aarch64.dmg`, `Bakemono_amd64.deb`, `Bakemono_x64-setup.exe`) so `releases/latest/download/<name>` keeps resolving across versions
-- A headless server bundle per desktop platform (`bakemono-server-<target>.tar.gz`, Linux x64 + macOS arm64): the daemon + cli plus the same bundled node / gallery-dl / ffmpeg / webtorrent, so a server can untar and run scrape + seed from the console without Docker
+- A server bundle per server platform (`bakemono-server-<target>.tar.gz`, Linux x64 + macOS arm64) from `server.yml`: the daemon + cli plus bundled node / gallery-dl / ffmpeg / webtorrent, so a server untars and runs scrape + seed from the console without Docker - no Tauri, no GUI
 
 The release is a draft. Review the artifacts, then publish it.
 
