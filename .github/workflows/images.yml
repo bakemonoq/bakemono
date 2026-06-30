@@ -12,6 +12,7 @@ on:
       - "Cargo.lock"
       - "Dockerfile"
       - "Dockerfile.tracker"
+      - "defaults/**"
       - ".github/workflows/images.yml"
   workflow_dispatch:
 
