@@ -4,11 +4,11 @@ How desktop installers are built and shipped.
 
 ## What a release produces
 
-Pushing a tag `v*` runs `.github/workflows/release.yml`, which builds the Tauri app on four runners and drafts a GitHub release with:
+Pushing a tag `v*` runs `.github/workflows/release.yml`, which builds the Tauri app on three runners and drafts a GitHub release with:
 
-- Per-OS installers: `.dmg` (macOS arm64 + x64), `.AppImage` (Linux x64), NSIS `-setup.exe` (Windows x64)
-- `latest.json` plus per-platform `.sig` files for the auto-updater
-- Stable, versionless copies of each installer (`Bakemono_aarch64.dmg`, `Bakemono_x64.dmg`, `Bakemono_amd64.AppImage`, `Bakemono_x64-setup.exe`) so `releases/latest/download/<name>` keeps resolving across versions
+- Per-OS installers: `.dmg` (macOS arm64), `.deb` + `.rpm` (Linux x64), NSIS `-setup.exe` + `.msi` (Windows x64)
+- `latest.json` plus per-platform `.sig` files for the auto-updater on macOS and Windows; the Linux `.deb` updates through the system package manager, not the in-app updater
+- Stable, versionless copies of each installer (`Bakemono_aarch64.dmg`, `Bakemono_amd64.deb`, `Bakemono_x64-setup.exe`) so `releases/latest/download/<name>` keeps resolving across versions
 
 The release is a draft. Review the artifacts, then publish it.
 
@@ -44,12 +44,12 @@ Tauri bundles these via `externalBin` and `resources`. At runtime the GUI points
 ## Not done yet
 
 - **OS code-signing.** Installers are unsigned, so first launch warns (macOS Gatekeeper, Windows SmartScreen). Wire an Apple Developer ID + notarization and a Windows code-signing cert into the workflow once available.
-- **macOS is per-arch, not universal.** A universal build is impractical here: the bundled Node runtime and webtorrent's native addon are arch-specific. The board's `/contribute` download list still names one `Bakemono_universal.dmg`; reconcile it to the two arch-specific dmgs when the board changes next land.
+- **macOS is Apple Silicon only.** Intel (`x86_64`) was dropped: GitHub's `macos-13` Intel runners are scarce and a universal build is impractical (the bundled Node runtime and webtorrent native addon are arch-specific). Intel Mac users browse via the web board.
+- **Linux ships `.deb` + `.rpm`, no AppImage.** linuxdeploy fails with an opaque error (tauri-apps/tauri#14796) that survives `libfuse2`, `APPIMAGE_EXTRACT_AND_RUN`, and `NO_STRIP`, so there is no in-app auto-update on Linux. Revisit when tauri's new AppImage bundler lands.
 
-## First-run risks to watch
-
-The workflow is authored but has not run against live runners. Most likely to need a tweak on the first tag:
+## Known rough edges
 
 - gallery-dl under PyInstaller - extractor submodules sometimes need extra `--hidden-import`/`--collect-*` flags
 - the `bundle_glob` paths, if a Tauri version changes bundle output layout
 - the stable-name upload step (guarded with `continue-on-error`, so it cannot fail the release)
+- GitHub's release API occasionally times out mid-upload; re-running the failed job clears it

@@ -18,14 +18,18 @@ jobs:
         include:
           - os: macos-14
             target: aarch64-apple-darwin
+            extra_args: ""
             stable_asset: Bakemono_aarch64.dmg
             bundle_glob: target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          # AppImage bundling fails on an opaque linuxdeploy error (tauri-apps/tauri#14796), so ship deb + rpm
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            stable_asset: Bakemono_amd64.AppImage
-            bundle_glob: target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
+            extra_args: "--bundles deb,rpm"
+            stable_asset: Bakemono_amd64.deb
+            bundle_glob: target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            extra_args: ""
             stable_asset: Bakemono_x64-setup.exe
             bundle_glob: target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
     runs-on: ${{ matrix.os }}
@@ -36,7 +40,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev pkg-config libfuse2
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev pkg-config
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -92,16 +96,12 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # linuxdeploy is an AppImage; libfuse2 (in deps) plus this cover running it on the runner
-          APPIMAGE_EXTRACT_AND_RUN: "1"
-          # linuxdeploy strip chokes on modern .relr.dyn sections; skip it (tauri-apps/tauri#14796)
-          NO_STRIP: "true"
         with:
           projectPath: crates/bakemono-app
           tagName: ${{ github.ref_name }}
           releaseName: Bakemono ${{ github.ref_name }}
           releaseDraft: true
-          args: --target ${{ matrix.target }}
+          args: --target ${{ matrix.target }} ${{ matrix.extra_args }}
 
       # the board's /contribute page links to versionless asset names under releases/latest/download.
       # upload a stable-named copy of each installer so those links survive version bumps. best-effort:
