@@ -10,6 +10,7 @@ use bakemono_scraper::{ScrapeRequest, Scraper};
 
 use bakemono_engine::identity::Identity;
 use crate::scrape::{gather_pairs, manifest_from_files};
+use crate::thumbnail;
 use bakemono_engine::seeder::SeederHandle;
 
 pub type ProgressFn<'a> = &'a (dyn Fn(Progress) + Send + Sync);
@@ -38,6 +39,10 @@ pub enum Progress {
         size: u64,
     },
     Seeded {
+        file: String,
+        magnet: String,
+    },
+    Thumbnailed {
         file: String,
         magnet: String,
     },
@@ -156,14 +161,23 @@ pub async fn reseed(seeder: &SeederHandle, dir: &Path) -> usize {
         }
     };
     let mut count = 0;
+    let mut live: Vec<PathBuf> = Vec::new();
     for (media, _sidecar) in &pairs {
         match seeder.seed(media).await {
             Ok(_) => count += 1,
             Err(e) => tracing::warn!("reseed failed for {}: {e:#}", media.display()),
         }
+        live.push(media.clone());
+        // keep the preview's magnet alive across restarts by re-seeding it alongside its file
+        let thumb = thumbnail::thumb_path(media);
+        if thumb.is_file() {
+            if seeder.seed(&thumb).await.is_ok() {
+                count += 1;
+            }
+            live.push(thumb);
+        }
     }
     // lazy prune: anything staged whose source is no longer on disk gets dropped here
-    let live: Vec<PathBuf> = pairs.into_iter().map(|(media, _)| media).collect();
     seeder.retain_staging(&live).await;
     tracing::info!(count, dir = %dir.display(), "reseeded from disk");
     count
@@ -215,6 +229,23 @@ async fn build_seed_publish(
                 file: file_label(media),
                 magnet: manifest.magnet.clone(),
             });
+            match seed_thumbnail(media, &manifest.mime, seeder).await {
+                Ok((hash, magnet)) => {
+                    progress(Progress::Thumbnailed {
+                        file: file_label(media),
+                        magnet: magnet.clone(),
+                    });
+                    manifest.thumb_x = Some(hash);
+                    manifest.thumb_magnet = Some(magnet);
+                }
+                Err(e) => {
+                    tracing::warn!("thumbnail skipped for {}: {e:#}", media.display());
+                    progress(Progress::Skipped {
+                        file: format!("{} (thumbnail)", file_label(media)),
+                        reason: format!("{e:#}"),
+                    });
+                }
+            }
         }
         summaries.push(summary_of(&manifest));
         manifests.push(manifest);
@@ -256,6 +287,27 @@ async fn build_seed_publish(
         event_ids,
         relays: ctx.relays.to_vec(),
     })
+}
+
+// make a downscaled frame, seed it, return (sha256, magnet) for the manifest. the caller treats an
+// error as a skipped preview (the file still ships), but surfaces the reason so a missing ffmpeg shows
+async fn seed_thumbnail(
+    media: &Path,
+    mime: &str,
+    seeder: &SeederHandle,
+) -> Result<(String, String)> {
+    let thumb = thumbnail::generate(media, mime)
+        .await
+        .context("generating thumbnail")?;
+    let bytes = std::fs::read(&thumb).with_context(|| format!("reading {}", thumb.display()))?;
+    let hash = hash_bytes(&bytes);
+    let info = seeder.seed(&thumb).await.context("seeding thumbnail")?;
+    Ok((hash, info.magnet))
+}
+
+fn hash_bytes(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(bytes))
 }
 
 async fn publish(relays: &[String], keys: &Keys, manifests: &[Manifest]) -> Result<Vec<EventId>> {

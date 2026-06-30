@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -64,16 +64,33 @@ impl<C: ContentSource> Daemon<C> {
     }
 
     pub async fn run_job(&self, job: Value, progress: ProgressFn<'_>) -> Result<Value> {
-        let cancel = self.begin()?;
+        // the guard releases the job slot on every exit path; an early error (e.g. the seeder
+        // sidecar failing to start) must not leave the daemon wedged in 'a job is already running'
+        let guard = self.begin()?;
+        tracing::info!("job started");
+        let result = self.run_guarded(job, guard.token(), progress).await;
+        match &result {
+            Ok(_) => tracing::info!("job finished"),
+            Err(e) => tracing::warn!("job failed: {e:#}"),
+        }
+        result
+    }
+
+    async fn run_guarded(
+        &self,
+        job: Value,
+        cancel: &CancellationToken,
+        progress: ProgressFn<'_>,
+    ) -> Result<Value> {
         let seeder = if self.config.seed {
-            self.ensure_seeder().await?;
+            self.ensure_seeder()
+                .await
+                .context("starting the webtorrent seeder")?;
             Some(&self.seeder)
         } else {
             None
         };
-        let result = self.source.run(job, seeder, &cancel, progress).await;
-        self.end();
-        result
+        self.source.run(job, seeder, cancel, progress).await
     }
 
     pub fn cancel(&self) {
@@ -113,21 +130,41 @@ impl<C: ContentSource> Daemon<C> {
             .await
     }
 
-    fn begin(&self) -> Result<CancellationToken> {
-        let mut slot = self.lock_job();
-        if slot.is_some() {
-            bail!("a job is already running");
-        }
+    fn begin(&self) -> Result<JobGuard<'_>> {
         let token = CancellationToken::new();
-        *slot = Some(token.clone());
-        Ok(token)
-    }
-
-    fn end(&self) {
-        *self.lock_job() = None;
+        {
+            let mut slot = self.lock_job();
+            if slot.is_some() {
+                bail!("a job is already running");
+            }
+            *slot = Some(token.clone());
+        }
+        Ok(JobGuard {
+            slot: &self.job,
+            token,
+        })
     }
 
     fn lock_job(&self) -> std::sync::MutexGuard<'_, Option<CancellationToken>> {
         self.job.lock().expect("job slot poisoned")
+    }
+}
+
+// releases the daemon's single job slot when the running job ends, errors out, or panics
+struct JobGuard<'a> {
+    slot: &'a Mutex<Option<CancellationToken>>,
+    token: CancellationToken,
+}
+
+impl JobGuard<'_> {
+    fn token(&self) -> &CancellationToken {
+        &self.token
+    }
+}
+
+impl Drop for JobGuard<'_> {
+    fn drop(&mut self) {
+        *self.slot.lock().expect("job slot poisoned") = None;
+        tracing::debug!("job slot released");
     }
 }

@@ -196,6 +196,8 @@ fn sample_manifest() -> Manifest {
         tier: Some("paid".into()),
         topics: vec!["furry".into(), "art".into()],
         thumb: None,
+        thumb_x: Some("b4c9e7f1".repeat(8)),
+        thumb_magnet: Some("magnet:?xt=urn:btih:thumbinfohash&dn=post123_image.thumb.jpg".into()),
         content: "post body text".into(),
     }
 }

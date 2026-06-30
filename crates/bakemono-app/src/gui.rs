@@ -174,12 +174,17 @@ fn get_config(state: State<AppState>) -> AppConfig {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn save_settings(
     relays: Vec<String>,
     trackers: Vec<String>,
     stun: Vec<String>,
     max_up_mbit: u32,
     max_down_mbit: u32,
+    node_bin: Option<String>,
+    ffmpeg_bin: Option<String>,
+    gallery_dl_bin: Option<String>,
+    webtorrent_script: Option<String>,
     state: State<AppState>,
 ) -> Result<AppConfig, String> {
     let mut guard = state.lock();
@@ -188,9 +193,17 @@ fn save_settings(
     guard.config.stun = stun;
     guard.config.max_up_mbit = max_up_mbit;
     guard.config.max_down_mbit = max_down_mbit;
+    guard.config.node_bin = clean_path(node_bin);
+    guard.config.ffmpeg_bin = clean_path(ffmpeg_bin);
+    guard.config.gallery_dl_bin = clean_path(gallery_dl_bin);
+    guard.config.webtorrent_script = clean_path(webtorrent_script);
     guard.config.save().map_err(stringify)?;
     tracing::info!(relays = guard.config.relays.len(), "saved settings");
     Ok(guard.config.clone())
+}
+
+fn clean_path(value: Option<String>) -> Option<String> {
+    value.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
 #[tauri::command]
@@ -376,7 +389,7 @@ fn spawn_daemon() -> std::io::Result<()> {
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    apply_bundled_env(&mut cmd);
+    apply_sidecar_env(&mut cmd, &AppConfig::load().unwrap_or_default());
     // own process group so the daemon survives the gui and ignores its signals
     #[cfg(unix)]
     {
@@ -406,6 +419,7 @@ struct Bundled {
     node: Option<PathBuf>,
     gallery_dl: Option<PathBuf>,
     webtorrent: Option<PathBuf>,
+    ffmpeg: Option<PathBuf>,
 }
 
 fn resolve_bundled(app: &tauri::App) -> Bundled {
@@ -426,21 +440,33 @@ fn resolve_bundled(app: &tauri::App) -> Bundled {
         node: next_to_exe("node"),
         gallery_dl: next_to_exe("gallery-dl"),
         webtorrent,
+        ffmpeg: next_to_exe("ffmpeg"),
     }
 }
 
-fn apply_bundled_env(cmd: &mut std::process::Command) {
-    let Some(bundled) = BUNDLED.get() else {
+// hand the daemon its sidecar paths with precedence: an exported BAKEMONO_* var wins (dev/CI escape
+// hatch), else the path configured in the app, else the binary bundled with a release. all unset
+// falls back to PATH / the in-repo sidecar
+fn apply_sidecar_env(cmd: &mut std::process::Command, config: &AppConfig) {
+    let bundled = BUNDLED.get();
+    set_sidecar(cmd, "BAKEMONO_NODE", config.node_bin.as_deref(), bundled.and_then(|b| b.node.as_deref()));
+    set_sidecar(cmd, "BAKEMONO_WEBTORRENT", config.webtorrent_script.as_deref(), bundled.and_then(|b| b.webtorrent.as_deref()));
+    set_sidecar(cmd, "BAKEMONO_GALLERY_DL", config.gallery_dl_bin.as_deref(), bundled.and_then(|b| b.gallery_dl.as_deref()));
+    set_sidecar(cmd, "BAKEMONO_FFMPEG", config.ffmpeg_bin.as_deref(), bundled.and_then(|b| b.ffmpeg.as_deref()));
+}
+
+fn set_sidecar(cmd: &mut std::process::Command, key: &str, config: Option<&str>, bundled: Option<&Path>) {
+    // forward an exported var explicitly rather than trusting the daemon to inherit our environment
+    if let Some(value) = std::env::var_os(key) {
+        cmd.env(key, value);
         return;
-    };
-    if let Some(node) = &bundled.node {
-        cmd.env("BAKEMONO_NODE", node);
     }
-    if let Some(script) = &bundled.webtorrent {
-        cmd.env("BAKEMONO_WEBTORRENT", script);
+    if let Some(path) = config.map(str::trim).filter(|s| !s.is_empty()) {
+        cmd.env(key, path);
+        return;
     }
-    if let Some(gallery_dl) = &bundled.gallery_dl {
-        cmd.env("BAKEMONO_GALLERY_DL", gallery_dl);
+    if let Some(path) = bundled {
+        cmd.env(key, path);
     }
 }
 

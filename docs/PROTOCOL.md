@@ -67,10 +67,10 @@ The `content` field is the source post's body text, plain or markdown. Empty str
 
 ## Thumbnails
 
-Previews are generated client-side by the desktop app at scrape time, never by the board. After hashing the original file the app downscales images (or grabs a poster frame for video) into a small preview and attaches it one of two ways:
+Previews are generated client-side by the desktop app at scrape time, never by the board. After hashing the original file the app shells out to a bundled ffmpeg to make one downscaled JPEG frame (longest side ~400px) - a single frame for images and animated GIFs, a poster frame a second in for video - and attaches it one of two ways:
 
-- Tiny previews (a few KB) go inline in the `thumb` tag as a base64 `data:` URL. A board renders them with no swarm activity at all.
-- Larger previews are seeded as their own small file and referenced by `thumb_x` (sha256) + `thumb_magnet`. They join the swarm like any other file, so previews stay decentralized and survive the original's seeders going away.
+- A seeded preview is its own small file, referenced by `thumb_x` (sha256) + `thumb_magnet`. It joins the swarm like any other file, so previews stay decentralized and survive the original's seeders going away. This is what v0 produces.
+- A tiny preview (a few KB) can instead go inline in the `thumb` tag as a base64 `data:` URL, rendered by a board with no swarm activity at all. The tag exists for this but v0 does not emit it.
 
 A board therefore never pulls the full-resolution file just to fill a grid of previews; the full file is fetched only when a user actually opens it. Thumbnails are immutable and content-addressed like everything else, so identical previews dedupe by hash
 
