@@ -951,7 +951,7 @@ for (const el of document.querySelectorAll('.file')) {
       el.appendChild(img)
     })
   } else {
-    status.textContent = 'connecting...'
+    status.remove()
     loadFull()
   }
 }
