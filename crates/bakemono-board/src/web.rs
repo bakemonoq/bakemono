@@ -626,7 +626,8 @@ fn turn_ice_entry() -> Option<String> {
     let ttl = env_opt("BAKEMONO_TURN_TTL")
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(3600);
-    let username = (now_unix() + ttl).to_string();
+    // expiry:id - the per-mint id keeps coturn's per-user quota counting sessions, not timestamp collisions
+    let username = format!("{}:{}", now_unix() + ttl, next_turn_id());
     let credential = turn_credential(&secret, &username);
     Some(format!(
         "{{\"urls\":[{}],\"username\":\"{username}\",\"credential\":\"{}\"}}",
@@ -650,6 +651,12 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn next_turn_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 fn json_escape(s: &str) -> String {
