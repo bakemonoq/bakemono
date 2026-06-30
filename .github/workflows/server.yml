@@ -1,0 +1,116 @@
+name: server
+
+# daemon + cli + their bundled sidecars (node/gallery-dl/ffmpeg/webtorrent), tarred so a server
+# runs scrape+seed from the console without docker. tauri-free; attaches to the same draft as release.yml
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux build deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: server-${{ matrix.target }}
+          cache-on-failure: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install webtorrent sidecar deps
+        working-directory: sidecars/webtorrent
+        run: npm ci
+
+      - name: Build gallery-dl standalone
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip pyinstaller gallery-dl
+          echo "from gallery_dl import main; main()" > gdl_entry.py
+          pyinstaller --onefile --name gallery-dl --collect-all gallery_dl gdl_entry.py
+
+      - name: Build daemon + cli
+        run: cargo build --release -p bakemono-daemon -p bakemono-cli --target ${{ matrix.target }}
+
+      - name: Package server bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET="${{ matrix.target }}"
+          PKG="bakemono-server-$TARGET"
+          rm -rf "$PKG"; mkdir -p "$PKG/bin" "$PKG/sidecars"
+          cp "target/$TARGET/release/bakemono-daemon" "$PKG/bin/bakemono-daemon"
+          cp "target/$TARGET/release/bakemono-cli"    "$PKG/bin/bakemono-cli"
+          cp "$(command -v node)"                     "$PKG/bin/node"
+          cp "dist/gallery-dl"                        "$PKG/bin/gallery-dl"
+          npm i --no-save ffmpeg-static
+          cp "$(node -e "process.stdout.write(require('ffmpeg-static'))")" "$PKG/bin/ffmpeg"
+          cp -R sidecars/webtorrent "$PKG/sidecars/webtorrent"
+          chmod +x "$PKG/bin/"*
+          for entry in bakemono-daemon bakemono-cli; do
+            launcher="bakemonod"; [ "$entry" = bakemono-cli ] && launcher="bakemono"
+            cat > "$PKG/$launcher" <<LAUNCH
+          #!/bin/sh
+          DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+          export BAKEMONO_NODE="\$DIR/bin/node"
+          export BAKEMONO_WEBTORRENT="\$DIR/sidecars/webtorrent/seed.mjs"
+          export BAKEMONO_GALLERY_DL="\$DIR/bin/gallery-dl"
+          export BAKEMONO_FFMPEG="\$DIR/bin/ffmpeg"
+          exec "\$DIR/bin/$entry" "\$@"
+          LAUNCH
+            chmod +x "$PKG/$launcher"
+          done
+          cat > "$PKG/README.txt" <<'DOC'
+          Bakemono server bundle (no GUI, no docker).
+
+          ./bakemonod &                                      run the daemon (seeds + scrape queue + Nostr publish)
+          ./bakemono scrape <creator> --cookies cookies.txt  queue a scrape (paid posts need a cookies.txt)
+          ./bakemono status | stats | stop                   control the running daemon
+
+          Identity, config and seeded cache live under ~/.bakemono. Cookies never leave this machine.
+          macOS: clear quarantine once with  xattr -dr com.apple.quarantine .
+          DOC
+          tar czf "$PKG.tar.gz" "$PKG"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bakemono-server-${{ matrix.target }}
+          path: bakemono-server-${{ matrix.target }}.tar.gz
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          PKG="bakemono-server-${{ matrix.target }}.tar.gz"
+          gh release create "$TAG" --draft --title "Bakemono $TAG" --notes "Desktop installers and server bundles." 2>/dev/null || true
+          gh release upload "$TAG" "$PKG" --clobber
