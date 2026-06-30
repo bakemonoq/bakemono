@@ -693,7 +693,7 @@ const REPO: &str = env!("CARGO_PKG_REPOSITORY");
 const DOWNLOADS: &[(&str, &str)] = &[
     ("Windows", "Bakemono_x64-setup.exe"),
     ("macOS (Apple Silicon)", "Bakemono_aarch64.dmg"),
-    ("Linux", "Bakemono_amd64.AppImage"),
+    ("Linux (.deb)", "Bakemono_amd64.deb"),
 ];
 
 const STYLE: &str = "
