@@ -123,15 +123,15 @@ impl Scraper {
         let args = build_args(request);
         tracing::info!(binary = %self.binary.to_string_lossy(), ?args, "running gallery-dl");
 
-        let mut child = tokio::process::Command::new(&self.binary)
-            .args(&args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|source| Error::Spawn {
-                binary: self.binary.to_string_lossy().into_owned(),
-                source,
-            })?;
+        let mut cmd = tokio::process::Command::new(&self.binary);
+        cmd.args(&args).stdout(Stdio::piped()).stderr(Stdio::piped());
+        // own process group so cancel can kill gallery-dl's PyInstaller worker, not just the bootstrap
+        #[cfg(unix)]
+        cmd.process_group(0);
+        let mut child = cmd.spawn().map_err(|source| Error::Spawn {
+            binary: self.binary.to_string_lossy().into_owned(),
+            source,
+        })?;
 
         let stdout = child.stdout.take().expect("child stdout");
         let stderr = child.stderr.take().expect("child stderr");
@@ -142,7 +142,7 @@ impl Scraper {
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
-                    let _ = child.start_kill();
+                    kill_group(&mut child);
                     tracing::info!("scrape cancelled, killing gallery-dl");
                     break;
                 }
@@ -211,6 +211,18 @@ impl Scraper {
             }
         }
     }
+}
+
+// gallery-dl's PyInstaller onefile bootstrap forks a worker that outlives a plain kill, so signal the
+// whole process group (the child is its own group leader); start_kill still reaps the bootstrap
+fn kill_group(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &format!("-{pid}")])
+            .status();
+    }
+    let _ = child.start_kill();
 }
 
 fn build_args(request: &ScrapeRequest) -> Vec<String> {
