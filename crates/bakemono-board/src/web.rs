@@ -273,6 +273,7 @@ async fn post_page(
                 }
             }
             script { (PreEscaped(format!("window.__bakemonoIce = {};", ice_servers_json()))) }
+            script { (PreEscaped(format!("window.__bakemonoTrackers = {};", trackers_json()))) }
             script type="module" { (PreEscaped(PLAYER_JS)) }
         },
     )
@@ -593,6 +594,17 @@ fn ice_servers_json() -> String {
     std::env::var("BAKEMONO_ICE_SERVERS").unwrap_or_else(|_| "[]".to_string())
 }
 
+// wss trackers the browser also announces to, so the preview finds our seeder even when the stored
+// magnet was built with an older tracker list (reseeding does not rewrite published magnets)
+fn trackers_json() -> String {
+    let wss: Vec<String> = bakemono_core::default_trackers()
+        .into_iter()
+        .filter(|t| t.starts_with("wss://"))
+        .map(|t| format!("\"{t}\""))
+        .collect();
+    format!("[{}]", wss.join(","))
+}
+
 fn board_name() -> String {
     env_opt("BAKEMONO_BOARD_NAME").unwrap_or_else(|| "化け物 bakemono".to_string())
 }
@@ -752,7 +764,7 @@ async function sha256Hex(buf) {
 // the magnet is attacker-controlled, so bytes that fail the signed sha256 are never rendered
 function fetchVerified(magnet, wantHash, status, onReady) {
   const want = (wantHash || '').toLowerCase()
-  const torrent = client.add(magnet, { store: MemChunkStore })
+  const torrent = client.add(magnet, { store: MemChunkStore, announce: window.__bakemonoTrackers || [] })
   // tracker peer counts include us and 20-min ghosts, so they lie; numPeers is the only honest
   // 'a seeder is actually reachable' signal, and metadata never arrives without one
   let deadline = Date.now() + 30000
