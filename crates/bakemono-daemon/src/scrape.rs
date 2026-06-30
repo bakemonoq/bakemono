@@ -13,7 +13,7 @@ pub fn gather_pairs(dir: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
     let present: std::collections::HashSet<&PathBuf> = files.iter().collect();
     let mut pairs = Vec::new();
     for path in &files {
-        if is_sidecar(path) {
+        if is_sidecar(path) || is_thumb(path) {
             continue;
         }
         let sidecar = sidecar_path(path);
@@ -54,6 +54,8 @@ pub fn manifest_from_files(media: &Path, sidecar: &Path) -> Result<Manifest> {
         tier: Some(tier_of(&meta)),
         topics: topics_of(&meta),
         thumb: None,
+        thumb_x: None,
+        thumb_magnet: None,
         content: string_at(&meta, &["content"]).unwrap_or_default(),
     })
 }
@@ -73,6 +75,12 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 
 fn is_sidecar(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()) == Some("json")
+}
+
+fn is_thumb(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".thumb.jpg"))
 }
 
 fn sidecar_path(media: &Path) -> PathBuf {

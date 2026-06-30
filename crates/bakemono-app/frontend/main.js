@@ -17,6 +17,7 @@ function render(p) {
     case 'seeder_ready': return 'seeder ready'
     case 'manifest': return `[${p.index}/${p.total}] ${p.file} ${p.hash.slice(0, 16)} (${p.size} bytes)`
     case 'seeded': return `seeded ${p.file}`
+    case 'thumbnailed': return `thumbnail ${p.file}`
     case 'skipped': return `skip ${p.file}: ${p.reason}`
     case 'publishing': return `publishing ${p.count} event(s) to ${p.relays.join(', ')}`
     case 'published': return `published ${p.event_ids.length} event(s)`
@@ -81,6 +82,10 @@ async function refreshConfig() {
   $('stun').value = cfg.stun.join('\n')
   $('maxUp').value = cfg.max_up_mbit
   $('maxDown').value = cfg.max_down_mbit
+  $('nodeBin').value = cfg.node_bin || ''
+  $('ffmpegBin').value = cfg.ffmpeg_bin || ''
+  $('galleryDlBin').value = cfg.gallery_dl_bin || ''
+  $('webtorrentScript').value = cfg.webtorrent_script || ''
   $('stopOnExit').checked = !!cfg.stop_daemon_on_exit
 }
 
@@ -165,7 +170,14 @@ $('saveSettings').onclick = async () => {
   const stun = lines('stun')
   const maxUpMbit = Number($('maxUp').value) || 0
   const maxDownMbit = Number($('maxDown').value) || 0
-  await invoke('save_settings', { relays, trackers, stun, maxUpMbit, maxDownMbit })
+  const nodeBin = $('nodeBin').value.trim() || null
+  const ffmpegBin = $('ffmpegBin').value.trim() || null
+  const galleryDlBin = $('galleryDlBin').value.trim() || null
+  const webtorrentScript = $('webtorrentScript').value.trim() || null
+  await invoke('save_settings', {
+    relays, trackers, stun, maxUpMbit, maxDownMbit,
+    nodeBin, ffmpegBin, galleryDlBin, webtorrentScript,
+  })
   log(`saved settings; restarting daemon`)
   applyToDaemon()
 }

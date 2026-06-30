@@ -264,7 +264,8 @@ async fn post_page(
             h2 { (title) }
             @if !body.is_empty() { div.body { (PreEscaped(body)) } }
             @for f in &files {
-                div.file data-magnet=(f.magnet) data-mime=(f.mime) data-hash=(f.file_hash) {
+                div.file data-magnet=(f.magnet) data-mime=(f.mime) data-hash=(f.file_hash)
+                    data-thumb-magnet=[f.thumb_magnet.as_deref()] data-thumb-hash=[f.thumb_x.as_deref()] {
                     p.muted {
                         (f.filename.clone().unwrap_or_else(|| f.file_hash.clone())) " - " (f.size) " bytes"
                         a.magnet href=(f.magnet) title="magnet link" { "🧲" }
@@ -710,6 +711,7 @@ nav a { text-decoration: none }
 .body { margin: 1rem 0 }
 .file { margin: 1rem 0; padding: .5rem; border: 1px solid #8884; border-radius: 6px }
 .file img, .file video { max-width: 100%; display: block; margin-top: .5rem }
+.file img.thumb { max-width: 360px; cursor: pointer; border-radius: 6px }
 .magnet { margin-left: .4rem; text-decoration: none; opacity: .55; font-size: .9em }
 .magnet:hover { opacity: 1 }
 .modform { display: inline; margin: .4rem .4rem 0 0 }
@@ -744,19 +746,13 @@ async function sha256Hex(buf) {
   const digest = await crypto.subtle.digest('SHA-256', buf)
   return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('')
 }
-for (const el of document.querySelectorAll('.file')) {
-  const status = document.createElement('p')
-  status.className = 'muted'
-  el.appendChild(status)
-  if (!secure) {
-    status.textContent = 'open this board over https or via http://localhost (a LAN IP over http has no Web Crypto)'
-    continue
-  }
-  status.textContent = 'connecting...'
-  const want = (el.dataset.hash || '').toLowerCase()
-  const torrent = client.add(el.dataset.magnet)
-  // tracker complete/incomplete counts include us and 20-min ghost peers, so they lie; numPeers is
-  // the only honest 'a seeder is actually reachable' signal, and metadata never arrives without one
+// add a magnet, wait for a reachable seeder, hand back the first file whose bytes match wantHash.
+// the magnet is attacker-controlled, so bytes that fail the signed sha256 are never rendered
+function fetchVerified(magnet, wantHash, status, onReady) {
+  const want = (wantHash || '').toLowerCase()
+  const torrent = client.add(magnet)
+  // tracker peer counts include us and 20-min ghosts, so they lie; numPeers is the only honest
+  // 'a seeder is actually reachable' signal, and metadata never arrives without one
   let deadline = Date.now() + 30000
   const tick = setInterval(() => {
     if (torrent.numPeers > 0) {
@@ -765,15 +761,13 @@ for (const el of document.querySelectorAll('.file')) {
       status.textContent = 'downloading ' + Math.round(torrent.progress * 100) + '%'
     } else if (Date.now() > deadline) {
       status.className = 'error'
-      status.textContent = 'no seeders online - nobody is sharing this file right now'
+      status.textContent = 'no seeders online - nobody is sharing this right now'
     } else {
       status.className = 'muted'
       status.textContent = 'connecting...'
     }
   }, 500)
-  // the magnet is attacker-controlled; only render bytes that match the signed sha256
   torrent.on('ready', async () => {
-    let shown = false
     for (const file of torrent.files) {
       let buf
       try {
@@ -785,20 +779,59 @@ for (const el of document.querySelectorAll('.file')) {
         return
       }
       if (want && (await sha256Hex(buf)) !== want) continue
-      const isVideo = /\\.(mp4|webm|mov)$/i.test(file.name)
-      const node = document.createElement(isVideo ? 'video' : 'img')
-      if (isVideo) node.controls = true
-      node.src = URL.createObjectURL(new Blob([buf], { type: el.dataset.mime || '' }))
-      el.appendChild(node)
-      shown = true
+      clearInterval(tick)
+      status.remove()
+      onReady(buf, file)
+      return
     }
     clearInterval(tick)
-    if (shown) {
-      status.remove()
-    } else {
-      status.className = 'error'
-      status.textContent = 'integrity check failed - file does not match its signed hash'
-    }
+    status.className = 'error'
+    status.textContent = 'integrity check failed - bytes do not match the signed hash'
   })
+}
+function mediaNode(buf, name, mime) {
+  const isVideo = /\\.(mp4|webm|mov)$/i.test(name)
+  const node = document.createElement(isVideo ? 'video' : 'img')
+  if (isVideo) node.controls = true
+  node.src = URL.createObjectURL(new Blob([buf], { type: mime || '' }))
+  return node
+}
+for (const el of document.querySelectorAll('.file')) {
+  const status = document.createElement('p')
+  status.className = 'muted'
+  el.appendChild(status)
+  if (!secure) {
+    status.textContent = 'open this board over https or via http://localhost (a LAN IP over http has no Web Crypto)'
+    continue
+  }
+  const mime = el.dataset.mime || ''
+  const loadFull = () => {
+    const s = document.createElement('p')
+    s.className = 'muted'
+    s.textContent = 'connecting...'
+    el.appendChild(s)
+    fetchVerified(el.dataset.magnet, el.dataset.hash, s, (buf, file) => {
+      el.appendChild(mediaNode(buf, file.name, mime))
+    })
+  }
+  // a seeded thumbnail fills the preview cheaply; the full file is fetched only when the user opens it
+  if (el.dataset.thumbMagnet) {
+    status.textContent = 'loading preview...'
+    fetchVerified(el.dataset.thumbMagnet, el.dataset.thumbHash, status, (buf) => {
+      const img = mediaNode(buf, 'thumb.jpg', 'image/jpeg')
+      img.className = 'thumb'
+      img.title = 'click to load the full file'
+      let opened = false
+      img.addEventListener('click', () => {
+        if (opened) return
+        opened = true
+        loadFull()
+      })
+      el.appendChild(img)
+    })
+  } else {
+    status.textContent = 'connecting...'
+    loadFull()
+  }
 }
 ";

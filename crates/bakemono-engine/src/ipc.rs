@@ -42,19 +42,24 @@ where
     let cmd = request.get("cmd").and_then(Value::as_str).unwrap_or_default();
 
     match cmd {
+        // status/stats are polled by the gui on a timer, so keep them off the default info log
         "status" => {
+            tracing::debug!("ipc status");
             let status = daemon.status().await;
             write_line(&mut writer, &json!({"ok": true, "result": status})).await?;
         }
         "stats" => {
+            tracing::debug!("ipc stats");
             let stats = daemon.stats();
             write_line(&mut writer, &json!({"ok": true, "result": stats})).await?;
         }
         "cancel" => {
+            tracing::info!("ipc cancel");
             daemon.cancel();
             write_line(&mut writer, &json!({"ok": true})).await?;
         }
         "shutdown" => {
+            tracing::info!("ipc shutdown");
             // cancel first: a fire-and-forget client (the gui on exit) may already be gone,
             // so writing the ok can fail - the daemon must shut down regardless
             shutdown.cancel();
@@ -62,9 +67,12 @@ where
         }
         "run" => {
             let job = request.get("job").cloned().unwrap_or(Value::Null);
+            let kind = job.get("kind").and_then(Value::as_str).unwrap_or("unknown");
+            tracing::info!(%kind, "ipc run");
             run_streaming(job, writer, daemon).await;
         }
         other => {
+            tracing::warn!(cmd = %other, "ipc unknown command");
             write_line(&mut writer, &json!({"ok": false, "error": format!("unknown cmd {other}")}))
                 .await?;
         }

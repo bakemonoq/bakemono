@@ -18,6 +18,15 @@ pub struct AppConfig {
     // default false: closing the desktop app leaves the daemon seeding in the background
     #[serde(default)]
     pub stop_daemon_on_exit: bool,
+    // optional sidecar binary overrides the app hands the daemon; empty = bundled, then PATH default
+    #[serde(default)]
+    pub node_bin: Option<String>,
+    #[serde(default)]
+    pub ffmpeg_bin: Option<String>,
+    #[serde(default)]
+    pub gallery_dl_bin: Option<String>,
+    #[serde(default)]
+    pub webtorrent_script: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -30,6 +39,10 @@ impl Default for AppConfig {
             max_up_mbit: 20,
             max_down_mbit: 0,
             stop_daemon_on_exit: false,
+            node_bin: None,
+            ffmpeg_bin: None,
+            gallery_dl_bin: None,
+            webtorrent_script: None,
         }
     }
 }

@@ -56,6 +56,8 @@ pub async fn upsert(pool: &PgPool, event: &Event, manifest: &Manifest) -> Result
         .bind(&manifest.posted_at)
         .bind(&manifest.tier)
         .bind(&manifest.content)
+        .bind(&manifest.thumb_x)
+        .bind(&manifest.thumb_magnet)
         .execute(pool)
         .await?;
     Ok(())
@@ -408,6 +410,8 @@ pub struct ManifestRow {
     pub posted_at: Option<String>,
     pub tier: Option<String>,
     pub content: String,
+    pub thumb_x: Option<String>,
+    pub thumb_magnet: Option<String>,
 }
 
 const SCHEMA: &str = "
@@ -429,8 +433,13 @@ CREATE TABLE IF NOT EXISTS manifests (
     post_title TEXT,
     posted_at  TEXT,
     tier       TEXT,
-    content    TEXT NOT NULL
+    content    TEXT NOT NULL,
+    thumb_x      TEXT,
+    thumb_magnet TEXT
 );
+-- add the preview columns to boards indexed before thumbnails existed
+ALTER TABLE manifests ADD COLUMN IF NOT EXISTS thumb_x TEXT;
+ALTER TABLE manifests ADD COLUMN IF NOT EXISTS thumb_magnet TEXT;
 CREATE INDEX IF NOT EXISTS manifests_creator ON manifests (platform, creator_id);
 CREATE INDEX IF NOT EXISTS manifests_post ON manifests (platform, creator_id, post_id);
 CREATE INDEX IF NOT EXISTS manifests_hash ON manifests (file_hash);
@@ -474,8 +483,9 @@ WHERE m.pubkey IN (SELECT pubkey FROM pubkeys WHERE status = 'approved')
 const INSERT: &str = "
 INSERT INTO manifests (
     event_id, pubkey, created_at, d_tag, file_hash, size, mime, magnet,
-    platform, creator, creator_id, post_id, file_index, filename, post_title, posted_at, tier, content
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+    platform, creator, creator_id, post_id, file_index, filename, post_title, posted_at, tier, content,
+    thumb_x, thumb_magnet
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
 ON CONFLICT (event_id) DO NOTHING
 ";
 

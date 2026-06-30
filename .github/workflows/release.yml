@@ -68,7 +68,7 @@ jobs:
           echo "from gallery_dl import main; main()" > gdl_entry.py
           pyinstaller --onefile --name gallery-dl --collect-all gallery_dl gdl_entry.py
 
-      - name: Stage app bundle (daemon + node + gallery-dl + webtorrent)
+      - name: Stage app bundle (daemon + node + gallery-dl + ffmpeg + webtorrent)
         shell: bash
         run: |
           set -euo pipefail
@@ -84,6 +84,11 @@ jobs:
           cp "$(command -v node)" "$APP/binaries/node-$TARGET$EXE"
           # gallery-dl built above
           cp "dist/gallery-dl$EXE" "$APP/binaries/gallery-dl-$TARGET$EXE"
+          # ffmpeg for thumbnail generation: ffmpeg-static ships a portable static build per os/arch
+          npm i --no-save ffmpeg-static
+          FFMPEG_BIN="$(node -e "process.stdout.write(require('ffmpeg-static'))")"
+          cp "$FFMPEG_BIN" "$APP/binaries/ffmpeg-$TARGET$EXE"
+          chmod +x "$APP/binaries/ffmpeg-$TARGET$EXE" || true
           # the webtorrent script + its node_modules, copied in as a resource
           rm -rf "$APP/sidecars"
           mkdir -p "$APP/sidecars"

@@ -6,7 +6,7 @@ use std::process::Stdio;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
 #[derive(Debug, Clone)]
 pub struct SeedInfo {
@@ -33,15 +33,20 @@ impl Seeder {
             .arg(script)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::piped());
         for (key, value) in extra_env {
             command.env(key, value);
         }
+        tracing::info!(node = %node.display(), script = %script.display(), "starting webtorrent sidecar");
         let mut child = command
             .spawn()
             .with_context(|| format!("spawning {} {}", node.display(), script.display()))?;
         let stdin = child.stdin.take().context("sidecar stdin missing")?;
         let stdout = child.stdout.take().context("sidecar stdout missing")?;
+        // node's own errors (missing module, bad runtime) would otherwise vanish; forward them to the log
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(forward_stderr(stderr));
+        }
         let lines = BufReader::new(stdout).lines();
 
         // staging persists and is reused across runs: a file already linked here is skipped,
@@ -56,7 +61,18 @@ impl Seeder {
             lines,
             staging,
         };
-        seeder.wait_for("ready").await?;
+        if let Err(e) = seeder.wait_for("ready").await {
+            let exit = seeder.child.try_wait().ok().flatten();
+            let detail = exit
+                .map(|s| format!(" (node exited: {s})"))
+                .unwrap_or_default();
+            bail!(
+                "webtorrent sidecar ({} {}) never signalled ready: {e}{detail}",
+                node.display(),
+                script.display()
+            );
+        }
+        tracing::info!("webtorrent sidecar ready");
         Ok(seeder)
     }
 
@@ -173,6 +189,16 @@ impl Seeder {
         self.stdin.write_all(&bytes).await?;
         self.stdin.flush().await?;
         Ok(())
+    }
+}
+
+// drain the sidecar's stderr into the daemon log so a node crash is visible, not silent
+async fn forward_stderr(stderr: ChildStderr) {
+    let mut lines = BufReader::new(stderr).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if !line.trim().is_empty() {
+            tracing::warn!(target: "webtorrent", "{line}");
+        }
     }
 }
 
