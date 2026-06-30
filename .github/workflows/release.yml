@@ -20,10 +20,6 @@ jobs:
             target: aarch64-apple-darwin
             stable_asset: Bakemono_aarch64.dmg
             bundle_glob: target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
-          - os: macos-13
-            target: x86_64-apple-darwin
-            stable_asset: Bakemono_x64.dmg
-            bundle_glob: target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             stable_asset: Bakemono_amd64.AppImage
@@ -48,6 +44,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+          cache-on-failure: true
 
       - uses: actions/setup-node@v4
         with:
@@ -95,6 +92,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # linuxdeploy is itself an AppImage; extract-and-run avoids needing libfuse2 on the runner
+          APPIMAGE_EXTRACT_AND_RUN: "1"
         with:
           projectPath: crates/bakemono-app
           tagName: ${{ github.ref_name }}
