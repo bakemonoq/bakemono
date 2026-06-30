@@ -833,14 +833,18 @@ window.addEventListener('unhandledrejection', (e) => { if (e.reason && e.reason.
 const secure = window.isSecureContext
 // iceServers from the board config (empty = host-only, fast on a LAN; set STUN/TURN for the internet)
 const iceServers = window.__bakemonoIce || []
-const client = secure ? new WebTorrent({ tracker: { rtcConfig: { iceServers } } }) : null
+// relays cost bandwidth, so only thumbnails (tiny) may use TURN; full files stay STUN/host-only.
+// TURN entries are the only ones carrying a credential, so dropping those leaves the STUN set
+const iceNoTurn = iceServers.filter((s) => !s.credential)
+const thumbClient = secure ? new WebTorrent({ tracker: { rtcConfig: { iceServers } } }) : null
+const fullClient = secure ? new WebTorrent({ tracker: { rtcConfig: { iceServers: iceNoTurn } } }) : null
 async function sha256Hex(buf) {
   const digest = await crypto.subtle.digest('SHA-256', buf)
   return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('')
 }
 // add a magnet, wait for a reachable seeder, hand back the first file whose bytes match wantHash.
 // the magnet is attacker-controlled, so bytes that fail the signed sha256 are never rendered
-function fetchVerified(magnet, wantHash, status, onReady) {
+function fetchVerified(client, magnet, wantHash, status, onReady) {
   const want = (wantHash || '').toLowerCase()
   const torrent = client.add(magnet, { store: MemChunkStore, announce: window.__bakemonoTrackers || [] })
   // tracker peer counts include us and 20-min ghosts, so they lie; numPeers is the only honest
@@ -927,14 +931,14 @@ for (const el of document.querySelectorAll('.file')) {
     s.className = 'muted'
     s.textContent = 'connecting...'
     el.appendChild(s)
-    fetchVerified(el.dataset.magnet, el.dataset.hash, s, (buf, file) => {
+    fetchVerified(fullClient, el.dataset.magnet, el.dataset.hash, s, (buf, file) => {
       el.appendChild(mediaNode(buf, file.name, mime))
     })
   }
   // a seeded thumbnail fills the preview cheaply; the full file is fetched only when the user opens it
   if (el.dataset.thumbMagnet) {
     status.textContent = 'loading preview...'
-    fetchVerified(el.dataset.thumbMagnet, el.dataset.thumbHash, status, (buf) => {
+    fetchVerified(thumbClient, el.dataset.thumbMagnet, el.dataset.thumbHash, status, (buf) => {
       const img = mediaNode(buf, 'thumb.jpg', 'image/jpeg')
       img.className = 'thumb'
       img.title = 'click to load the full file'
