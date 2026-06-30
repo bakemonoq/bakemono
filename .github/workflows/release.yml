@@ -94,6 +94,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           # linuxdeploy is an AppImage; libfuse2 (in deps) plus this cover running it on the runner
           APPIMAGE_EXTRACT_AND_RUN: "1"
+          # linuxdeploy strip chokes on modern .relr.dyn sections; skip it (tauri-apps/tauri#14796)
+          NO_STRIP: "true"
         with:
           projectPath: crates/bakemono-app
           tagName: ${{ github.ref_name }}
