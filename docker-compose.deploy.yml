@@ -42,12 +42,18 @@ services:
       # DMCA and general contact shown on /info
       BAKEMONO_DMCA_CONTACT: ${BAKEMONO_DMCA_CONTACT:-}
       BAKEMONO_CONTACT: ${BAKEMONO_CONTACT:-}
+      # richer customization (mascot, welcome/about html, community links) lives in board.toml, mounted below;
+      # deploy.sh ships ./board.toml and ./static from this dir. the env vars above still apply as a fallback
+      BAKEMONO_CONFIG: /config/board.toml
     ports:
       - "3000:3000"
       - "${BAKEMONO_GATEWAY_PORT:-4240}:${BAKEMONO_GATEWAY_PORT:-4240}"
       - "${BAKEMONO_GATEWAY_PORT:-4240}:${BAKEMONO_GATEWAY_PORT:-4240}/udp"
     volumes:
       - bakemono-cache:/cache
+      # board.toml + static assets shipped by deploy.sh; static_dir in board.toml should be /config/static
+      - ./board.toml:/config/board.toml:ro
+      - ./static:/config/static:ro
     depends_on:
       - postgres
       - relay

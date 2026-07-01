@@ -34,12 +34,9 @@ pub struct CommunityLink {
 impl BoardConfig {
     fn load() -> Self {
         let mut cfg = read_file().unwrap_or_default();
-        // env still wins so existing deploys that set these keep working without a board.toml
-        if let Some(name) = env_opt("BAKEMONO_BOARD_NAME") {
-            cfg.name = name;
-        }
+        // board.toml wins; the env vars stay as a fallback so a deploy with no board.toml still works
         if cfg.name.is_empty() {
-            cfg.name = "化け物 bakemono".to_string();
+            cfg.name = env_opt("BAKEMONO_BOARD_NAME").unwrap_or_else(|| "化け物 bakemono".to_string());
         }
         cfg.dmca_contact = cfg.dmca_contact.or_else(|| env_opt("BAKEMONO_DMCA_CONTACT"));
         cfg.contact = cfg.contact.or_else(|| env_opt("BAKEMONO_CONTACT"));

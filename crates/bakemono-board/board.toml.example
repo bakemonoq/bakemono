@@ -24,8 +24,9 @@ Read the <a href="/keepers">keepers</a> page to help keep content online.</p>
 accent = "#cba6f7"
 
 # Serve operator assets (mascot, favicon) from this dir at /static/<file>, so the board makes no external
-# request. Flat filenames only.
-static_dir = "/var/lib/bakemono/static"
+# request. Flat filenames only. With docker/deploy.sh, put the files in a ./static dir next to board.toml;
+# deploy.sh ships it and mounts it at /config/static, so keep static_dir set to that path.
+static_dir = "/config/static"
 
 dmca_contact = "dmca@example.org"
 contact = "hi@example.org"
