@@ -1,6 +1,10 @@
+use std::io::SeekFrom;
+use std::sync::Arc;
+
+use axum::body::Body;
 use axum::extract::{Form, FromRef, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::response::{Html, IntoResponse, Json, Redirect, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use base64::Engine;
@@ -8,6 +12,8 @@ use chrono::Utc;
 use maud::{html, Markup, PreEscaped, DOCTYPE};
 use nostr_sdk::prelude::{Client, Event, Keys, PublicKey, ToBech32};
 use sqlx::postgres::PgPool;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio_util::io::ReaderStream;
 
 use bakemono_core::{Takedown, Target};
 
@@ -18,6 +24,7 @@ pub struct AppState {
     pub pool: PgPool,
     pub relays: Vec<String>,
     pub signer: Option<Keys>,
+    pub gateway: Arc<bakemono_torrent::Gateway>,
 }
 
 // lets handlers that only need the pool keep extracting State<PgPool> unchanged
@@ -41,7 +48,8 @@ pub fn router(state: AppState) -> Router {
         .route("/mod/reject-creator", post(mod_reject_creator))
         .route("/mod/takedown", post(mod_takedown))
         .route("/mod/untakedown", post(mod_untakedown))
-        .route("/webtorrent.min.js", get(webtorrent_js))
+        .route("/t/{infohash}/meta", get(gateway_meta))
+        .route("/t/{infohash}/f/{file_index}", get(gateway_file))
         .with_state(state)
 }
 
@@ -264,19 +272,143 @@ async fn post_page(
             h2 { (title) }
             @if !body.is_empty() { div.body { (PreEscaped(body)) } }
             @for f in &files {
-                div.file data-magnet=(f.magnet) data-mime=(f.mime) data-hash=(f.file_hash)
-                    data-thumb-magnet=[f.thumb_magnet.as_deref()] data-thumb-hash=[f.thumb_x.as_deref()] {
-                    p.muted {
-                        (f.filename.clone().unwrap_or_else(|| f.file_hash.clone())) " - " (f.size) " bytes"
-                        a.magnet href=(f.magnet) title="magnet link" { "🧲" }
+                div.file {
+                    p.muted { (f.filename.clone().unwrap_or_else(|| f.file_hash.clone())) " - " (f.size) " bytes" }
+                    @match f.infohash.as_deref() {
+                        Some(ih) => (media_tag(ih, &f.mime)),
+                        None => p.muted { "unavailable: manifest carries no infohash" }
                     }
                 }
             }
-            script { (PreEscaped(format!("window.__bakemonoIce = {};", ice_servers_json()))) }
-            script { (PreEscaped(format!("window.__bakemonoTrackers = {};", trackers_json()))) }
-            script type="module" { (PreEscaped(PLAYER_JS)) }
         },
     )
+}
+
+// the browser fetches bytes straight from the gateway over HTTP; the immutable, content-addressed URL
+// lets the browser and any CDN cache it forever
+fn media_tag(infohash: &str, mime: &str) -> Markup {
+    let src = format!("/t/{infohash}/f/0");
+    html! {
+        @if mime.starts_with("video/") {
+            video controls preload="metadata" src=(src) {}
+        } @else {
+            img src=(src) loading="lazy" alt="";
+        }
+    }
+}
+
+// the gateway is the only thing here that speaks BitTorrent: it joins a swarm cold for an infohash the
+// board carries and hands the bytes back as plain HTTP, so browsers do no P2P
+
+async fn gateway_meta(State(state): State<AppState>, Path(infohash): Path<String>) -> Response {
+    let Some(magnet) = resolve_magnet(&state, &infohash).await else {
+        return (StatusCode::NOT_FOUND, "unknown infohash").into_response();
+    };
+    match state.gateway.meta(&magnet).await {
+        Ok(meta) => Json(meta).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("swarm error: {e:#}")).into_response(),
+    }
+}
+
+async fn gateway_file(
+    State(state): State<AppState>,
+    Path((infohash, file_index)): Path<(String, usize)>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(magnet) = resolve_magnet(&state, &infohash).await else {
+        return (StatusCode::NOT_FOUND, "unknown infohash").into_response();
+    };
+    match state.gateway.open(&magnet, file_index).await {
+        Ok(file) => stream_file(file, &headers).await,
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("swarm error: {e:#}")).into_response(),
+    }
+}
+
+// only infohashes the board carries (and that pass moderation) are served, so the gateway is never an open
+// proxy. BAKEMONO_GATEWAY_OPEN lifts the catalog check for local testing of a cold load
+async fn resolve_magnet(state: &AppState, infohash: &str) -> Option<String> {
+    let infohash = infohash.trim().to_ascii_lowercase();
+    if infohash.len() != 40 || !infohash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    if let Ok(Some(magnet)) = db::magnet_by_infohash(&state.pool, &infohash).await {
+        return Some(magnet);
+    }
+    if env_opt("BAKEMONO_GATEWAY_OPEN").is_some() {
+        let trackers: Vec<String> = bakemono_core::default_trackers()
+            .into_iter()
+            .filter(|t| !t.starts_with("wss://"))
+            .collect();
+        return Some(bakemono_torrent::synth_magnet(&infohash, &trackers));
+    }
+    None
+}
+
+async fn stream_file(mut file: bakemono_torrent::OpenFile, headers: &HeaderMap) -> Response {
+    let total = file.size;
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|r| parse_range(r, total));
+
+    let (status, body, content_len, content_range) = match range {
+        Some((start, end)) => {
+            if file.stream.seek(SeekFrom::Start(start)).await.is_err() {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "seek failed").into_response();
+            }
+            let len = end - start + 1;
+            let body = Body::from_stream(ReaderStream::new(file.stream.take(len)));
+            let cr = format!("bytes {start}-{end}/{total}");
+            (StatusCode::PARTIAL_CONTENT, body, len, Some(cr))
+        }
+        None => {
+            let body = Body::from_stream(ReaderStream::new(file.stream));
+            (StatusCode::OK, body, total, None)
+        }
+    };
+
+    let mut resp = Response::new(body);
+    *resp.status_mut() = status;
+    let h = resp.headers_mut();
+    if let Ok(v) = file.mime.parse() {
+        h.insert(header::CONTENT_TYPE, v);
+    }
+    h.insert(header::ACCEPT_RANGES, header::HeaderValue::from_static("bytes"));
+    // immutable: the URL is content-addressed by infohash, so the bytes can never change
+    h.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    h.insert(header::CONTENT_LENGTH, header::HeaderValue::from(content_len));
+    if let Some(cr) = content_range.and_then(|cr| cr.parse().ok()) {
+        h.insert(header::CONTENT_RANGE, cr);
+    }
+    resp
+}
+
+// one "bytes=start-end" range; suffix ("-N") and open-ended ("N-") forms supported, multi-range is not
+fn parse_range(raw: &str, total: u64) -> Option<(u64, u64)> {
+    let spec = raw.strip_prefix("bytes=")?;
+    if spec.contains(',') {
+        return None;
+    }
+    let (s, e) = spec.split_once('-')?;
+    let (start, end) = if s.is_empty() {
+        let n: u64 = e.parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        (total.saturating_sub(n), total.saturating_sub(1))
+    } else {
+        let start: u64 = s.parse().ok()?;
+        let end = if e.is_empty() {
+            total.saturating_sub(1)
+        } else {
+            e.parse::<u64>().ok()?.min(total.saturating_sub(1))
+        };
+        (start, end)
+    };
+    (total > 0 && start <= end && start < total).then_some((start, end))
 }
 
 async fn mod_queue(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -589,91 +721,6 @@ fn npub(pubkey_hex: &str) -> String {
         .unwrap_or_else(|| pubkey_hex.to_string())
 }
 
-// BAKEMONO_ICE_SERVERS is a JSON array of RTCIceServer objects, default none (host-only).
-// A TURN entry with freshly minted short-lived creds is appended when BAKEMONO_TURN_* is set.
-fn ice_servers_json() -> String {
-    let mut entries: Vec<String> = Vec::new();
-    if let Some(raw) = env_opt("BAKEMONO_ICE_SERVERS") {
-        let inner = raw
-            .trim()
-            .strip_prefix('[')
-            .and_then(|s| s.strip_suffix(']'))
-            .map(str::trim)
-            .unwrap_or("");
-        if !inner.is_empty() {
-            entries.push(inner.to_string());
-        }
-    }
-    if let Some(turn) = turn_ice_entry() {
-        entries.push(turn);
-    }
-    format!("[{}]", entries.join(","))
-}
-
-// TURN stays optional: nothing is emitted unless both the relay URLs and the shared secret are set,
-// so a board runs fine with no TURN at all
-fn turn_ice_entry() -> Option<String> {
-    let secret = env_opt("BAKEMONO_TURN_SECRET")?;
-    let urls: Vec<String> = env_opt("BAKEMONO_TURN_URLS")?
-        .split(',')
-        .map(str::trim)
-        .filter(|u| !u.is_empty())
-        .map(|u| format!("\"{}\"", json_escape(u)))
-        .collect();
-    if urls.is_empty() {
-        return None;
-    }
-    let ttl = env_opt("BAKEMONO_TURN_TTL")
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(3600);
-    // expiry:id - the per-mint id keeps coturn's per-user quota counting sessions, not timestamp collisions
-    let username = format!("{}:{}", now_unix() + ttl, next_turn_id());
-    let credential = turn_credential(&secret, &username);
-    Some(format!(
-        "{{\"urls\":[{}],\"username\":\"{username}\",\"credential\":\"{}\"}}",
-        urls.join(","),
-        json_escape(&credential)
-    ))
-}
-
-// coturn use-auth-secret REST mechanism: password = base64(HMAC-SHA1(secret, username))
-fn turn_credential(secret: &str, username: &str) -> String {
-    use base64::Engine;
-    use hmac::{Hmac, Mac};
-    use sha1::Sha1;
-    let mut mac = Hmac::<Sha1>::new_from_slice(secret.as_bytes()).expect("hmac takes any key length");
-    mac.update(username.as_bytes());
-    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
-}
-
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn next_turn_id() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    COUNTER.fetch_add(1, Ordering::Relaxed)
-}
-
-fn json_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-// wss trackers the browser also announces to, so the preview finds our seeder even when the stored
-// magnet was built with an older tracker list (reseeding does not rewrite published magnets)
-fn trackers_json() -> String {
-    let wss: Vec<String> = bakemono_core::default_trackers()
-        .into_iter()
-        .filter(|t| t.starts_with("wss://"))
-        .map(|t| format!("\"{t}\""))
-        .collect();
-    format!("[{}]", wss.join(","))
-}
-
 fn board_name() -> String {
     env_opt("BAKEMONO_BOARD_NAME").unwrap_or_else(|| "化け物 bakemono".to_string())
 }
@@ -714,13 +761,6 @@ fn pretty_date(raw: &str) -> String {
     raw.to_string()
 }
 
-async fn webtorrent_js() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "application/javascript")],
-        WEBTORRENT_JS,
-    )
-}
-
 fn render(title: &str, body: Markup) -> Html<String> {
     let board = board_name();
     let tab = if title.is_empty() {
@@ -755,29 +795,6 @@ fn render(title: &str, body: Markup) -> Html<String> {
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{pretty_date, turn_credential};
-
-    #[test]
-    fn formats_iso_dates_and_passes_junk_through() {
-        assert_eq!(pretty_date("2026-06-23T17:46:49.000+00:00"), "Jun 23, 2026");
-        assert_eq!(pretty_date("2026-01-03 10:00:00"), "Jan 3, 2026");
-        assert_eq!(pretty_date("whenever"), "whenever");
-    }
-
-    #[test]
-    fn turn_credential_matches_coturn_rest_format() {
-        // base64(HMAC-SHA1(secret, username)), cross-checked against openssl dgst -sha1 -hmac
-        assert_eq!(
-            turn_credential("test-secret", "1751280000"),
-            "Y35wv4+JSUCzBzfwPVS34zWiKCM="
-        );
-    }
-}
-
-const WEBTORRENT_JS: &str = include_str!("../assets/webtorrent.min.js");
-
 const REPO: &str = env!("CARGO_PKG_REPOSITORY");
 
 // per-OS desktop builds, served by GitHub's stable latest-release redirect; names track Tauri's bundles
@@ -801,9 +818,6 @@ nav a { text-decoration: none }
 .body { margin: 1rem 0 }
 .file { margin: 1rem 0; padding: .5rem; border: 1px solid #8884; border-radius: 6px }
 .file img, .file video { max-width: 100%; display: block; margin-top: .5rem }
-.file img.thumb { max-width: 360px; cursor: pointer; border-radius: 6px }
-.magnet { margin-left: .4rem; text-decoration: none; opacity: .55; font-size: .9em }
-.magnet:hover { opacity: 1 }
 .modform { display: inline; margin: .4rem .4rem 0 0 }
 .takedown { display: flex; flex-wrap: wrap; gap: .4rem; margin: .6rem 0 1rem }
 .takedown input { flex: 1 1 12rem }
@@ -825,134 +839,15 @@ code { word-break: break-all; font-size: .85em }
 a { color: #4488ff }
 ";
 
-const PLAYER_JS: &str = "
-import WebTorrent from '/webtorrent.min.js'
-// the bundle probes OPFS on import to clear stale chunks; we keep data in memory, so swallow that SecurityError
-window.addEventListener('unhandledrejection', (e) => { if (e.reason && e.reason.name === 'SecurityError') e.preventDefault() })
-// WebTorrent needs Web Crypto, which only exists in a secure context (https or http://localhost)
-const secure = window.isSecureContext
-// iceServers from the board config (empty = host-only, fast on a LAN; set STUN/TURN for the internet)
-const iceServers = window.__bakemonoIce || []
-// relays cost bandwidth, so only thumbnails (tiny) may use TURN; full files stay STUN/host-only.
-// TURN entries are the only ones carrying a credential, so dropping those leaves the STUN set
-const iceNoTurn = iceServers.filter((s) => !s.credential)
-const thumbClient = secure ? new WebTorrent({ tracker: { rtcConfig: { iceServers } } }) : null
-const fullClient = secure ? new WebTorrent({ tracker: { rtcConfig: { iceServers: iceNoTurn } } }) : null
-async function sha256Hex(buf) {
-  const digest = await crypto.subtle.digest('SHA-256', buf)
-  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('')
-}
-// add a magnet, wait for a reachable seeder, hand back the first file whose bytes match wantHash.
-// the magnet is attacker-controlled, so bytes that fail the signed sha256 are never rendered
-function fetchVerified(client, magnet, wantHash, status, onReady) {
-  const want = (wantHash || '').toLowerCase()
-  const torrent = client.add(magnet, { store: MemChunkStore, announce: window.__bakemonoTrackers || [] })
-  // tracker peer counts include us and 20-min ghosts, so they lie; numPeers is the only honest
-  // 'a seeder is actually reachable' signal, and metadata never arrives without one
-  let deadline = Date.now() + 30000
-  const tick = setInterval(() => {
-    if (torrent.numPeers > 0) {
-      deadline = Date.now() + 30000
-      status.className = 'muted'
-      status.textContent = 'downloading ' + Math.round(torrent.progress * 100) + '%'
-    } else if (Date.now() > deadline) {
-      status.className = 'error'
-      status.textContent = 'no seeders online - nobody is sharing this right now'
-    } else {
-      status.className = 'muted'
-      status.textContent = 'connecting...'
+
+#[cfg(test)]
+mod tests {
+    use super::pretty_date;
+
+    #[test]
+    fn formats_iso_dates_and_passes_junk_through() {
+        assert_eq!(pretty_date("2026-06-23T17:46:49.000+00:00"), "Jun 23, 2026");
+        assert_eq!(pretty_date("2026-01-03 10:00:00"), "Jan 3, 2026");
+        assert_eq!(pretty_date("whenever"), "whenever");
     }
-  }, 500)
-  torrent.on('ready', async () => {
-    for (const file of torrent.files) {
-      let buf
-      try {
-        buf = await file.arrayBuffer()
-      } catch (err) {
-        clearInterval(tick)
-        status.className = 'error'
-        status.textContent = 'error: ' + err.message
-        return
-      }
-      if (want && (await sha256Hex(buf)) !== want) continue
-      clearInterval(tick)
-      status.remove()
-      onReady(buf, file)
-      return
-    }
-    clearInterval(tick)
-    status.className = 'error'
-    status.textContent = 'integrity check failed - bytes do not match the signed hash'
-  })
 }
-function mediaNode(buf, name, mime) {
-  const isVideo = /\\.(mp4|webm|mov)$/i.test(name)
-  const node = document.createElement(isVideo ? 'video' : 'img')
-  if (isVideo) node.controls = true
-  node.src = URL.createObjectURL(new Blob([buf], { type: mime || '' }))
-  return node
-}
-// abstract-chunk-store kept in memory, so previews never touch OPFS (blocked in private windows and strict-privacy profiles)
-class MemChunkStore {
-  constructor(chunkLength, opts = {}) {
-    this.chunkLength = Number(chunkLength)
-    this.chunks = []
-    this.length = Number(opts.length) || Infinity
-    this.lastChunkLength = (this.length % this.chunkLength) || this.chunkLength
-    this.lastChunkIndex = Math.ceil(this.length / this.chunkLength) - 1
-  }
-  put(i, buf, cb = () => {}) {
-    this.chunks[i] = buf
-    queueMicrotask(() => cb(null))
-  }
-  get(i, opts, cb = () => {}) {
-    if (typeof opts === 'function') return this.get(i, null, opts)
-    const buf = this.chunks[i]
-    if (!buf) return queueMicrotask(() => { const e = new Error('Chunk not found'); e.notFound = true; cb(e) })
-    if (!opts) return queueMicrotask(() => cb(null, buf))
-    const offset = opts.offset || 0
-    const len = opts.length || (buf.length - offset)
-    queueMicrotask(() => cb(null, buf.slice(offset, offset + len)))
-  }
-  close(cb = () => {}) { queueMicrotask(() => cb(null)) }
-  destroy(cb = () => {}) { this.chunks = []; queueMicrotask(() => cb(null)) }
-}
-for (const el of document.querySelectorAll('.file')) {
-  const status = document.createElement('p')
-  status.className = 'muted'
-  el.appendChild(status)
-  if (!secure) {
-    status.textContent = 'open this board over https or via http://localhost (a LAN IP over http has no Web Crypto)'
-    continue
-  }
-  const mime = el.dataset.mime || ''
-  const loadFull = () => {
-    const s = document.createElement('p')
-    s.className = 'muted'
-    s.textContent = 'connecting...'
-    el.appendChild(s)
-    fetchVerified(fullClient, el.dataset.magnet, el.dataset.hash, s, (buf, file) => {
-      el.appendChild(mediaNode(buf, file.name, mime))
-    })
-  }
-  // a seeded thumbnail fills the preview cheaply; the full file is fetched only when the user opens it
-  if (el.dataset.thumbMagnet) {
-    status.textContent = 'loading preview...'
-    fetchVerified(thumbClient, el.dataset.thumbMagnet, el.dataset.thumbHash, status, (buf) => {
-      const img = mediaNode(buf, 'thumb.jpg', 'image/jpeg')
-      img.className = 'thumb'
-      img.title = 'click to load the full file'
-      let opened = false
-      img.addEventListener('click', () => {
-        if (opened) return
-        opened = true
-        loadFull()
-      })
-      el.appendChild(img)
-    })
-  } else {
-    status.remove()
-    loadFull()
-  }
-}
-";

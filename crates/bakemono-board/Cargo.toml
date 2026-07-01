@@ -8,17 +8,17 @@ repository.workspace = true
 
 [dependencies]
 bakemono-core = { path = "../bakemono-core" }
+bakemono-torrent = { path = "../bakemono-torrent" }
 nostr-sdk.workspace = true
 rustls.workspace = true
 sqlx.workspace = true
 axum.workspace = true
 maud.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 anyhow.workspace = true
 serde = { version = "1", features = ["derive"] }
 base64 = "0.22"
-hmac = "0.12"
-sha1 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
