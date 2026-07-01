@@ -393,6 +393,36 @@ pub async fn creator_posts(
     Ok(rows)
 }
 
+// the older and newer post by the same creator, ordered by post date, for prev/next links on a post page.
+// prev is older (further back in time), next is newer
+pub async fn adjacent_posts(
+    pool: &PgPool,
+    platform: &str,
+    creator_id: &str,
+    post_id: &str,
+) -> Result<Option<AdjacentRow>> {
+    let row = sqlx::query_as::<_, AdjacentRow>(
+        "SELECT prev_id, prev_title, next_id, next_title FROM (
+             SELECT post_id,
+                    LEAD(post_id) OVER w AS prev_id, LEAD(t) OVER w AS prev_title,
+                    LAG(post_id)  OVER w AS next_id, LAG(t)  OVER w AS next_title
+             FROM (
+                 SELECT post_id, MAX(post_title) AS t, MAX(posted_at) AS pa, MAX(created_at) AS ca
+                 FROM visible_manifests
+                 WHERE platform = $1 AND creator_id = $2
+                 GROUP BY post_id
+             ) g
+             WINDOW w AS (ORDER BY pa DESC NULLS LAST, ca DESC)
+         ) r WHERE post_id = $3",
+    )
+    .bind(platform)
+    .bind(creator_id)
+    .bind(post_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
 pub async fn random_post(pool: &PgPool) -> Result<Option<(String, String, String)>> {
     let row = sqlx::query_as::<_, (String, String, String)>(
         "SELECT platform, creator_id, post_id FROM visible_manifests ORDER BY random() LIMIT 1",
@@ -594,9 +624,17 @@ pub struct PostCard {
     pub posted_at: Option<String>,
     pub mime: String,
     pub thumb: Option<String>,
-    pub infohash: Option<String>,
     pub files: i64,
     pub views: i64,
+}
+
+// prev/next post ids and titles for on-post navigation; prev is older, next is newer
+#[derive(sqlx::FromRow)]
+pub struct AdjacentRow {
+    pub prev_id: Option<String>,
+    pub prev_title: Option<String>,
+    pub next_id: Option<String>,
+    pub next_title: Option<String>,
 }
 
 // a creator reduced to one grid card: cover thumb from their newest previewable file + counts
@@ -608,7 +646,6 @@ pub struct CreatorCard {
     pub posts: i64,
     pub files: i64,
     pub thumb: Option<String>,
-    pub infohash: Option<String>,
     pub mime: Option<String>,
 }
 

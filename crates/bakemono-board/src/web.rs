@@ -42,6 +42,7 @@ pub fn router(state: AppState) -> Router {
         .route("/static/{file}", get(static_file))
         .route("/posts", get(posts_index))
         .route("/creators", get(creators_index))
+        .route("/search", get(search_index))
         .route("/random", get(random_redirect))
         .route("/feed.xml", get(seed_feed))
         .route("/contribute", get(contribute))
@@ -65,7 +66,8 @@ pub fn router(state: AppState) -> Router {
 const PAGE: i64 = 60;
 
 async fn home(State(pool): State<PgPool>) -> Html<String> {
-    let posts = db::list_posts(&pool, db::Sort::Recent, "", 18, 0)
+    // 12 keeps Recent to two rows on a wide screen
+    let posts = db::list_posts(&pool, db::Sort::Recent, "", 12, 0)
         .await
         .unwrap_or_default();
     let creators = db::list_creators(&pool, db::Sort::Popular, "", 12, 0)
@@ -75,7 +77,7 @@ async fn home(State(pool): State<PgPool>) -> Html<String> {
     render(
         "",
         html! {
-            (welcome(cfg, posts.first()))
+            (welcome(cfg))
             section.block {
                 div.blockhead { h2 { "Recent" } a.more href="/posts" { "all posts" } }
                 @if posts.is_empty() {
@@ -143,6 +145,95 @@ async fn random_redirect(State(pool): State<PgPool>) -> Redirect {
     }
 }
 
+// one query, two result sets: posts and creators live under their own tabs since either can be large
+async fn search_index(State(pool): State<PgPool>, Query(query): Query<SearchQuery>) -> Html<String> {
+    let q = query.q.unwrap_or_default().trim().to_string();
+    let creators_tab = query.tab.as_deref() == Some("creators");
+    let page = query.page.unwrap_or(0).max(0);
+
+    let mut posts = Vec::new();
+    let mut creators = Vec::new();
+    let mut has_next = false;
+    if !q.is_empty() && creators_tab {
+        creators = db::list_creators(&pool, db::Sort::Recent, &q, PAGE + 1, page * PAGE)
+            .await
+            .unwrap_or_default();
+        has_next = creators.len() as i64 > PAGE;
+        creators.truncate(PAGE as usize);
+    } else if !q.is_empty() {
+        posts = db::list_posts(&pool, db::Sort::Recent, &q, PAGE + 1, page * PAGE)
+            .await
+            .unwrap_or_default();
+        has_next = posts.len() as i64 > PAGE;
+        posts.truncate(PAGE as usize);
+    }
+
+    let tab = if creators_tab { "creators" } else { "posts" };
+    render(
+        "search",
+        html! {
+            h1.pagetitle { "Search" }
+            form.search method="get" action="/search" {
+                input type="search" name="q" value=(q) placeholder="search posts and creators" autofocus;
+                @if creators_tab { input type="hidden" name="tab" value="creators"; }
+                button { "go" }
+            }
+            div.tabs {
+                a.tab.active[!creators_tab] href=(search_href(&q, "posts", 0)) { "Posts" }
+                a.tab.active[creators_tab] href=(search_href(&q, "creators", 0)) { "Creators" }
+            }
+            @if q.is_empty() {
+                p.muted { "Type something to search posts and creators" }
+            } @else if creators_tab {
+                @if creators.is_empty() { p.muted { "No creators match \"" (q) "\"" } }
+                (creators_grid(&creators))
+            } @else {
+                @if posts.is_empty() { p.muted { "No posts match \"" (q) "\"" } }
+                (posts_grid(&posts))
+            }
+            (search_pager(&q, tab, page, has_next))
+        },
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct SearchQuery {
+    q: Option<String>,
+    tab: Option<String>,
+    page: Option<i64>,
+}
+
+fn search_href(q: &str, tab: &str, page: i64) -> String {
+    let mut out = format!("/search?q={}", qs_encode(q));
+    if tab != "posts" {
+        out.push_str(&format!("&tab={tab}"));
+    }
+    if page > 0 {
+        out.push_str(&format!("&page={page}"));
+    }
+    out
+}
+
+fn search_pager(q: &str, tab: &str, page: i64, has_next: bool) -> Markup {
+    html! {
+        @if page > 0 || has_next {
+            div.pager {
+                @if page > 0 {
+                    a.btn.ghost href=(search_href(q, tab, page - 1)) { "prev" }
+                } @else {
+                    span.btn.ghost.off { "prev" }
+                }
+                span.muted { "page " (page + 1) }
+                @if has_next {
+                    a.btn.ghost href=(search_href(q, tab, page + 1)) { "next" }
+                } @else {
+                    span.btn.ghost.off { "next" }
+                }
+            }
+        }
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct BrowseQuery {
     q: Option<String>,
@@ -173,12 +264,14 @@ fn post_card(p: &db::PostCard) -> Markup {
     let title = p.post_title.clone().unwrap_or_else(|| p.post_id.clone());
     html! {
         a.card href=(href) {
-            div.cardthumb { (card_thumb(p.thumb.as_deref(), p.infohash.as_deref(), &p.mime)) }
+            div.cardthumb { (card_thumb(p.thumb.as_deref(), &p.mime)) }
             div.cardmeta {
                 div.cardtitle { (title) }
                 div.cardsub {
                     span.strong { (p.creator) }
-                    " - " (p.files) @if p.files == 1 { " file" } @else { " files" }
+                    br;
+                    (p.files) @if p.files == 1 { " file" } @else { " files" }
+                    @if let Some(at) = &p.posted_at { " - " (pretty_date(at)) }
                     @if p.views > 0 { " - " (p.views) " views" }
                 }
             }
@@ -198,7 +291,7 @@ fn creator_card(c: &db::CreatorCard) -> Markup {
     let href = format!("/c/{}/{}", c.platform, c.creator_id);
     html! {
         a.card href=(href) {
-            div.cardthumb.banner { (card_thumb(c.thumb.as_deref(), c.infohash.as_deref(), c.mime.as_deref().unwrap_or(""))) }
+            div.cardthumb.banner { (card_thumb(c.thumb.as_deref(), c.mime.as_deref().unwrap_or(""))) }
             div.cardmeta {
                 div.cardtitle { (c.creator) }
                 div.cardsub {
@@ -210,23 +303,21 @@ fn creator_card(c: &db::CreatorCard) -> Markup {
     }
 }
 
-// the thumbnail area: inline preview paints instantly with zero fetch. with none, a still image can fall back
-// to the gateway (lazy), but a video never loads its full bytes into a grid cell - it shows a placeholder
-fn card_thumb(thumb: Option<&str>, infohash: Option<&str>, mime: &str) -> Markup {
-    let is_video = mime.starts_with("video/");
+// the thumbnail area: the inline preview paints instantly with zero fetch. no preview shows a placeholder
+// rather than pulling a full file into a grid cell, so a page of cards stays cheap
+fn card_thumb(thumb: Option<&str>, mime: &str) -> Markup {
     html! {
-        @match (thumb, is_video, infohash) {
-            (Some(t), _, _) => { img.cover src=(t) loading="lazy" alt=""; }
-            (None, false, Some(ih)) => { img.cover src=(format!("/t/{ih}/f/0")) loading="lazy" alt=""; }
-            _ => { (placeholder(mime)) }
+        @match thumb {
+            Some(t) => { img.cover src=(t) loading="lazy" alt=""; }
+            None => { (placeholder(mime)) }
         }
-        @if is_video { span.playbadge {} }
+        @if mime.starts_with("video/") { span.playbadge {} }
     }
 }
 
 fn placeholder(mime: &str) -> Markup {
     let label = mime.rsplit('/').next().unwrap_or("file").to_uppercase();
-    html! { div.placeholder { span { (label) } } }
+    html! { div.placeholder { (PreEscaped(ICON_IMAGE)) span { (label) } } }
 }
 
 fn toolbar(base: &str, q: &str, sort: db::Sort, placeholder: &str) -> Markup {
@@ -277,7 +368,7 @@ fn browse_href(base: &str, sort: db::Sort, q: &str, page: i64) -> String {
     out
 }
 
-fn welcome(cfg: &config::BoardConfig, featured: Option<&db::PostCard>) -> Markup {
+fn welcome(cfg: &config::BoardConfig) -> Markup {
     html! {
         @if cfg.mascot.is_some() || cfg.welcome_html.is_some() {
             section.welcome {
@@ -287,15 +378,6 @@ fn welcome(cfg: &config::BoardConfig, featured: Option<&db::PostCard>) -> Markup
                     @if let Some(t) = &cfg.tagline { p.tagline { (t) } }
                     // operator-authored html, rendered raw on purpose (same trust level as the binary)
                     @if let Some(body) = &cfg.welcome_html { div.welcomebody { (PreEscaped(body)) } }
-                }
-            }
-        } @else if let Some(f) = featured {
-            a.hero href=(format!("/p/{}/{}/{}", f.platform, f.creator_id, f.post_id)) {
-                div.cardthumb { (card_thumb(f.thumb.as_deref(), f.infohash.as_deref(), &f.mime)) }
-                div.herobody {
-                    span.eyebrow { "Latest" }
-                    h1 { (f.post_title.clone().unwrap_or_else(|| f.post_id.clone())) }
-                    p.muted { (f.creator) @if let Some(at) = &f.posted_at { " - " (pretty_date(at)) } }
                 }
             }
         }
@@ -776,6 +858,11 @@ async fn post_page(
         .unwrap_or_else(|| post_id.clone());
     let body = first.map(|f| f.content.clone()).unwrap_or_default();
     let creator = first.map(|f| f.creator.clone());
+    let date = first.and_then(|f| f.posted_at.clone());
+    let adjacent = db::adjacent_posts(&pool, &platform, &creator_id, &post_id)
+        .await
+        .ok()
+        .flatten();
 
     // count one view per browser: a rolling cookie holds the last post opened, so a refresh does not re-count
     let token = view_token(&platform, &creator_id, &post_id);
@@ -789,25 +876,23 @@ async fn post_page(
         html! {
             div.crumbs {
                 a href="/posts" { "Posts" }
-                @if let Some(f) = first {
-                    " / " a href=(format!("/c/{}/{}", f.platform, f.creator_id)) { (f.creator) }
+                @if let Some(c) = &creator {
+                    " / " a href=(format!("/c/{platform}/{creator_id}")) { (c) }
                 }
             }
             h1.pagetitle { (title) }
-            @if let Some(c) = &creator {
-                p.muted { "by " a.strong href=(format!("/c/{platform}/{creator_id}")) { (c) } }
-            }
-            @if !body.is_empty() { div.body { (PreEscaped(body)) } }
-            @if files.is_empty() { p.muted { "This post has no files, or they are hidden" } }
-            div.gallery {
-                @for f in &files {
-                    figure.file {
-                        (media_block(f))
-                        figcaption.muted { (f.filename.clone().unwrap_or_else(|| f.file_hash.clone())) " - " (human_size(f.size)) }
-                    }
+            div.postmeta {
+                @if let Some(c) = &creator {
+                    "by " a.strong href=(format!("/c/{platform}/{creator_id}")) { (c) }
                 }
+                @if let Some(d) = &date { " - " (pretty_date(d)) }
+                @if !files.is_empty() { " - " (files.len()) @if files.len() == 1 { " file" } @else { " files" } }
             }
-            script { (PreEscaped(THUMB_JS)) }
+            (post_nav(&platform, &creator_id, adjacent.as_ref()))
+            @if files.is_empty() { p.muted { "This post has no files, or they are hidden" } }
+            (carousel(&files))
+            @if !body.is_empty() { div.body { (PreEscaped(body)) } }
+            script { (PreEscaped(CAROUSEL_JS)) }
         },
     );
 
@@ -822,28 +907,53 @@ async fn post_page(
     resp
 }
 
-// the preview is embedded in the event as a webp data URI, so it renders with zero fetch and no seeder;
-// the full file is content-addressed and pulled from the gateway over HTTP only when the thumb is clicked
-fn media_block(f: &db::ManifestRow) -> Markup {
-    let Some(infohash) = f.infohash.as_deref() else {
-        return html! { p.muted { "unavailable: manifest carries no infohash" } };
+fn post_nav(platform: &str, creator_id: &str, adj: Option<&db::AdjacentRow>) -> Markup {
+    let Some(adj) = adj else {
+        return html! {};
     };
-    let full = format!("/t/{infohash}/f/0");
-    let is_video = f.mime.starts_with("video/");
+    let base = format!("/p/{platform}/{creator_id}");
     html! {
-        @match f.thumb.as_deref() {
-            Some(thumb) => {
-                div.media data-full=(full) data-video=[is_video.then_some("1")] {
-                    img.thumb src=(thumb) loading="lazy" alt="";
+        @if adj.prev_id.is_some() || adj.next_id.is_some() {
+            div.postnav {
+                @if let Some(id) = &adj.prev_id {
+                    a href=(format!("{base}/{id}")) {
+                        (PreEscaped(ICON_PREV))
+                        span.ntitle { "Previous" @if let Some(t) = &adj.prev_title { ": " (t) } }
+                    }
+                }
+                @if let Some(id) = &adj.next_id {
+                    a.nnext href=(format!("{base}/{id}")) {
+                        span.ntitle { "Next" @if let Some(t) = &adj.next_title { ": " (t) } }
+                        (PreEscaped(ICON_NEXT))
+                    }
                 }
             }
-            None => {
-                @if is_video {
-                    video controls preload="metadata" src=(full) {}
-                } @else {
-                    img src=(full) loading="lazy" alt="" onerror="bakemonoErr(this)";
-                }
-            }
+        }
+    }
+}
+
+// full media (not the tiny preview) streamed straight from the gateway, one at a time and centered - content
+// is the point of the page. each item loads only when shown, so a many-image post does not fetch it all at once
+fn carousel(files: &[db::ManifestRow]) -> Markup {
+    let items: Vec<String> = files
+        .iter()
+        .filter_map(|f| {
+            let ih = f.infohash.as_deref()?;
+            let video = f.mime.starts_with("video/");
+            Some(format!("{{\"u\":\"/t/{ih}/f/0\",\"v\":{video}}}"))
+        })
+        .collect();
+    if items.is_empty() {
+        return html! {};
+    }
+    let multi = items.len() > 1;
+    let json = format!("[{}]", items.join(","));
+    html! {
+        div.carousel data-items=(json) {
+            @if multi { button.cprev type="button" aria-label="Previous image" { (PreEscaped(ICON_PREV)) } }
+            div.cstage {}
+            @if multi { button.cnext type="button" aria-label="Next image" { (PreEscaped(ICON_NEXT)) } }
+            @if multi { div.ccount {} }
         }
     }
 }
@@ -1291,22 +1401,6 @@ fn env_opt(key: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-// bytes as a short human string for file captions
-fn human_size(bytes: i64) -> String {
-    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
-    let mut v = bytes as f64;
-    let mut u = 0;
-    while v >= 1024.0 && u < UNITS.len() - 1 {
-        v /= 1024.0;
-        u += 1;
-    }
-    if u == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{v:.1} {}", UNITS[u])
-    }
-}
-
 // a stable per-post cookie token so a refresh does not re-count a view; hashed so odd ids stay cookie-safe
 fn view_token(platform: &str, creator_id: &str, post_id: &str) -> String {
     use std::hash::{Hash, Hasher};
@@ -1373,16 +1467,17 @@ fn render(title: &str, body: Markup) -> Html<String> {
                             @if let Some(m) = &cfg.mascot { img.brandmascot src=(m) alt=""; }
                             span { (cfg.name) }
                         }
-                        form.topsearch method="get" action="/posts" {
-                            input type="search" name="q" placeholder="Search" aria-label="Search";
-                        }
-                        div.navwrap {
-                            a.shuffle href="/random" title="Random post" aria-label="Random post" { (PreEscaped(ICON_SHUFFLE)) }
-                            nav {
-                                a href="/creators" { "Creators" }
-                                a href="/posts" { "Posts" }
-                                a href="/contribute" { "Contribute" }
+                        div.searchgroup {
+                            form.topsearch method="get" action="/search" {
+                                input type="search" name="q" placeholder="Search" aria-label="Search";
+                                button.searchbtn type="submit" aria-label="Search" { (PreEscaped(ICON_SEARCH)) }
                             }
+                            a.shuffle href="/random" title="Random post" aria-label="Random post" { (PreEscaped(ICON_SHUFFLE)) }
+                        }
+                        nav {
+                            a href="/creators" { (PreEscaped(ICON_CREATORS)) span { "Creators" } }
+                            a href="/posts" { (PreEscaped(ICON_POSTS)) span { "Posts" } }
+                            a href="/contribute" { (PreEscaped(ICON_CONTRIBUTE)) span { "Contribute" } }
                         }
                     }
                     main { (body) }
@@ -1427,8 +1522,15 @@ const DOWNLOADS: &[(&str, &str)] = &[
     ("Linux (.deb)", "Bakemono_amd64.deb"),
 ];
 
-// two crossing arrows for the Random button; inline so the page pulls no icon font or external asset
+// inline SVGs so the page pulls no icon font or external asset. shared attrs are per-svg to stay standalone
 const ICON_SHUFFLE: &str = "<svg viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M16 3h5v5'/><path d='M4 20 21 3'/><path d='M21 16v5h-5'/><path d='M15 15l6 6'/><path d='M4 4l5 5'/></svg>";
+const ICON_SEARCH: &str = "<svg viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><circle cx='11' cy='11' r='7'/><path d='M21 21l-4.3-4.3'/></svg>";
+const ICON_PREV: &str = "<svg viewBox='0 0 24 24' width='20' height='20' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M15 18l-6-6 6-6'/></svg>";
+const ICON_NEXT: &str = "<svg viewBox='0 0 24 24' width='20' height='20' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M9 18l6-6-6-6'/></svg>";
+const ICON_CREATORS: &str = "<svg viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2'/><circle cx='9' cy='7' r='4'/><path d='M23 21v-2a4 4 0 0 0-3-3.87'/><path d='M16 3.13a4 4 0 0 1 0 7.75'/></svg>";
+const ICON_POSTS: &str = "<svg viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><rect x='3' y='3' width='7' height='7' rx='1'/><rect x='14' y='3' width='7' height='7' rx='1'/><rect x='3' y='14' width='7' height='7' rx='1'/><rect x='14' y='14' width='7' height='7' rx='1'/></svg>";
+const ICON_CONTRIBUTE: &str = "<svg viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.6l-1-1a5.5 5.5 0 1 0-7.8 7.8l1 1L12 21l7.8-7.6 1-1a5.5 5.5 0 0 0 0-7.8z'/></svg>";
+const ICON_IMAGE: &str = "<svg viewBox='0 0 24 24' width='30' height='30' fill='none' stroke='currentColor' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'><rect x='3' y='3' width='18' height='18' rx='2'/><circle cx='8.5' cy='8.5' r='1.5'/><path d='M21 15l-5-5L5 21'/></svg>";
 
 // Catppuccin Mocha, self-hosted and static: no external font, no CDN, no third-party request from any page
 const STYLE: &str = "
@@ -1456,17 +1558,18 @@ button,input,select { font:inherit }
 .brand { display:flex; align-items:center; gap:.5rem; font-weight:800; font-size:1.15rem; color:var(--text) }
 .brand:hover { text-decoration:none }
 .brandmascot { width:28px; height:28px; border-radius:7px; object-fit:cover }
-.topsearch { flex:1; max-width:520px; margin:0 auto }
-.topsearch input { width:100%; padding:.55rem .95rem; border-radius:999px; border:1px solid var(--surface1);
+.searchgroup { flex:1; display:flex; align-items:center; justify-content:center; gap:.5rem }
+.topsearch { display:flex; gap:.4rem; width:min(100%,440px) }
+.topsearch input { flex:1; padding:.55rem .95rem; border-radius:999px; border:1px solid var(--surface1);
   background:var(--surface0); color:var(--text) }
 .topsearch input:focus { outline:none; border-color:var(--accent) }
-.navwrap { display:flex; align-items:center; gap:1rem; margin-left:auto }
-.topbar nav { display:flex; gap:1.1rem }
-.topbar nav a { color:var(--subtext1); font-weight:600 }
+.searchbtn, .shuffle { flex:none; display:grid; place-items:center; width:40px; height:40px; border-radius:10px;
+  background:var(--surface0); color:var(--subtext1); border:1px solid var(--surface1); cursor:pointer }
+.searchbtn:hover, .shuffle:hover { color:var(--crust); background:var(--accent); border-color:var(--accent) }
+.topbar nav { display:flex; gap:1.1rem; margin-left:auto }
+.topbar nav a { display:inline-flex; align-items:center; gap:.4rem; color:var(--subtext1); font-weight:600 }
 .topbar nav a:hover { color:var(--text); text-decoration:none }
-.shuffle { display:grid; place-items:center; width:38px; height:38px; border-radius:10px;
-  background:var(--surface0); color:var(--subtext1); border:1px solid var(--surface1) }
-.shuffle:hover { color:var(--crust); background:var(--accent); border-color:var(--accent) }
+.topbar nav a svg { width:17px; height:17px }
 
 main { max-width:1240px; margin:0 auto; padding:1.4rem 1.1rem 3rem }
 .pagetitle { font-size:1.6rem; margin:.2rem 0 1rem }
@@ -1488,8 +1591,9 @@ main { max-width:1240px; margin:0 auto; padding:1.4rem 1.1rem 3rem }
 .cardthumb { position:relative; aspect-ratio:3/4; background:var(--crust); overflow:hidden }
 .cardthumb.banner { aspect-ratio:16/10 }
 .cover { width:100%; height:100%; object-fit:cover }
-.placeholder { position:absolute; inset:0; display:grid; place-items:center; color:var(--overlay1);
-  font-size:.8rem; letter-spacing:.08em; background:linear-gradient(135deg,var(--surface0),var(--crust)) }
+.placeholder { position:absolute; inset:0; display:flex; flex-direction:column; gap:.3rem; align-items:center;
+  justify-content:center; color:var(--overlay1); font-size:.72rem; letter-spacing:.08em;
+  background:linear-gradient(135deg,var(--surface0),var(--crust)) }
 .playbadge { position:absolute; top:8px; left:8px; padding:.15rem .45rem; border-radius:6px;
   background:#000a; color:#fff; font-size:.65rem; font-weight:700; letter-spacing:.06em }
 .playbadge::before { content:'VIDEO' }
@@ -1502,15 +1606,6 @@ main { max-width:1240px; margin:0 auto; padding:1.4rem 1.1rem 3rem }
 .chip { display:inline-block; padding:.12rem .5rem; border-radius:999px; background:var(--surface1);
   color:var(--subtext1); font-size:.72rem; font-weight:600 }
 .chip.platform { background:color-mix(in srgb, var(--accent) 22%, var(--surface1)); color:var(--text) }
-
-.hero { display:block; position:relative; border-radius:18px; overflow:hidden; margin-bottom:1.6rem; color:#fff }
-.hero .cardthumb { aspect-ratio:21/9 }
-.hero:hover { text-decoration:none }
-.herobody { position:absolute; left:0; right:0; bottom:0; padding:1.4rem 1.6rem;
-  background:linear-gradient(to top,#000e,#0000) }
-.herobody h1 { margin:.2rem 0 .1rem; font-size:1.9rem }
-.eyebrow { text-transform:uppercase; letter-spacing:.12em; font-size:.72rem; color:var(--accent); font-weight:700 }
-.hero .muted { color:#cdd6f4bb }
 
 .toolbar { display:flex; flex-wrap:wrap; gap:.8rem; align-items:center; justify-content:space-between; margin-bottom:1.1rem }
 .toolbar .search { display:flex; gap:.4rem; flex:1; min-width:220px; max-width:420px; margin:0 }
@@ -1537,15 +1632,21 @@ main { max-width:1240px; margin:0 auto; padding:1.4rem 1.1rem 3rem }
 .tagline { color:var(--subtext0); margin:.2rem 0 .6rem }
 .welcomebody { color:var(--subtext1) }
 
-.gallery { display:flex; flex-direction:column; gap:1.2rem; margin-top:1rem }
-.file { margin:0; padding:0; border:none }
-figcaption { margin-top:.4rem; font-size:.8rem }
-.media { display:inline-block; position:relative; cursor:pointer; border-radius:12px; overflow:hidden; background:var(--crust) }
-.media img.thumb { max-width:min(100%,520px); height:auto; display:block; border-radius:12px }
-.media.loading { opacity:.6 }
-.media.loading::after { content:'loading...'; position:absolute; inset:0; display:grid; place-items:center; color:#fff; background:#0007 }
-.file img, .file video { max-width:min(100%,760px); border-radius:12px }
-.body { margin:1rem 0; color:var(--subtext1) }
+.postmeta { color:var(--subtext0); margin:.1rem 0 1rem }
+.postmeta a { color:var(--subtext1); font-weight:600 }
+.postnav { display:flex; gap:.6rem; margin:.2rem 0 1.2rem }
+.postnav a { display:flex; align-items:center; gap:.4rem; max-width:48%; color:var(--subtext1); font-weight:600;
+  background:var(--surface0); border:1px solid var(--surface1); padding:.45rem .7rem; border-radius:10px }
+.postnav a:hover { border-color:var(--accent); text-decoration:none }
+.postnav .nnext { margin-left:auto; text-align:right }
+.postnav .ntitle { overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+.carousel { position:relative; display:flex; align-items:center; justify-content:center; gap:.6rem; margin:1rem auto 1.4rem; max-width:920px }
+.cstage { flex:1; display:flex; align-items:center; justify-content:center; min-height:240px; background:var(--crust); border-radius:16px; overflow:hidden }
+.cmedia { max-width:100%; max-height:80vh; display:block; border-radius:16px }
+.cprev, .cnext { flex:none; width:44px; height:44px; border-radius:50%; border:1px solid var(--surface1); background:var(--surface0); color:var(--text); display:grid; place-items:center; cursor:pointer }
+.cprev:hover, .cnext:hover { background:var(--accent); color:var(--crust); border-color:var(--accent) }
+.ccount { position:absolute; bottom:12px; left:50%; transform:translateX(-50%); background:#000a; color:#fff; padding:.15rem .65rem; border-radius:999px; font-size:.75rem }
+.body { margin:1rem auto 0; max-width:720px; color:var(--subtext1) }
 .body img { max-width:100%; border-radius:10px }
 
 .foot { border-top:1px solid var(--surface0); margin-top:2.5rem; padding:1.6rem 1.1rem; text-align:center; color:var(--subtext0) }
@@ -1577,43 +1678,48 @@ figcaption { margin-top:.4rem; font-size:.8rem }
 code { background:var(--surface0); padding:.1rem .35rem; border-radius:5px; word-break:break-all; font-size:.85em }
 pre { white-space:pre-wrap; word-break:break-all; background:var(--mantle); border:1px solid var(--surface0); padding:.7rem .9rem; border-radius:10px }
 
-@media (max-width:640px) {
-  .topsearch { display:none }
+@media (max-width:720px) {
+  .topbar nav a span { display:none }
+  .topbar { gap:.6rem; padding:.6rem .8rem }
   .grid { grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:10px }
   .welcome { flex-direction:column; text-align:center }
   .mascot { width:120px }
+  .postnav a { max-width:100% }
 }
 ";
 
-const THUMB_JS: &str = "
-// the gateway 502s when it can't reach a seeder; show that instead of a broken-image icon
-function bakemonoErr(node) {
-  const box = node.closest('.media') || node
-  const msg = document.createElement('p'); msg.className = 'muted'
-  msg.textContent = 'unavailable - no seeders online right now'
-  box.classList.remove('loading'); box.replaceChildren(msg)
-}
-// the full file is fetched only on click, never prefetched, so a page of thumbnails stays cheap.
-// the inline thumbnail stays visible under a loading overlay until the full lands, then swaps in
-for (const el of document.querySelectorAll('.media')) {
-  const full = el.dataset.full
-  const isVideo = el.dataset.video === '1'
-  el.title = 'click to load the full file'
-  el.addEventListener('click', () => {
-    if (el.dataset.open) return
-    el.dataset.open = '1'
-    if (isVideo) {
-      const v = document.createElement('video'); v.controls = true; v.autoplay = true; v.src = full
-      v.onerror = () => bakemonoErr(el)
-      el.replaceChildren(v)
-      return
+const CAROUSEL_JS: &str = "
+// full media loaded straight from the gateway, one item at a time; only the shown item is fetched
+for (const el of document.querySelectorAll('.carousel')) {
+  let items = []
+  try { items = JSON.parse(el.dataset.items || '[]') } catch (e) {}
+  const stage = el.querySelector('.cstage')
+  const count = el.querySelector('.ccount')
+  let i = 0
+  const show = (n) => {
+    i = (n + items.length) % items.length
+    const it = items[i]
+    let node
+    if (it.v) { node = document.createElement('video'); node.controls = true; node.src = it.u }
+    else { node = new Image(); node.alt = ''; node.src = it.u }
+    node.className = 'cmedia'
+    node.onerror = () => {
+      const p = document.createElement('p'); p.className = 'muted'
+      p.textContent = 'unavailable - no seeders online right now'
+      stage.replaceChildren(p)
     }
-    el.classList.add('loading')
-    const img = new Image(); img.alt = ''
-    img.onload = () => { el.classList.remove('loading'); el.replaceChildren(img) }
-    img.onerror = () => { el.dataset.open = ''; bakemonoErr(el) }
-    img.src = full
-  })
+    stage.replaceChildren(node)
+    if (count) count.textContent = (i + 1) + ' / ' + items.length
+  }
+  el.querySelector('.cprev')?.addEventListener('click', () => show(i - 1))
+  el.querySelector('.cnext')?.addEventListener('click', () => show(i + 1))
+  if (items.length > 1) {
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowLeft') show(i - 1)
+      else if (e.key === 'ArrowRight') show(i + 1)
+    })
+  }
+  if (items.length) show(0)
 }
 ";
 
