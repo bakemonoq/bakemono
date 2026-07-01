@@ -19,7 +19,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
 
-      # the desktop gui build needs node/gallery-dl/daemon staged as Tauri sidecars (see
+      # the desktop gui build needs gallery-dl/ffmpeg/daemon staged as Tauri sidecars (see
       # release.yml); the rest of the workspace builds and tests without them. the app's non-gui
       # path is checked separately below
       - run: cargo test --workspace --exclude bakemono-app

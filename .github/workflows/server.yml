@@ -1,7 +1,7 @@
 name: server
 
-# daemon + cli + their bundled sidecars (node/gallery-dl/ffmpeg/webtorrent), tarred so a server
-# runs scrape+seed from the console without docker. tauri-free; attaches to the same draft as release.yml
+# daemon + cli + bundled gallery-dl/ffmpeg, tarred so a server runs scrape+seed from the console
+# without docker. tauri-free; attaches to the same draft as release.yml
 on:
   push:
     tags: ["v*"]
@@ -36,16 +36,13 @@ jobs:
           key: server-${{ matrix.target }}
           cache-on-failure: true
 
+      # node is only a build-time tool here, to fetch the ffmpeg-static binary
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Install webtorrent sidecar deps
-        working-directory: sidecars/webtorrent
-        run: npm ci
 
       - name: Build gallery-dl standalone
         shell: bash
@@ -63,22 +60,18 @@ jobs:
           set -euo pipefail
           TARGET="${{ matrix.target }}"
           PKG="bakemono-server-$TARGET"
-          rm -rf "$PKG"; mkdir -p "$PKG/bin" "$PKG/sidecars"
+          rm -rf "$PKG"; mkdir -p "$PKG/bin"
           cp "target/$TARGET/release/bakemono-daemon" "$PKG/bin/bakemono-daemon"
           cp "target/$TARGET/release/bakemono"        "$PKG/bin/bakemono-cli"
-          cp "$(command -v node)"                     "$PKG/bin/node"
           cp "dist/gallery-dl"                        "$PKG/bin/gallery-dl"
           npm i --no-save ffmpeg-static
           cp "$(node -e "process.stdout.write(require('ffmpeg-static'))")" "$PKG/bin/ffmpeg"
-          cp -R sidecars/webtorrent "$PKG/sidecars/webtorrent"
           chmod +x "$PKG/bin/"*
           for entry in bakemono-daemon bakemono-cli; do
             launcher="bakemonod"; [ "$entry" = bakemono-cli ] && launcher="bakemono"
             cat > "$PKG/$launcher" <<LAUNCH
           #!/bin/sh
           DIR="\$(cd "\$(dirname "\$0")" && pwd)"
-          export BAKEMONO_NODE="\$DIR/bin/node"
-          export BAKEMONO_WEBTORRENT="\$DIR/sidecars/webtorrent/seed.mjs"
           export BAKEMONO_GALLERY_DL="\$DIR/bin/gallery-dl"
           export BAKEMONO_FFMPEG="\$DIR/bin/ffmpeg"
           exec "\$DIR/bin/$entry" "\$@"

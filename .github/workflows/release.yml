@@ -50,16 +50,13 @@ jobs:
           key: ${{ matrix.target }}
           cache-on-failure: true
 
+      # node is only a build-time tool here, to fetch the ffmpeg-static binary
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Install webtorrent sidecar deps
-        working-directory: sidecars/webtorrent
-        run: npm ci
 
       - name: Build gallery-dl standalone
         shell: bash
@@ -68,7 +65,7 @@ jobs:
           echo "from gallery_dl import main; main()" > gdl_entry.py
           pyinstaller --onefile --name gallery-dl --collect-all gallery_dl gdl_entry.py
 
-      - name: Stage app bundle (daemon + node + gallery-dl + ffmpeg + webtorrent)
+      - name: Stage app bundle (daemon + gallery-dl + ffmpeg)
         shell: bash
         run: |
           set -euo pipefail
@@ -80,8 +77,6 @@ jobs:
           # our daemon, built for this target and shipped beside the gui
           cargo build --release -p bakemono-daemon --target "$TARGET"
           cp "target/$TARGET/release/bakemono-daemon$EXE" "$APP/binaries/bakemono-daemon-$TARGET$EXE"
-          # the runner's node runtime (correct OS/arch) as the webtorrent sidecar interpreter
-          cp "$(command -v node)" "$APP/binaries/node-$TARGET$EXE"
           # gallery-dl built above
           cp "dist/gallery-dl$EXE" "$APP/binaries/gallery-dl-$TARGET$EXE"
           # ffmpeg for thumbnail generation: ffmpeg-static ships a portable static build per os/arch
@@ -89,10 +84,6 @@ jobs:
           FFMPEG_BIN="$(node -e "process.stdout.write(require('ffmpeg-static'))")"
           cp "$FFMPEG_BIN" "$APP/binaries/ffmpeg-$TARGET$EXE"
           chmod +x "$APP/binaries/ffmpeg-$TARGET$EXE" || true
-          # the webtorrent script + its node_modules, copied in as a resource
-          rm -rf "$APP/sidecars"
-          mkdir -p "$APP/sidecars"
-          cp -R sidecars/webtorrent "$APP/sidecars/webtorrent"
 
       - name: Build, bundle, sign updater, draft release
         id: tauri
