@@ -1694,38 +1694,54 @@ pre { white-space:pre-wrap; word-break:break-all; background:var(--mantle); bord
 ";
 
 const CAROUSEL_JS: &str = "
-// full media loaded straight from the gateway, one item at a time; only the shown item is fetched.
-// the stage holds a fixed size and shows a loading state until the media is ready, so navigating never
-// collapses the frame while bytes arrive over the swarm
+// full media pulled from the gateway, one item at a time and only when first shown. each element is built
+// once and kept, so returning to an already-loaded item shows it instantly with no flicker; the fixed-size
+// stage shows a loading state only while an item is genuinely still fetching
 for (const el of document.querySelectorAll('.carousel')) {
   let items = []
   try { items = JSON.parse(el.dataset.items || '[]') } catch (e) {}
   const stage = el.querySelector('.cstage')
   const count = el.querySelector('.ccount')
-  let i = 0, token = 0
-  const show = (n) => {
-    i = (n + items.length) % items.length
-    const it = items[i]
-    if (count) count.textContent = (i + 1) + ' / ' + items.length
-    const gen = ++token
-    const load = document.createElement('div'); load.className = 'cload'; load.textContent = 'Loading...'
-    stage.replaceChildren(load)
-    const done = (node) => { if (gen === token) { node.className = 'cmedia'; stage.replaceChildren(node) } }
-    const fail = () => { if (gen === token) load.textContent = 'unavailable - no seeders online right now' }
-    if (it.v) {
-      const v = document.createElement('video'); v.controls = true; v.preload = 'metadata'
-      v.onloadeddata = () => done(v); v.onerror = fail; v.src = it.u
+  const nodes = []
+  let cur = 0
+  const ready = (n) => n && (n.tagName === 'VIDEO' ? n.readyState >= 2 : n.complete && n.naturalWidth > 0)
+  const render = (idx) => {
+    const n = nodes[idx]
+    if (n && n.dataset.failed) {
+      const p = document.createElement('p'); p.className = 'muted'
+      p.textContent = 'unavailable - no seeders online right now'
+      stage.replaceChildren(p)
+    } else if (ready(n)) {
+      stage.replaceChildren(n)
     } else {
-      const img = new Image(); img.alt = ''
-      img.onload = () => done(img); img.onerror = fail; img.src = it.u
+      const load = document.createElement('div'); load.className = 'cload'; load.textContent = 'Loading...'
+      stage.replaceChildren(load)
     }
   }
-  el.querySelector('.cprev')?.addEventListener('click', () => show(i - 1))
-  el.querySelector('.cnext')?.addEventListener('click', () => show(i + 1))
+  const build = (idx) => {
+    const it = items[idx]
+    let n
+    if (it.v) { n = document.createElement('video'); n.controls = true; n.preload = 'metadata' }
+    else { n = new Image(); n.alt = '' }
+    n.className = 'cmedia'
+    const settle = () => { if (cur === idx) render(idx) }
+    if (it.v) n.onloadeddata = settle; else n.onload = settle
+    n.onerror = () => { n.dataset.failed = '1'; if (cur === idx) render(idx) }
+    n.src = it.u
+    nodes[idx] = n
+  }
+  const show = (n) => {
+    cur = (n + items.length) % items.length
+    if (count) count.textContent = (cur + 1) + ' / ' + items.length
+    if (!nodes[cur]) build(cur)
+    render(cur)
+  }
+  el.querySelector('.cprev')?.addEventListener('click', () => show(cur - 1))
+  el.querySelector('.cnext')?.addEventListener('click', () => show(cur + 1))
   if (items.length > 1) {
     document.addEventListener('keydown', (e) => {
-      if (e.key === 'ArrowLeft') show(i - 1)
-      else if (e.key === 'ArrowRight') show(i + 1)
+      if (e.key === 'ArrowLeft') show(cur - 1)
+      else if (e.key === 'ArrowRight') show(cur + 1)
     })
   }
   if (items.length) show(0)
