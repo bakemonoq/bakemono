@@ -17,6 +17,7 @@ pub struct BoardConfig {
     pub tagline: Option<String>,
     pub mascot: Option<String>,
     pub welcome_html: Option<String>,
+    pub about_html: Option<String>,
     pub accent: Option<String>,
     pub dmca_contact: Option<String>,
     pub contact: Option<String>,

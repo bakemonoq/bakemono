@@ -14,6 +14,12 @@ welcome_html = """
 Files are served from a peer swarm, nothing is stored on this box.</p>
 """
 
+# Longer board description, rendered raw in an "About this board" block on /info.
+about_html = """
+<p>This board indexes signed manifests from the Bakemono network and serves previews from a peer swarm.
+Read the <a href="/keepers">keepers</a> page to help keep content online.</p>
+"""
+
 # Optional accent override (defaults to Catppuccin mauve). Any CSS color.
 accent = "#cba6f7"
 

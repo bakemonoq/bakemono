@@ -768,6 +768,10 @@ async fn info_page(State(state): State<AppState>) -> Html<String> {
         "info",
         html! {
             h2 { (board_name()) }
+            // operator-authored board description, rendered raw (same trust level as the binary)
+            @if let Some(about) = &config::get().about_html {
+                div.aboutblock { (PreEscaped(about)) }
+            }
             div.stats {
                 (stat_card(stats.posts, "posts"))
                 (stat_card(stats.authors, "authors"))
@@ -1472,8 +1476,8 @@ fn render(title: &str, body: Markup) -> Html<String> {
                         }
                         div.searchgroup {
                             form.topsearch method="get" action="/search" {
+                                button.searchicon type="submit" aria-label="Search" { (PreEscaped(ICON_SEARCH)) }
                                 input type="search" name="q" placeholder="Search" aria-label="Search";
-                                button.searchbtn type="submit" aria-label="Search" { (PreEscaped(ICON_SEARCH)) }
                             }
                             a.shuffle href="/random" title="Random post" aria-label="Random post" { (PreEscaped(ICON_SHUFFLE)) }
                         }
@@ -1495,24 +1499,48 @@ fn render(title: &str, body: Markup) -> Html<String> {
 fn footer(cfg: &config::BoardConfig) -> Markup {
     html! {
         footer.foot {
-            @if !cfg.community.is_empty() {
-                div.community {
-                    @for l in &cfg.community {
-                        a.chip href=(l.url) rel="noopener noreferrer" target="_blank" { (l.label) }
+            div.footinner {
+                @if !cfg.community.is_empty() {
+                    div.social {
+                        @for l in &cfg.community {
+                            a.soc href=(l.url) title=(l.label) rel="noopener noreferrer" target="_blank" {
+                                (PreEscaped(community_icon(&l.label))) span { (l.label) }
+                            }
+                        }
                     }
                 }
-            }
-            div.footlinks {
-                a href="/info" { "Info" }
-                a href="/keepers" { "Keepers" }
-                a href="/contribute" { "Contribute" }
-                @if let Some(email) = &cfg.contact { a href=(format!("mailto:{email}")) { "Contact" } }
-            }
-            p.small.muted {
-                "Files are served from a peer swarm, not stored here. "
-                a href="/info" { "How this works" }
+                nav.footlinks {
+                    a href="/info" { (PreEscaped(ICON_INFO)) span { "Info" } }
+                    a href="/keepers" { (PreEscaped(ICON_KEEPERS)) span { "Keepers" } }
+                    a href="/contribute" { (PreEscaped(ICON_CONTRIBUTE)) span { "Contribute" } }
+                    @if let Some(email) = &cfg.contact { a href=(format!("mailto:{email}")) { (PreEscaped(ICON_MAIL)) span { "Contact" } } }
+                }
+                p.small.muted {
+                    "Files are served from a peer swarm, not stored here. "
+                    a href="/info" { "How this works" }
+                }
             }
         }
+    }
+}
+
+// map a toml community link label to a brand mark; unknown networks get a generic link glyph
+fn community_icon(label: &str) -> &'static str {
+    let l = label.to_ascii_lowercase();
+    if l.contains("telegram") {
+        ICON_TELEGRAM
+    } else if l.contains("discord") {
+        ICON_DISCORD
+    } else if l.contains("reddit") {
+        ICON_REDDIT
+    } else if l.contains("youtube") {
+        ICON_YOUTUBE
+    } else if l.contains("github") {
+        ICON_GITHUB
+    } else if l.contains("twitter") || l == "x" || l.contains("x.com") {
+        ICON_X
+    } else {
+        ICON_LINK
     }
 }
 
@@ -1534,6 +1562,18 @@ const ICON_CREATORS: &str = "<svg viewBox='0 0 24 24' width='18' height='18' fil
 const ICON_POSTS: &str = "<svg viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><rect x='3' y='3' width='7' height='7' rx='1'/><rect x='14' y='3' width='7' height='7' rx='1'/><rect x='3' y='14' width='7' height='7' rx='1'/><rect x='14' y='14' width='7' height='7' rx='1'/></svg>";
 const ICON_CONTRIBUTE: &str = "<svg viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.6l-1-1a5.5 5.5 0 1 0-7.8 7.8l1 1L12 21l7.8-7.6 1-1a5.5 5.5 0 0 0 0-7.8z'/></svg>";
 const ICON_IMAGE: &str = "<svg viewBox='0 0 24 24' width='30' height='30' fill='none' stroke='currentColor' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'><rect x='3' y='3' width='18' height='18' rx='2'/><circle cx='8.5' cy='8.5' r='1.5'/><path d='M21 15l-5-5L5 21'/></svg>";
+const ICON_INFO: &str = "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='9'/><path d='M12 16v-4M12 8h.01'/></svg>";
+const ICON_KEEPERS: &str = "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z'/></svg>";
+const ICON_MAIL: &str = "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><rect x='3' y='5' width='18' height='14' rx='2'/><path d='M3 7l9 6 9-6'/></svg>";
+
+// brand marks for footer social links (self-hosted, no icon font); matched from the toml link label
+const ICON_TELEGRAM: &str = "<svg viewBox='0 0 24 24' fill='currentColor'><path d='M11.944 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0a12 12 0 0 0-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 0 1 .171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z'/></svg>";
+const ICON_DISCORD: &str = "<svg viewBox='0 0 24 24' fill='currentColor'><path d='M20.317 4.3698a19.7913 19.7913 0 0 0-4.8851-1.5152.0741.0741 0 0 0-.0785.0371c-.211.3753-.4447.8648-.6083 1.2495-1.8447-.2762-3.68-.2762-5.4868 0-.1636-.3933-.4058-.8742-.6177-1.2495a.077.077 0 0 0-.0785-.037 19.7363 19.7363 0 0 0-4.8852 1.515.0699.0699 0 0 0-.0321.0277C.5334 9.0458-.319 13.5799.0992 18.0578a.0824.0824 0 0 0 .0312.0561c2.0528 1.5076 4.0413 2.4228 5.9929 3.0294a.0777.0777 0 0 0 .0842-.0276c.4616-.6304.8731-1.2952 1.226-1.9942a.076.076 0 0 0-.0416-.1057c-.6528-.2476-1.2743-.5495-1.8722-.8923a.077.077 0 0 1-.0076-.1277c.1258-.0943.2517-.1923.3718-.2914a.0743.0743 0 0 1 .0776-.0105c3.9278 1.7933 8.18 1.7933 12.0614 0a.0739.0739 0 0 1 .0785.0095c.1202.099.246.1981.3728.2924a.077.077 0 0 1-.0066.1276 12.2986 12.2986 0 0 1-1.873.8914.0766.0766 0 0 0-.0407.1067c.3604.698.7719 1.3628 1.225 1.9932a.076.076 0 0 0 .0842.0286c1.961-.6067 3.9495-1.5219 6.0023-3.0294a.077.077 0 0 0 .0313-.0552c.5004-5.177-.8382-9.6739-3.5485-13.6604a.061.061 0 0 0-.0312-.0286zM8.02 15.3312c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9555-2.4189 2.157-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.9555 2.4189-2.1569 2.4189zm7.9748 0c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9554-2.4189 2.1569-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.946 2.4189-2.1568 2.4189z'/></svg>";
+const ICON_REDDIT: &str = "<svg viewBox='0 0 24 24' fill='currentColor'><path d='M12 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0zm5.01 4.744c.688 0 1.25.561 1.25 1.249a1.25 1.25 0 0 1-2.498.056l-2.597-.547-.8 3.747c1.824.07 3.48.632 4.674 1.488.308-.309.73-.491 1.207-.491.968 0 1.754.786 1.754 1.754 0 .716-.435 1.333-1.01 1.614a3.111 3.111 0 0 1 .042.52c0 2.694-3.13 4.87-7.004 4.87-3.874 0-7.004-2.176-7.004-4.87 0-.183.015-.366.043-.534A1.748 1.748 0 0 1 4.028 12c0-.968.786-1.754 1.754-1.754.463 0 .898.196 1.207.49 1.207-.883 2.878-1.43 4.744-1.487l.885-4.182a.342.342 0 0 1 .14-.197.35.35 0 0 1 .238-.042l2.906.617a1.214 1.214 0 0 1 1.108-.701zM9.25 12c-.688 0-1.25.561-1.25 1.25 0 .687.561 1.248 1.25 1.248.687 0 1.248-.561 1.248-1.249 0-.688-.561-1.249-1.249-1.249zm5.5 0c-.687 0-1.248.561-1.248 1.25 0 .687.561 1.248 1.249 1.248.688 0 1.249-.561 1.249-1.249 0-.687-.562-1.249-1.25-1.249zm-5.466 3.99a.327.327 0 0 0-.231.094.33.33 0 0 0 0 .463c.842.842 2.484.913 2.961.913.477 0 2.105-.056 2.961-.913a.361.361 0 0 0 .029-.463.33.33 0 0 0-.464 0c-.547.533-1.684.73-2.512.73-.828 0-1.979-.196-2.512-.73a.326.326 0 0 0-.232-.095z'/></svg>";
+const ICON_YOUTUBE: &str = "<svg viewBox='0 0 24 24' fill='currentColor'><path d='M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12z'/></svg>";
+const ICON_GITHUB: &str = "<svg viewBox='0 0 24 24' fill='currentColor'><path d='M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12'/></svg>";
+const ICON_X: &str = "<svg viewBox='0 0 24 24' fill='currentColor'><path d='M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z'/></svg>";
+const ICON_LINK: &str = "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='9'/><path d='M3 12h18'/><path d='M12 3a15 15 0 0 1 0 18 15 15 0 0 1 0-18z'/></svg>";
 
 // Catppuccin Mocha, self-hosted and static: no external font, no CDN, no third-party request from any page
 const STYLE: &str = "
@@ -1562,13 +1602,16 @@ button,input,select { font:inherit }
 .brand:hover { text-decoration:none }
 .brandmascot { width:28px; height:28px; border-radius:7px; object-fit:cover }
 .searchgroup { flex:1; display:flex; align-items:center; justify-content:center; gap:.5rem }
-.topsearch { display:flex; align-items:center; gap:.4rem; width:min(100%,440px) }
-.topsearch input { flex:1; height:40px; padding:0 .95rem; border-radius:999px; border:1px solid var(--surface1);
+.topsearch { position:relative; display:flex; align-items:center; width:min(100%,460px) }
+.topsearch input { flex:1; height:40px; padding:0 .9rem 0 2.4rem; border-radius:10px; border:1px solid var(--surface1);
   background:var(--surface0); color:var(--text) }
 .topsearch input:focus { outline:none; border-color:var(--accent) }
-.searchbtn, .shuffle { flex:none; display:grid; place-items:center; width:40px; height:40px; border-radius:10px;
+.searchicon { position:absolute; left:0; top:0; height:40px; width:2.4rem; display:grid; place-items:center;
+  background:none; border:none; color:var(--subtext0); cursor:pointer; padding:0 }
+.searchicon:hover { color:var(--accent) }
+.shuffle { flex:none; display:grid; place-items:center; width:40px; height:40px; border-radius:10px;
   background:var(--surface0); color:var(--subtext1); border:1px solid var(--surface1); cursor:pointer }
-.searchbtn:hover, .shuffle:hover { color:var(--crust); background:var(--accent); border-color:var(--accent) }
+.shuffle:hover { color:var(--crust); background:var(--accent); border-color:var(--accent) }
 .topbar nav { display:flex; gap:1.1rem; margin-left:auto }
 .topbar nav a { display:inline-flex; align-items:center; gap:.4rem; color:var(--subtext1); font-weight:600 }
 .topbar nav a:hover { color:var(--text); text-decoration:none }
@@ -1588,7 +1631,7 @@ main { max-width:1240px; margin:0 auto; padding:1.4rem 1.1rem 3rem }
 .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(170px,1fr)); gap:14px }
 .grid.wide { grid-template-columns:repeat(auto-fill,minmax(230px,1fr)) }
 .card { display:flex; flex-direction:column; background:var(--surface0); border:1px solid var(--surface0);
-  border-radius:14px; overflow:hidden; color:var(--text);
+  border-radius:10px; overflow:hidden; color:var(--text);
   transition:transform .12s ease, border-color .12s ease, box-shadow .12s ease }
 .card:hover { transform:translateY(-3px); border-color:var(--accent); box-shadow:0 8px 24px #0006; text-decoration:none }
 .cardthumb { position:relative; aspect-ratio:3/4; background:var(--crust); overflow:hidden }
@@ -1606,7 +1649,7 @@ main { max-width:1240px; margin:0 auto; padding:1.4rem 1.1rem 3rem }
 .cardsub { margin-top:.3rem; color:var(--subtext0); font-size:.76rem }
 .cardsub .strong { color:var(--subtext1); font-weight:600 }
 
-.chip { display:inline-block; padding:.12rem .5rem; border-radius:999px; background:var(--surface1);
+.chip { display:inline-block; padding:.12rem .5rem; border-radius:8px; background:var(--surface1);
   color:var(--subtext1); font-size:.72rem; font-weight:600 }
 .chip.platform { background:color-mix(in srgb, var(--accent) 22%, var(--surface1)); color:var(--text) }
 
@@ -1629,8 +1672,8 @@ main { max-width:1240px; margin:0 auto; padding:1.4rem 1.1rem 3rem }
 .pager { display:flex; gap:1rem; align-items:center; justify-content:center; margin:1.6rem 0 }
 
 .welcome { display:flex; gap:1.4rem; align-items:center; background:var(--mantle); border:1px solid var(--surface0);
-  border-radius:16px; padding:1.4rem 1.6rem; margin-bottom:1.6rem }
-.mascot { width:150px; height:auto; border-radius:12px; flex:none }
+  border-radius:12px; padding:1.4rem 1.6rem; margin-bottom:1.6rem }
+.mascot { width:150px; height:auto; border-radius:10px; flex:none }
 .welcometext h1 { margin:0 0 .3rem }
 .tagline { color:var(--subtext0); margin:.2rem 0 .6rem }
 .welcomebody { color:var(--subtext1) }
@@ -1647,36 +1690,42 @@ main { max-width:1240px; margin:0 auto; padding:1.4rem 1.1rem 3rem }
 .pnav:hover { border-color:var(--accent); text-decoration:none }
 .pnav.off { visibility:hidden }
 .carousel { position:relative; display:flex; align-items:center; justify-content:center; gap:.6rem; margin:.4rem auto 1.4rem; max-width:960px }
-.cstage { flex:1; display:flex; align-items:center; justify-content:center; height:min(70vh,760px); background:var(--crust); border-radius:16px; overflow:hidden }
+.cstage { flex:1; display:flex; align-items:center; justify-content:center; height:min(70vh,760px); background:var(--crust); border-radius:12px; overflow:hidden }
 .cmedia { max-width:100%; max-height:100%; object-fit:contain; display:block }
 .cload { color:var(--subtext0); font-size:.9rem; letter-spacing:.04em }
-.cprev, .cnext { flex:none; width:44px; height:44px; border-radius:50%; border:1px solid var(--surface1); background:var(--surface0); color:var(--text); display:grid; place-items:center; cursor:pointer }
+.cprev, .cnext { flex:none; width:44px; height:44px; border-radius:10px; border:1px solid var(--surface1); background:var(--surface0); color:var(--text); display:grid; place-items:center; cursor:pointer }
 .cprev:hover, .cnext:hover { background:var(--accent); color:var(--crust); border-color:var(--accent) }
-.ccount { position:absolute; bottom:12px; left:50%; transform:translateX(-50%); background:#000a; color:#fff; padding:.15rem .65rem; border-radius:999px; font-size:.75rem }
+.ccount { position:absolute; bottom:12px; left:50%; transform:translateX(-50%); background:#000a; color:#fff; padding:.15rem .65rem; border-radius:8px; font-size:.75rem }
 .lightbox { position:fixed; inset:0; z-index:100; background:#000e }
 .lightbox[hidden] { display:none }
 .lbstage { position:absolute; inset:0; overflow:auto; display:flex; align-items:safe center; justify-content:safe center }
 .lbimg { display:block; max-width:none; cursor:zoom-in; user-select:none; -webkit-user-drag:none }
 .lbvideo { max-width:100%; max-height:100%; display:block }
-.lbclose { position:fixed; top:14px; right:16px; width:42px; height:42px; border-radius:50%; border:1px solid var(--surface1); background:#000a; color:#fff; display:grid; place-items:center; cursor:pointer }
+.lbclose { position:fixed; top:14px; right:16px; width:42px; height:42px; border-radius:10px; border:1px solid var(--surface1); background:#000a; color:#fff; display:grid; place-items:center; cursor:pointer }
 .lbclose:hover { background:var(--accent); color:var(--crust); border-color:var(--accent) }
-.lbnav { position:fixed; top:50%; transform:translateY(-50%); width:48px; height:48px; border-radius:50%; border:1px solid var(--surface1); background:#000a; color:#fff; display:grid; place-items:center; cursor:pointer; z-index:2 }
+.lbnav { position:fixed; top:50%; transform:translateY(-50%); width:48px; height:48px; border-radius:10px; border:1px solid var(--surface1); background:#000a; color:#fff; display:grid; place-items:center; cursor:pointer; z-index:2 }
 .lbnav[hidden] { display:none }
 .lbprev { left:14px }
 .lbnext { right:14px }
 .lbnav:hover { background:var(--accent); color:var(--crust); border-color:var(--accent) }
-.lbcount { position:fixed; bottom:16px; left:50%; transform:translateX(-50%); background:#000a; color:#fff; padding:.2rem .7rem; border-radius:999px; font-size:.8rem; z-index:2 }
+.lbcount { position:fixed; bottom:16px; left:50%; transform:translateX(-50%); background:#000a; color:#fff; padding:.2rem .7rem; border-radius:8px; font-size:.8rem; z-index:2 }
 .lbcount[hidden] { display:none }
 .body { margin:1rem auto 0; max-width:720px; color:var(--subtext1) }
 .body img { max-width:100%; border-radius:10px }
 
-.foot { border-top:1px solid var(--surface0); margin-top:2.5rem; padding:1.6rem 1.1rem; text-align:center; color:var(--subtext0) }
-.community { display:flex; flex-wrap:wrap; gap:.5rem; justify-content:center; margin-bottom:1rem }
-.community .chip { padding:.35rem .8rem; font-size:.85rem; background:var(--surface0); border:1px solid var(--surface1) }
-.community .chip:hover { border-color:var(--accent); color:var(--text); text-decoration:none }
-.footlinks { display:flex; gap:1.2rem; justify-content:center; flex-wrap:wrap; margin-bottom:.6rem }
-.footlinks a { color:var(--subtext1); font-weight:600 }
-.small { font-size:.8rem }
+.foot { border-top:1px solid var(--surface0); margin-top:2.5rem; padding:2rem 1.1rem }
+.footinner { max-width:1240px; margin:0 auto; display:flex; flex-direction:column; align-items:center; gap:1.1rem; text-align:center }
+.social { display:flex; flex-wrap:wrap; gap:.6rem; justify-content:center }
+.soc { display:inline-flex; align-items:center; gap:.45rem; padding:.5rem .85rem; border-radius:8px; border:1px solid var(--surface1); background:var(--surface0); color:var(--subtext1); font-weight:600; font-size:.9rem }
+.soc:hover { border-color:var(--accent); color:var(--text); text-decoration:none }
+.soc svg { width:18px; height:18px; flex:none }
+.footlinks { display:flex; gap:1.3rem; justify-content:center; flex-wrap:wrap }
+.footlinks a { display:inline-flex; align-items:center; gap:.4rem; color:var(--subtext1); font-weight:600 }
+.footlinks a:hover { color:var(--text); text-decoration:none }
+.footlinks svg { width:16px; height:16px; flex:none }
+.small { font-size:.8rem; color:var(--subtext0) }
+.aboutblock { margin:1rem 0 1.5rem; color:var(--subtext1) }
+.aboutblock a { color:var(--accent) }
 
 .muted { color:var(--subtext0) }
 .strong { color:var(--subtext1); font-weight:600 }
@@ -1684,11 +1733,11 @@ main { max-width:1240px; margin:0 auto; padding:1.4rem 1.1rem 3rem }
 .list { list-style:none; padding:0 }
 .list li { padding:.5rem 0; border-bottom:1px solid var(--surface0) }
 .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(8rem,1fr)); gap:.75rem; margin:1rem 0 1.5rem }
-.stat { border:1px solid var(--surface0); background:var(--mantle); border-radius:12px; padding:1rem }
+.stat { border:1px solid var(--surface0); background:var(--mantle); border-radius:10px; padding:1rem }
 .stat .num { font-size:1.7rem; font-weight:800 }
 .stat .label { color:var(--subtext0); font-size:.85em }
 .steps { list-style:none; counter-reset:step; padding:0 }
-.step { counter-increment:step; border:1px solid var(--surface0); background:var(--mantle); border-radius:14px; padding:1.1rem 1.3rem; margin:1rem 0 }
+.step { counter-increment:step; border:1px solid var(--surface0); background:var(--mantle); border-radius:10px; padding:1.1rem 1.3rem; margin:1rem 0 }
 .step h3 { margin:0 0 .5rem }
 .step h3::before { content:counter(step) '. '; color:var(--accent); font-weight:800 }
 .step img { max-width:100%; border-radius:8px; margin-top:.6rem }
