@@ -58,7 +58,6 @@ impl<C: ContentSource> Daemon<C> {
                 Err(e) => tracing::warn!("reseed failed for {}: {e:#}", file.display()),
             }
         }
-        self.seeder.retain_staging(&files).await;
         tracing::info!(count, "reseeded content set");
         Ok(count)
     }

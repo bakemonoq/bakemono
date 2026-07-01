@@ -1,5 +1,3 @@
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -156,22 +154,20 @@ pub struct SeedInfo {
     pub info_hash: String,
 }
 
-// holds a file in the swarm over classic BT: creates the torrent, announces to trackers, serves peers.
-// staging survives across runs (a file already linked is skipped), so relaunch cost is O(new files)
+// holds a file in the swarm over classic BT: creates the torrent, announces to trackers, serves peers
 pub struct Seeder {
     session: Arc<Session>,
-    staging: PathBuf,
     trackers: Vec<String>,
 }
 
 impl Seeder {
     pub async fn start(
-        staging_root: PathBuf,
+        session_dir: PathBuf,
         trackers: Vec<String>,
         listen_port: Option<u16>,
     ) -> Result<Self> {
-        std::fs::create_dir_all(&staging_root)
-            .with_context(|| format!("creating staging dir {}", staging_root.display()))?;
+        std::fs::create_dir_all(&session_dir)
+            .with_context(|| format!("creating session dir {}", session_dir.display()))?;
         let opts = SessionOptions {
             persistence: None,
             // reuse of the stored DHT port collides when several sessions run on one host; take a fresh port
@@ -179,33 +175,29 @@ impl Seeder {
             listen_port_range: listen_port.map(|p| p..p + 1),
             ..Default::default()
         };
-        let session = Session::new_with_opts(staging_root.clone(), opts)
+        let session = Session::new_with_opts(session_dir, opts)
             .await
             .context("starting seed session")?;
-        Ok(Self {
-            session,
-            staging: staging_root,
-            trackers,
-        })
+        Ok(Self { session, trackers })
     }
 
-    // seed a sanitized hardlink so odd source filenames yield a clean, deterministic torrent name
+    // seed the file in place; for a complete torrent librqbit only reads it, it never rewrites content
     pub async fn seed(&self, file: &Path) -> Result<SeedInfo> {
-        let staged = self.stage(file)?;
+        let file = file
+            .canonicalize()
+            .with_context(|| format!("resolving {}", file.display()))?;
         let created = librqbit::create_torrent(
-            &staged,
+            &file,
             CreateTorrentOptions {
                 name: None,
                 piece_length: None,
             },
         )
         .await
-        .with_context(|| format!("creating torrent for {}", staged.display()))?;
+        .with_context(|| format!("creating torrent for {}", file.display()))?;
         let info_hash = created.info_hash().as_string();
         let torrent = created.as_bytes().context("serializing torrent")?;
-        let output_folder = staged
-            .parent()
-            .map(|p| p.to_string_lossy().into_owned());
+        let output_folder = file.parent().map(|p| p.to_string_lossy().into_owned());
         self.session
             .add_torrent(
                 AddTorrent::from_bytes(torrent),
@@ -222,36 +214,6 @@ impl Seeder {
             magnet: synth_magnet(&info_hash, &self.trackers),
             info_hash,
         })
-    }
-
-    // drop staged links whose source is gone, so deleted files stop pinning disk
-    pub fn retain_staging(&self, live_sources: &[PathBuf]) {
-        let keep: std::collections::HashSet<String> = live_sources
-            .iter()
-            .filter_map(|p| p.canonicalize().ok())
-            .map(|p| staging_key(&p))
-            .collect();
-        let Ok(entries) = std::fs::read_dir(&self.staging) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            if !keep.contains(entry.file_name().to_string_lossy().as_ref()) {
-                let _ = std::fs::remove_dir_all(entry.path());
-            }
-        }
-    }
-
-    fn stage(&self, file: &Path) -> Result<PathBuf> {
-        let src = file
-            .canonicalize()
-            .with_context(|| format!("resolving {}", file.display()))?;
-        let dir = self.staging.join(staging_key(&src));
-        std::fs::create_dir_all(&dir)?;
-        let staged = dir.join(safe_filename(&src));
-        if !staged.exists() && std::fs::hard_link(&src, &staged).is_err() {
-            std::fs::copy(&src, &staged).with_context(|| format!("staging {}", src.display()))?;
-        }
-        Ok(staged)
     }
 }
 
@@ -284,34 +246,6 @@ fn urlencode(s: &str) -> String {
         }
     }
     out
-}
-
-fn staging_key(canonical_src: &Path) -> String {
-    let mut hasher = DefaultHasher::new();
-    canonical_src.to_string_lossy().hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
-
-fn safe_filename(src: &Path) -> String {
-    let raw = src
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file".to_string());
-    let cleaned: String = raw
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if cleaned.is_empty() {
-        "file".to_string()
-    } else {
-        cleaned
-    }
 }
 
 fn mime_for(path: &str) -> String {
@@ -354,11 +288,5 @@ mod tests {
         );
         assert!(m.starts_with("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"));
         assert!(m.contains("&tr=udp%3A%2F%2Ftracker.example%3A1337%2Fannounce"));
-    }
-
-    #[test]
-    fn sanitizes_odd_filenames() {
-        assert_eq!(safe_filename(Path::new("/x/a b#1.jpg")), "a_b_1.jpg");
-        assert_eq!(safe_filename(Path::new("/x/")), "x");
     }
 }

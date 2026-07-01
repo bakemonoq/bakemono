@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
@@ -21,8 +21,7 @@ impl SeederHandle {
     pub async fn ensure_started(&self, trackers: &[String]) -> Result<()> {
         let mut guard = self.inner.lock().await;
         if guard.is_none() {
-            // stage on the data volume so hardlinks to scraped files never fall back to copying
-            let staging = super::data_dir().join("staging");
+            let session_dir = super::data_dir().join("seed-session");
             // wss trackers were WebRTC-only; classic BT announces to udp/http trackers plus DHT
             let trackers: Vec<String> = trackers
                 .iter()
@@ -35,7 +34,7 @@ impl SeederHandle {
                 .ok()
                 .and_then(|s| s.trim().parse().ok())
                 .or(Some(4250));
-            let seeder = Seeder::start(staging, trackers, port).await?;
+            let seeder = Seeder::start(session_dir, trackers, port).await?;
             *guard = Some(seeder);
             tracing::info!("seeder started");
         }
@@ -57,11 +56,5 @@ impl SeederHandle {
     pub async fn shutdown(&self) {
         // dropping the session ends seeding; there is no external process to reap
         let _ = self.inner.lock().await.take();
-    }
-
-    pub async fn retain_staging(&self, live_sources: &[PathBuf]) {
-        if let Some(seeder) = self.inner.lock().await.as_ref() {
-            seeder.retain_staging(live_sources);
-        }
     }
 }

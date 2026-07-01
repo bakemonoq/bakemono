@@ -161,24 +161,17 @@ pub async fn reseed(seeder: &SeederHandle, dir: &Path) -> usize {
         }
     };
     let mut count = 0;
-    let mut live: Vec<PathBuf> = Vec::new();
     for (media, _sidecar) in &pairs {
         match seeder.seed(media).await {
             Ok(_) => count += 1,
             Err(e) => tracing::warn!("reseed failed for {}: {e:#}", media.display()),
         }
-        live.push(media.clone());
         // keep the preview's magnet alive across restarts by re-seeding it alongside its file
         let thumb = thumbnail::thumb_path(media);
-        if thumb.is_file() {
-            if seeder.seed(&thumb).await.is_ok() {
-                count += 1;
-            }
-            live.push(thumb);
+        if thumb.is_file() && seeder.seed(&thumb).await.is_ok() {
+            count += 1;
         }
     }
-    // lazy prune: anything staged whose source is no longer on disk gets dropped here
-    seeder.retain_staging(&live).await;
     tracing::info!(count, dir = %dir.display(), "reseeded from disk");
     count
 }
