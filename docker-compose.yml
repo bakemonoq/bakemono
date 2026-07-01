@@ -2,7 +2,7 @@ services:
   postgres:
     image: postgres:16
     environment:
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: bakemono
     volumes:
       - bakemono-pg:/var/lib/postgresql/data
@@ -17,27 +17,17 @@ services:
       - ./relay/config.toml:/usr/src/app/config.toml:ro
     restart: unless-stopped
 
-  tracker:
-    image: ${TRACKER_IMAGE:-bakemono-tracker:latest}
-    build:
-      context: .
-      dockerfile: Dockerfile.tracker
-    ports:
-      - "${TRACKER_PORT:-9100}:8000"
-    restart: unless-stopped
-
   board:
     image: ${BOARD_IMAGE:-bakemono-board:latest}
     build:
       context: .
     environment:
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bakemono?sslmode=disable
+      DATABASE_URL: ${DATABASE_URL:-postgres://postgres:postgres@postgres:5432/bakemono?sslmode=disable}
       BAKEMONO_RELAYS: ${BAKEMONO_RELAYS:-ws://relay:8080}
-      BAKEMONO_ICE_SERVERS: ${BAKEMONO_ICE_SERVERS:-[]}
-      # optional TURN: relay URLs + coturn shared secret; both unset means no TURN and the board still works
-      BAKEMONO_TURN_URLS: ${BAKEMONO_TURN_URLS:-}
-      BAKEMONO_TURN_SECRET: ${BAKEMONO_TURN_SECRET:-}
-      BAKEMONO_TURN_TTL: ${BAKEMONO_TURN_TTL:-}
+      # BT peer port the gateway listens on; must match the published port below and be open at the firewall
+      BAKEMONO_GATEWAY_PORT: ${BAKEMONO_GATEWAY_PORT:-4240}
+      # optional: comma-separated ip:port seeders to dial directly (a known seedbox), bypassing tracker/DHT
+      BAKEMONO_GATEWAY_PEERS: ${BAKEMONO_GATEWAY_PEERS:-}
       # mod queue password (HTTP Basic auth); leave unset to disable /mod
       BAKEMONO_MOD_TOKEN: ${BAKEMONO_MOD_TOKEN:-}
       # instance keypair (nsec) that signs kind 31064 takedowns; unset keeps hides local-only
@@ -51,6 +41,8 @@ services:
       BAKEMONO_CONTACT: ${BAKEMONO_CONTACT:-}
     ports:
       - "3000:3000"
+      - "${BAKEMONO_GATEWAY_PORT:-4240}:${BAKEMONO_GATEWAY_PORT:-4240}"
+      - "${BAKEMONO_GATEWAY_PORT:-4240}:${BAKEMONO_GATEWAY_PORT:-4240}/udp"
     depends_on:
       - postgres
       - relay

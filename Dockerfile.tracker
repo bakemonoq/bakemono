@@ -1,5 +1,0 @@
-# shared webtorrent/bittorrent tracker for peer discovery (brokers WebRTC offers, no bytes pass through)
-FROM node:22-slim
-RUN npm install -g bittorrent-tracker
-EXPOSE 8000
-ENTRYPOINT ["bittorrent-tracker", "--port", "8000"]
