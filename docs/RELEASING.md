@@ -9,7 +9,7 @@ Pushing a tag `v*` runs two workflows that attach to one draft release: `release
 - Per-OS installers: `.dmg` (macOS arm64), `.deb` + `.rpm` (Linux x64), NSIS `-setup.exe` + `.msi` (Windows x64)
 - `latest.json` plus per-platform `.sig` files for the auto-updater on macOS and Windows; the Linux `.deb` updates through the system package manager, not the in-app updater
 - Stable, versionless copies of each installer (`Bakemono_aarch64.dmg`, `Bakemono_amd64.deb`, `Bakemono_x64-setup.exe`) so `releases/latest/download/<name>` keeps resolving across versions
-- A server bundle per server platform (`bakemono-server-<target>.tar.gz`, Linux x64 + macOS arm64) from `server.yml`: the daemon + cli plus bundled node / gallery-dl / ffmpeg / webtorrent, so a server untars and runs scrape + seed from the console without Docker - no Tauri, no GUI
+- A server bundle per server platform (`bakemono-server-<target>.tar.gz`, Linux x64 + macOS arm64) from `server.yml`: the daemon + cli plus bundled gallery-dl / ffmpeg, so a server untars and runs scrape + seed from the console without Docker - no Tauri, no GUI
 
 The release is a draft. Review the artifacts, then publish it.
 
@@ -33,19 +33,18 @@ Bump `version` in the root `Cargo.toml` and `crates/bakemono-app/tauri.conf.json
 
 ## How sidecars are bundled
 
-The installed app needs Node + the webtorrent script, plus `gallery-dl`, none of which a normal user has. The release workflow stages them per target into `crates/bakemono-app/`:
+The installed app needs `gallery-dl` and `ffmpeg`, neither of which a normal user has. The release workflow stages them per target into `crates/bakemono-app/binaries/`:
 
-- `binaries/bakemono-daemon-<triple>` - our daemon, built for the target
-- `binaries/node-<triple>` - the runner's Node runtime
-- `binaries/gallery-dl-<triple>` - a standalone gallery-dl built with PyInstaller
-- `sidecars/webtorrent/` - `seed.mjs` and its `node_modules`
+- `bakemono-daemon-<triple>` - our daemon, built for the target
+- `gallery-dl-<triple>` - a standalone gallery-dl built with PyInstaller
+- `ffmpeg-<triple>` - a static ffmpeg (from ffmpeg-static) for thumbnails
 
-Tauri bundles these via `externalBin` and `resources`. At runtime the GUI points the daemon at them through the env seams the engine already reads (`BAKEMONO_NODE`, `BAKEMONO_WEBTORRENT`, `BAKEMONO_GALLERY_DL`); dev builds leave those unset and fall back to PATH and the in-repo sidecar. These staged dirs are gitignored.
+Tauri bundles these via `externalBin`. At runtime the GUI points the daemon at them through the env seams the engine reads (`BAKEMONO_GALLERY_DL`, `BAKEMONO_FFMPEG`); dev builds leave those unset and fall back to PATH. The torrent engine is librqbit, linked into the daemon, so nothing torrent-related needs staging. This staged dir is gitignored.
 
 ## Not done yet
 
 - **OS code-signing.** Installers are unsigned, so first launch warns (macOS Gatekeeper, Windows SmartScreen). Wire an Apple Developer ID + notarization and a Windows code-signing cert into the workflow once available.
-- **macOS is Apple Silicon only.** Intel (`x86_64`) was dropped: GitHub's `macos-13` Intel runners are scarce and a universal build is impractical (the bundled Node runtime and webtorrent native addon are arch-specific). Intel Mac users browse via the web board.
+- **macOS is Apple Silicon only.** Intel (`x86_64`) was dropped: GitHub's `macos-13` Intel runners are scarce and a universal build is impractical (the bundled gallery-dl and ffmpeg binaries are arch-specific). Intel Mac users browse via the web board.
 - **Linux ships `.deb` + `.rpm`, no AppImage.** linuxdeploy fails with an opaque error (tauri-apps/tauri#14796) that survives `libfuse2`, `APPIMAGE_EXTRACT_AND_RUN`, and `NO_STRIP`, so there is no in-app auto-update on Linux. Revisit when tauri's new AppImage bundler lands.
 
 ## Known rough edges

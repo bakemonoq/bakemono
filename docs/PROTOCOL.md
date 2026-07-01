@@ -1,6 +1,6 @@
 # Protocol
 
-Bakemono uses **Nostr** as its metadata wire format and federation transport. This means: signed events published to relays, identity via secp256k1 / Schnorr keys, censorship resistance via multi-relay publishing. The actual file bytes still flow over BitTorrent v2 / WebTorrent, unchanged.
+Bakemono uses **Nostr** as its metadata wire format and federation transport. This means: signed events published to relays, identity via secp256k1 / Schnorr keys, censorship resistance via multi-relay publishing. The actual file bytes flow over classic BitTorrent (TCP/uTP + DHT + trackers); a board joins the swarm and re-serves those bytes to browsers as plain HTTP, but the manifest protocol below is unchanged.
 
 The full reasoning for choosing Nostr lives in `docs/ARCHITECTURE.md`. The short version: Nostr already solves federation, durability across operators, and pubkey identity. We get those for free instead of inventing them.
 
@@ -44,7 +44,7 @@ A Bakemono manifest is a Nostr event of **kind 31063** (in the parameterized-rep
 - `x` - sha256 of the file bytes, lowercase hex (no `sha256:` prefix; Nostr convention is bare hex).
 - `size` - file size in bytes as a decimal string.
 - `m` - MIME type from the file's magic bytes, not extension.
-- `magnet` - BitTorrent v1 magnet link, full URI. Format: `magnet:?xt=urn:btih:<sha1-of-bencoded-info-dict>&dn=<filename>&tr=...`. The infohash is sha1 because that is what BT v1 uses and what the `webtorrent` package (BT v1 + WebRTC) produces. The `x` tag above is sha256 of the file bytes and is independent of the infohash; the two coexist (one identifies the torrent, the other identifies the file content for dedup).
+- `magnet` - BitTorrent v1 magnet link, full URI. Format: `magnet:?xt=urn:btih:<sha1-of-bencoded-info-dict>&dn=<filename>&tr=...`. The infohash is sha1, what BT v1 uses and what librqbit produces when it creates the torrent. The `x` tag above is sha256 of the file bytes and is independent of the infohash; the two coexist (one identifies the torrent the board's gateway joins, the other identifies the file content for dedup).
 - `platform` - lowercase identifier matching the source extractor name. Clients SHOULD use the gallery-dl extractor identifier for interoperability. Any non-empty lowercase string is valid; indexers MUST treat unknown values as opaque.
 - `creator` - human-readable source handle.
 - `creator_id` - source-specific creator identifier.

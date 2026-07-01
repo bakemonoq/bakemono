@@ -22,17 +22,16 @@ Quick reference for terms used throughout the Bakemono docs and code.
 - **Seed / seeder**: a peer with the complete file, sharing it. The opposite of a leech.
 - **Leech / leecher**: a peer downloading and partially sharing. Not pejorative in this project; everyone leeches before they seed.
 - **DHT (Distributed Hash Table)**: the distributed phonebook BitTorrent uses to look up "who has hash X". Each peer holds a slice; queries hop through the network in roughly 15-20 steps.
-- **BitTorrent v1**: the classic BitTorrent protocol (SHA-1 infohash, urn:btih magnet links). What `webtorrent` and most existing torrent clients use. BT v2 (SHA-256) exists but lacks WebRTC support, so we stay on v1 for end-to-end compatibility with browsers.
-- **WebTorrent (`webtorrent` >=2.3.0)**: BitTorrent client written in JS that runs both in browsers (over WebRTC) and in Node (over TCP/uTP + WebRTC). Since 2.3.0 the package has native WebRTC support and the older `webtorrent-hybrid` split is deprecated. We use the same package as the Tauri sidecar in the desktop app, in the board's warm cache, and in the browser viewer.
-- **WebRTC**: browser-native peer-to-peer transport. Includes ICE for NAT traversal.
-- **Magnet link**: a URI containing a torrent's infohash and metadata. Lets a peer join a swarm without downloading a .torrent file first.
+- **BitTorrent v1**: the classic BitTorrent protocol (SHA-1 infohash, urn:btih magnet links). What librqbit and standard torrent clients speak, over TCP/uTP + DHT + trackers.
+- **Infohash**: the SHA-1 of a torrent's info dict, the id a swarm forms around. The board addresses content by it: `/t/{infohash}/f/{fileIndex}`.
+- **HTTP gateway**: the board component that joins a swarm for a cataloged infohash, pulls the bytes, and serves them to browsers as plain HTTP (with `Range`). Browsers do no P2P; an `<img>`/`<video>` points straight at a gateway URL.
+- **Magnet link**: a URI containing a torrent's infohash and trackers. Lets a peer join a swarm without downloading a .torrent file first.
 
-## NAT traversal
+## Connectivity
 
-- **ICE (Interactive Connectivity Establishment)**: the algorithm that combines STUN, TURN, and hole punching to make P2P work through NAT.
-- **STUN**: a small public server that tells a peer "your public IP:port looks like X to me". Cheap to run, free public ones exist.
-- **TURN**: a relay server peers use when direct connection cannot be established. Expensive (bandwidth-heavy). Fallback only.
-- **Hole punching**: technique where two NAT'd peers simultaneously fire outbound packets at each other; many NATs accept the inbound as if it were a response.
+- **Listen port**: a seeder must accept inbound BT connections, so it opens a fixed TCP port (default 4250) that peers dial. A seeder with no reachable port can only connect outward.
+- **Peer pinning**: the gateway can be handed explicit `ip:port` seeders (`BAKEMONO_GATEWAY_PEERS`) to dial directly, bypassing tracker/DHT discovery. The reliable path on a LAN or to a known seedbox.
+- **Reachability**: classic BT has no browser-style rendezvous, so cold-fill needs at least one side with an open port - a home seeder dials the board's open gateway port, or the board dials a pinned seeder.
 
 ## Bakemono-specific
 
@@ -50,7 +49,7 @@ Quick reference for terms used throughout the Bakemono docs and code.
 - **yt-dlp**: existing Python video extractor. Handles embedded video on supported source platforms.
 - **Tauri**: rust framework for cross-platform desktop apps with a web frontend. Smaller and faster than Electron. Our desktop app framework.
 - **bakemono-core**: shared rust crate holding Bakemono event types, tag helpers, validation, and protocol constants. Wraps the `nostr` crate. Imported by both `bakemono-app` and `bakemono-board` to guarantee the wire format cannot drift. Pure logic, no I/O.
-- **librqbit / rqbit**: rust BitTorrent client and library by ikatson. Initially considered for the daemon's seeder, but BT v2 only and no native WebRTC, so it cannot serve browsers directly. Parked as a candidate for a v2+ rust-native rewrite once a WebRTC-capable rust BT library matures. Not used in v0.
+- **librqbit / rqbit**: rust BitTorrent client and library by ikatson. Our torrent engine: `bakemono-torrent` wraps it for both seeding (create torrent, announce, serve peers) and the board gateway (join swarm, stream a file over byte ranges).
 - **axum**: rust async web framework on tokio. Board's HTTP layer.
 - **sqlx**: rust async Postgres driver with compile-time-checked queries. Board's DB layer.
 - **maud**: rust compile-time HTML template macro. Board's SSR rendering

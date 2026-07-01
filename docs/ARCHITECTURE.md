@@ -6,7 +6,7 @@ Bakemono is built around one core idea: separate WHAT a file is from WHERE it li
 
 ### 1. Content layer
 
-The actual file bytes. Lives in a BitTorrent v1 + WebRTC swarm via the `webtorrent` package. Every file is addressed by its sha256 hash, so the file's identity is what it is, not where it lives. Any peer holding the bytes can serve them to any other peer. The content layer has no central server, no CDN, no single point of failure. Taking down any host, instance, or the project's primary domain does not affect content availability as long as at least one peer is seeding.
+The actual file bytes. Lives in a classic BitTorrent swarm (TCP/uTP + DHT + trackers). Every file is addressed by its sha256 hash, so the file's identity is what it is, not where it lives. Any peer holding the bytes can serve them to any other peer, and a board joins the swarm to pull bytes it then re-serves to browsers over plain HTTP. The content layer has no central server, no CDN, no single point of failure. Taking down any host, instance, or the project's primary domain does not affect content availability as long as at least one peer is seeding.
 
 ### 2. Metadata layer
 
@@ -28,15 +28,15 @@ The end-to-end flow of one file from scrape to view in another user's browser. R
 
 2. **Hash and build event.** App computes sha256, gets `a3f8d2e1...`. Reads source metadata (source handle, post id, title, timestamp). Generates a small preview client-side (downscaled image, or a poster frame for video) and either inlines it in the `thumb` tag or seeds it as its own tiny file referenced by `thumb_x` + `thumb_magnet`, so a board can show previews without ever fetching the full file. Builds a Nostr event of kind 31063 with tags `x`, `size`, `m`, `magnet`, `platform`, `creator`, `post_id`, etc. Signs with Alice's secp256k1 private key using BIP-340 Schnorr (one call via the `nostr` rust crate).
 
-3. **Seed.** App spins up a BitTorrent v2 client locally. Joins the DHT. Announces "I have hash a3f8 at my IP:port". Alice's computer is now a peer in the swarm for this file.
+3. **Seed.** App creates a torrent from the file and seeds it over classic BT with librqbit, on a fixed listen port. Joins the DHT and announces to the magnet's trackers: "I have this infohash at my IP:port". Alice's computer is now a peer in the swarm for this file.
 
 4. **Publish to relays.** App fans out the event to its full configured relay set in parallel: our `wss://relay.bakemono.app`, plus public Nostr relays (relay.damus.io, nos.lol, nostr.wine, etc). Each relay verifies the signature, stores the event, and starts streaming it to its subscribers. NO bytes go to any relay, only the event.
 
 5. **Browse.** Bob lands on a Bakemono board and searches for a source handle. The board's postgres (filled by its indexer subscribing to the same relays Alice published to) returns Alice's event. Page renders with post title, text, image placeholder.
 
-6. **Preview.** Page JS sees an image with hash `a3f8`. Spins up a WebTorrent client in Bob's browser (no plugin; uses WebRTC). WebTorrent contacts the DHT, finds Alice (and any other seeders), opens a WebRTC data channel directly to her seeder, downloads 240 KB into a Blob, creates an object URL, swaps it into `<img src>`. Image appears.
+6. **Preview.** The page renders `<img src="/t/{infohash}/f/0">`. The board's gateway resolves that infohash to the magnet in its catalog, joins the swarm with librqbit (finding Alice via the magnet's trackers and the DHT, or a pinned seeder), pulls the 240 KB, verifies each piece against the infohash, and streams the bytes back to Bob over HTTP with a long immutable cache header. Bob's browser did no P2P.
 
-7. **Re-seed.** While Bob's tab is open, his browser also advertises hash `a3f8` to the DHT. If Carol arrives, she may fetch from Alice OR Bob. When Bob closes the tab, he drops out of the swarm. The file persists as long as anyone is seeding.
+7. **Persistence.** Bob's browser is a plain HTTP client and never joins the swarm. The file stays available as long as someone seeds it: Alice's daemon, any operator running a standard BT client, or the board itself once it has pulled the bytes (it uploads what it holds to other peers like any leecher). Nothing depends on the primary domain.
 
 ## Code layout
 
@@ -64,73 +64,67 @@ Bakemono/
     bakemono-app/         # binary crate (Tauri desktop client)
       src/
         main.rs           # Tauri shell + GUI commands
-        daemon/           # background: scrape queue, relay publisher, IPC to webtorrent sidecar
+        daemon/           # background: scrape queue, relay publisher, seeding
         scraper/          # gallery-dl / yt-dlp sidecar invocation
-        seeder/           # spawns and supervises the webtorrent Node sidecar
+        seeder/           # classic-BT seeding via bakemono-torrent (librqbit)
         identity/         # local secp256k1 keypair management
         relays/           # default relay list, user-configured overrides
   docs/
 ```
 
-Alongside the rust crates, two Node sidecars run:
+Alongside the rust crates:
 
-- `nostr-rs-relay` (rust binary) sits next to the board, exposing `ws://localhost:8080` to the indexer.
-- `webtorrent` (Node, >=2.3.0) runs as a Tauri sidecar in the desktop app (seeds scraped files over BT v1 + WebRTC) and also runs on the board for the warm-cache fetcher/seeder. Same package, both roles.
-
-Neither sidecar is part of the rust workspace; both are pulled in as system binaries or container images.
+- `nostr-rs-relay` (rust binary) sits next to the board as a sidecar, exposing `ws://localhost:8080` to the indexer.
+- The torrent engine is `librqbit`, used as a rust library through the `bakemono-torrent` crate: the desktop daemon seeds scraped files, the board runs it leech-only behind the HTTP gateway. No Node, no separate seeder process.
+- `gallery-dl` (and `ffmpeg` for thumbnails) run as Tauri sidecar binaries in the desktop app.
 
 `bakemono-core` is the contract. If a type or routine ends up in both `bakemono-app` and `bakemono-board`, it belongs in core. Keeping I/O out of core means the event-shaping logic stays trivially unit-testable and the workspace builds quickly.
 
 ## Component layout
 
 ```
-+---------------------+                       +---------------------+
-| Alice's machine     |                       | Bob's machine       |
-|---------------------|                       |---------------------|
-| bakemono-app GUI    |                       | Browser             |
-| bakemono-daemon     |                       |  webtorrent in JS   |
-|   scraper           |                       |  Bakemono web UI    |
-|   event signer      |                       +----------+----------+
-|   webtorrent side-  |                                  |
-|   car (BT+WebRTC)   |                                  | WebRTC P2P
-|   relay publisher   |                                  | (direct bytes)
-+---------+-----------+                                  |
-          |                                              |
-          | WebSocket EVENT publish                      |
-          | (fan out to many relays)                     |
-          v                                              |
-+-------------------------+   +-------------------------+
-| wss://relay.bakemono... |   | wss://relay.damus.io    | ... and more
-| nostr-rs-relay sidecar  |   | (public Nostr relay)    |
-+-----------+-------------+   +-----------+-------------+
-            ^                             ^
-            |                             |
-            |  WebSocket REQ subscribe    |
-            |  {"kinds":[31063],...}      |
-            |                             |
-+-----------+-----------------------------+-------------+
-| bakemono-board                                        |
-|-------------------------------------------------------|
-|  Indexer (subscribes to many relays)                  |
-|  Postgres metadata (deduped, searchable)              |
-|  Warm cache                                           |
-|  axum + maud SSR web frontend ----- HTTPS ----------> | Bob's browser
-|  Mod queue + takedown signer                          |
-+-------------------------------------------------------+
++---------------------+
+| Alice's machine     |
+|---------------------|
+| bakemono-app GUI    |
+| bakemono-daemon     |
+|   scraper           |
+|   event signer      |
+|   librqbit seeder --+--- classic BT (TCP/uTP + DHT + trackers) ---+
+|   relay publisher   |                                             |
++---------+-----------+                                             v
+          |                                          +--------------------------+
+          | WebSocket EVENT publish (fan out)        |     BitTorrent swarm      |
+          v                                          +------------+-------------+
++-------------------------+  +-------------------------+          ^
+| wss://relay.bakemono... |  | wss://relay.damus.io    | ...      | gateway pulls
+| nostr-rs-relay sidecar  |  | (public Nostr relay)    |          | (librqbit, leech-only)
++-----------+-------------+  +-----------+-------------+           |
+            ^                            ^                         |
+            |  WebSocket REQ subscribe   |                         |
+            |  {"kinds":[31063],...}     |                         |
++-----------+----------------------------+-------------------------+
+| bakemono-board                                                  |
+|-----------------------------------------------------------------|
+|  Indexer (subscribes to many relays) -> Postgres (searchable)   |
+|  Torrent -> HTTP gateway (librqbit)                             |
+|  Mod queue + takedown signer                                    |
++--------------------------------+--------------------------------+
+                                 | HTTP (bytes + Range, immutable cache)
+                                 v
+                           Bob's browser  (<img>/<video>, no P2P)
 ```
 
 ## NAT and connectivity
 
-Most home users are behind NAT, meaning their device cannot accept unsolicited inbound TCP/UDP. P2P solves this with ICE (Interactive Connectivity Establishment):
+Classic BitTorrent has no browser-style rendezvous, so cold-fill needs at least one reachable side. The browser never touches any of this - it is a plain HTTP client of the board's gateway, so a viewer needs no peer connectivity at all. The burden sits entirely between seeders and the gateway:
 
-- **STUN**: peer asks a public server "what does my public IP:port look like to you?". Free, lightweight. We use multiple public servers plus run our own.
-- **Hole punching**: both peers simultaneously fire outbound packets, many NATs accept the inbound as a legitimate response.
-- **TURN**: relay server, fallback for symmetric / carrier-grade NAT. Eats real bandwidth. We will run a small TURN cluster behind a rate limit.
-- **UPnP / NAT-PMP**: app politely asks the home router to open a port. Many routers comply.
+- **Seeder listen port**: the daemon/app seeds on a fixed TCP port (default 4250). A seeder behind NAT can still dial out to a reachable peer and upload, so if the board's gateway port is open, the NAT'd seeder connects to it and serves.
+- **Gateway listen port**: the board opens `BAKEMONO_GATEWAY_PORT` (default 4240) so NAT'd seeders can reach it. This cannot go through an HTTP-only proxy like Cloudflare; it needs a direct port-forward.
+- **Peer pinning**: the gateway can be handed explicit `ip:port` seeders (`BAKEMONO_GATEWAY_PEERS`) to dial directly. The reliable path on a LAN (public trackers hand back the public IP and rarely hairpin two peers behind one NAT) or to a known seedbox.
+- **DHT + trackers**: discovery for everyone else. The magnet carries the trackers; the session also runs the DHT.
 
-The `webtorrent` package (used in the browser and in the desktop daemon via Node sidecar) handles ICE end-to-end through its WebRTC layer. We wire it up; we do not reimplement it.
-
-Realistic split: about 80% of users connect peer-to-peer directly via STUN + hole punching. About 15% need TURN relay for some or all sessions. About 5% have NAT hostile enough that connectivity degrades to "download via desktop client" rather than browser streaming. This is acceptable.
+Realistic split: on a LAN or with a pinned seeder, connection is immediate. Across the internet, an operator seedbox with an open port (or the board's own open gateway port for home seeders to dial) covers the common case; a fully-firewalled seeder with no reachable counterpart is the degraded case, same as any classic torrent.
 
 ## Federation via Nostr
 
@@ -200,7 +194,7 @@ CSAM and other categorically illegal content is moderated proactively at every b
 - **No central content host.** No single-IP-block failure mode that has historically taken centralized archives offline.
 - **No central metadata host either.** Manifests live on many independent Nostr relays from the first publish. The archive is genuinely distributed.
 - **Per-jurisdiction posture.** Each operator determines their own moderation posture in line with local legal obligations. Takedowns are per-board, not global. Relays operated by other parties are not bound by any single operator's decisions.
-- **Real browser previews.** WebTorrent makes content viewable in browser without a plugin or torrent client.
+- **Real browser previews.** The board's torrent -> HTTP gateway makes content viewable in any browser without a plugin, torrent client, or in-page P2P.
 - **User-owned identity.** Standard Nostr keypair stays with the user across boards and across the broader Nostr ecosystem. Backup-able in any Nostr client.
 - **Bring-your-own credentials.** Each user authenticates to source platforms with their own session; no shared credentials, no pooled access infrastructure.
 - **Outlives the founders.** Even if every Bakemono operator quits, the events on relays remain queryable. Anyone can spin up a new board and resurrect the experience

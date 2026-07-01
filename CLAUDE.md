@@ -1,19 +1,19 @@
 # Bakemono
 
-Open-source peer-to-peer content archive protocol. Federated metadata layer over signed Nostr events, content layer over BitTorrent v1 + WebRTC for browser-native preview, with operator-level moderation autonomy per instance.
+Open-source peer-to-peer content archive protocol. Federated metadata layer over signed Nostr events, content layer over classic BitTorrent served to browsers through a torrent -> HTTP gateway, with operator-level moderation autonomy per instance.
 
 The name Bakemono (化け物) means "shapeshifter": one piece of content, many forms across many instances.
 
 ## Core idea in one paragraph
 
-Centralized content archives concentrate file storage and index in one administrative boundary, making them brittle to single-host failure. Bakemono separates the system into three loosely coupled layers: (1) content lives in a BitTorrent v1 + WebRTC swarm, addressed by sha256 so the file's identity is what it is, not where it lives; (2) metadata is published as signed Nostr events (custom kind 31063) to many independent relays, so losing any one relay or instance does not lose the index; (3) each board runs its own embedded relay plus a postgres indexer and web UI, sets its own local moderation policy, and inherits Nostr's relay-based federation for free. A cross-platform desktop client lets users back up their own subscribed content, contribute the bytes to the swarm, and publish signed events to multiple relays at once.
+Centralized content archives concentrate file storage and index in one administrative boundary, making them brittle to single-host failure. Bakemono separates the system into three loosely coupled layers: (1) content lives in a classic BitTorrent swarm (TCP/uTP + DHT + trackers), addressed by sha256 so the file's identity is what it is, not where it lives, and each board pulls bytes from the swarm and re-serves them to browsers as plain HTTP through a torrent -> HTTP gateway; (2) metadata is published as signed Nostr events (custom kind 31063) to many independent relays, so losing any one relay or instance does not lose the index; (3) each board runs its own embedded relay plus a postgres indexer and web UI, sets its own local moderation policy, and inherits Nostr's relay-based federation for free. A cross-platform desktop client lets users back up their own subscribed content, contribute the bytes to the swarm, and publish signed events to multiple relays at once.
 
 ## Components
 
 The repo is a single Cargo workspace. Three rust crates plus docs.
 
 - `bakemono-core` - shared library crate. Bakemono Nostr event types (kind 31063 manifest, kind 31064 takedown), tag schema helpers, event-building and validation routines, protocol version constants. Wraps the `nostr` crate from rust-nostr.org. Pure logic, zero I/O. Imported by both `bakemono-app` and `bakemono-board` so the wire protocol cannot drift between client and server. Unit-tested in isolation.
-- `bakemono-board` - the self-hostable web instance. Runs a `nostr-rs-relay` sidecar, runs an indexer that subscribes to a configured relay set and ingests kind 31063 events into postgres, serves search/browse UI, runs a warm cache for popular previews. Rust: axum + sqlx + maud (SSR templates) + Postgres. Depends on `bakemono-core`.
+- `bakemono-board` - the self-hostable web instance. Runs a `nostr-rs-relay` sidecar, runs an indexer that subscribes to a configured relay set and ingests kind 31063 events into postgres, serves the search/browse UI, and runs a torrent -> HTTP gateway (librqbit via `bakemono-torrent`) that joins swarms for cataloged infohashes and streams file bytes to browsers over HTTP. Rust: axum + sqlx + maud (SSR templates) + Postgres. Depends on `bakemono-core` and `bakemono-torrent`.
 - `bakemono-app` - cross-platform desktop client. Tauri (rust + web frontend). Three thin pieces around one shared backend: a daemon (DHT, BT seeder, retrieval queue, Nostr event signing and multi-relay publish), a GUI (configure archive jobs, manage keypair and relay list, see contribution stats), a tray icon (quick status, pause/resume). Depends on `bakemono-core`. Wraps gallery-dl for image/post sources and yt-dlp for video, both invoked from the rust daemon as Tauri sidecar binaries (Python runtime bundled). Uses an embedded webview so the user signs in to source platforms themselves; sessions stay local, never sent to any server.
 
 ## Tech stack (decided)
@@ -22,8 +22,8 @@ The repo is a single Cargo workspace. Three rust crates plus docs.
 |---|---|
 | Desktop app shell | Tauri + rust |
 | Source retrieval | gallery-dl, yt-dlp (Python sidecars invoked from rust) |
-| Seeding (desktop + board warm cache) | `webtorrent` >=2.3.0 (Node sidecar; BT v1 over TCP/uTP + native WebRTC) |
-| Browser preview | `webtorrent` >=2.3.0 (same package, runs in the browser via WebRTC) |
+| Seeding | `librqbit` (rust, via `bakemono-torrent`) over classic BT (TCP/uTP + DHT + trackers); standard clients can seed too |
+| Browser preview | board torrent -> HTTP gateway (librqbit); the browser fetches plain HTTP with `Range`, no in-page P2P |
 | Board backend | rust: axum + sqlx + maud + Postgres |
 | Async runtime | tokio |
 | HTTP client | reqwest |
@@ -32,14 +32,14 @@ The repo is a single Cargo workspace. Three rust crates plus docs.
 | Relay implementation | `nostr-rs-relay` (rust, MIT, by Greg Heartsfield) run as sidecar to the board |
 | Signing | `nostr` crate from rust-nostr.org. secp256k1 Schnorr per BIP-340, NIP-01 canonicalization |
 | Identity | secp256k1 keypair per user (Nostr-standard). User-facing `nsec` / `npub` bech32 per NIP-19 |
-| NAT traversal | ICE (STUN public + ours, hole punching, TURN as fallback) |
+| Connectivity | classic BT: seeders open a fixed listen port (default 4250), gateway can pin peers (`BAKEMONO_GATEWAY_PEERS`); DHT + trackers for discovery |
 
 ## What is in MVP v0
 
 - One reference board running at a single domain, with its own embedded relay
 - Desktop app for Windows / macOS / Linux that publishes to 5+ relays by default
 - Single-source-at-a-time retrieval via one gallery-dl extractor in v0 (additional extractors exposed in v1)
-- Kind 31063 manifest events, in-browser WebTorrent preview for images and short video
+- Kind 31063 manifest events, board gateway preview (HTTP) for images and short video
 - Warm cache on the board for top-popular files
 - Manual mod queue on the board's indexer for first-time-seen pubkeys
 
@@ -47,7 +47,7 @@ The repo is a single Cargo workspace. Three rust crates plus docs.
 
 - Federation between multiple Bakemono boards (Nostr handles base federation already; multi-board comes when we run a second board ourselves)
 - Kudos beyond a byte counter (leaderboards, badges, flair come v1)
-- IPFS for thumbnails (BitTorrent v2 + WebTorrent does the job for v0)
+- IPFS for thumbnails (the board gateway serves them for v0)
 - Volunteer seedbox tier and incentive design
 - Mobile app (mobile is browse-only via web in MVP)
 - Comments, voting, social features
@@ -56,7 +56,7 @@ The repo is a single Cargo workspace. Three rust crates plus docs.
 
 ## NAT and connectivity
 
-Most home users are NAT'd. WebRTC's ICE handles it: STUN servers (public free ones plus our own small one) for public IP discovery, hole punching for restricted NATs, TURN as fallback for the small percentage of symmetric / carrier-grade NATs. WebTorrent and modern BitTorrent libraries include this; we wire it up, we don't implement it.
+Most home users are NAT'd. Classic BT has no browser-style rendezvous, so cold-fill needs at least one reachable side: a home seeder opens a fixed listen port (default 4250) and dials the board's open gateway port, or the board is handed the seeder's `ip:port` directly via `BAKEMONO_GATEWAY_PEERS`. Discovery is DHT plus the trackers carried in the magnet. The board never seeds; it only pulls from the swarm and re-serves over HTTP, so a browser needs no connectivity to peers at all
 
 ## Threat model and ethics
 

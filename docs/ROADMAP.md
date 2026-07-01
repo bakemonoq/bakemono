@@ -28,7 +28,7 @@ See `MVP.md`. One reference board (with its own embedded relay), one desktop app
 - Better search: full-text on post bodies via postgres tsvector, fuzzy creator name, faceted filters by platform / tier / date range.
 - Tag taxonomy with curated topic tags; lightweight per-board tag review pipeline.
 - Bigger warm cache, smarter eviction (frecency).
-- WebTorrent improvements: video chapters, seek-ahead prefetch, better mobile playback.
+- Gateway streaming improvements: server-side thumbnails, seek-ahead piece prefetch, HTTP/3 to the browser.
 - Localization (Japanese, Russian, Chinese, Spanish, Portuguese).
 
 ## v4 and beyond

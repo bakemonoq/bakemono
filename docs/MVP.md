@@ -24,17 +24,17 @@ If all seven steps work without intervention, MVP ships.
 - Indexer that subscribes to a configured relay set (ours + 4-5 public Nostr relays) with filter `{"kinds": [31063]}`
 - Postgres schema for events (deduped by event id, indexed by file hash, pubkey, creator, platform, posted_at), mod queue, takedown ledger
 - Search and browse UI: by creator, by recent, by hash, by simple text search on post title and content
-- Post view page with embedded WebTorrent player for video, direct WebTorrent fetch for images
-- Warm cache: a small disk cache of the top N most-viewed files, served via plain HTTPS when present
+- Post view page rendering `<video>` / `<img>` straight from the board's torrent -> HTTP gateway
+- Torrent -> HTTP gateway: joins the swarm for a cataloged infohash, streams the file over HTTP with `Range`
 - Mod queue UI for board operators to approve / reject events from first-seen pubkeys
 - Instance operator keypair management, kind 31064 takedown signing
-- One STUN endpoint at `stun.bakemono.app` (small public-facing service)
+- Gateway BT peer port open so home seeders can dial the board (default 4240)
 
 ### bakemono-app v0
 
 - Tauri shell, single binary per OS (Windows, macOS, Linux x86_64 + arm64)
 - Three internal pieces: daemon, GUI, tray icon
-- Daemon: rust core orchestrating a `webtorrent` Node sidecar (>=2.3.0) for BT v1 + WebRTC seeding, plus DHT participation, scrape queue, Nostr event signer, multi-relay publisher
+- Daemon: rust core seeding scraped files over classic BT via librqbit (`bakemono-torrent`), plus DHT participation, scrape queue, Nostr event signer, multi-relay publisher
 - GUI: keypair management (`nsec` import/export), source platform login webview, content selection, archive progress, contribution stats, relay list editor
 - Tray: status, pause/resume seeding, open GUI, quit
 - Source extractor: gallery-dl (Python sidecar) wrapped for one source platform in v0, exposing one source at a time
@@ -47,8 +47,7 @@ If all seven steps work without intervention, MVP ships.
 
 - `bakemono-core` with kind 31063 manifest + kind 31064 takedown event types, tag helpers, validation (see `PROTOCOL.md`)
 - Signing and verification via the `nostr` rust crate (secp256k1 Schnorr)
-- BitTorrent v1 plus native WebRTC via the `webtorrent` Node package (one stack for desktop daemon, board warm cache, and browser viewer)
-- TURN fallback via a small coturn instance behind rate limit
+- Classic BitTorrent via librqbit (`bakemono-torrent`): the desktop daemon seeds, the board runs a torrent -> HTTP gateway, and browsers fetch over plain HTTP
 
 ## Out of scope for v0
 
@@ -74,9 +73,9 @@ Loose sequence. Each step ships something demoable.
 2. **Tiny CLI smoke test.** Throwaway binary that uses `bakemono-core` to read a file from disk, build a kind 31063 event, sign it, and publish it to a single local relay over WebSocket. Throwaway tiny subscriber that connects to the same relay and prints received events. Proves the core works end-to-end against a real relay before any product code.
 3. **Wrapper around gallery-dl.** Retrieves one source into a folder. CLI only; Python sidecar invoked from rust. Output is just files on disk.
 4. **Retrieval pipeline producing signed events.** Wire steps 1-3 together: extractor outputs files, each file gets hashed, each gets a signed kind 31063 event built and published. CLI driver still.
-5. **Add seeder via `webtorrent` Node sidecar (>=2.3.0).** The rust daemon spawns the sidecar and hands it the file path + torrent metadata via IPC. Each scraped file is seeded over BT v1 + WebRTC simultaneously, so both desktop torrent clients and browsers can fetch directly. The magnet link uses `urn:btih:<sha1-hex>` and matches the `magnet` tag in the published event. Test on a single machine, then verify a second machine's browser pulls the file via WebRTC.
-6. **Build `bakemono-board` v0 skeleton.** Run `nostr-rs-relay` sidecar locally. Build the indexer that subscribes to the local relay with `{"kinds": [31063]}` and writes events into postgres. Build a stub axum + maud frontend with creator-list and post-view pages. Add the WebTorrent JS player on the post-view page.
-7. **End-to-end loop demo.** Machine A runs the CLI: scrape, sign, publish to its local relay, seed. Machine B runs the board: indexer ingests events from a relay it subscribes to (could be A's), web UI shows them, WebTorrent player streams the file from A. This is the milestone where the architecture is proven real.
+5. **Add the librqbit seeder (`bakemono-torrent`).** The rust daemon creates a torrent from each scraped file and seeds it over classic BT on a fixed listen port. The magnet uses `urn:btih:<sha1-hex>` and matches the `magnet` tag in the published event. Test on a single machine, then verify a second machine pulls the file over classic BT.
+6. **Build `bakemono-board` v0 skeleton.** Run `nostr-rs-relay` sidecar locally. Build the indexer that subscribes to the local relay with `{"kinds": [31063]}` and writes events into postgres. Build a stub axum + maud frontend with creator-list and post-view pages. Add the torrent -> HTTP gateway route and render `<img>` / `<video>` against it.
+7. **End-to-end loop demo.** Machine A runs the CLI: scrape, sign, publish to its local relay, seed. Machine B runs the board: indexer ingests events from a relay it subscribes to (could be A's), web UI shows them, the board's gateway pulls the file from A and streams it to the browser over HTTP. This is the milestone where the architecture is proven real.
 8. **Wrap CLI extractor in the Tauri GUI.** Add keypair management (generate, import via `nsec`, export, backup prompt), source platform webview, content picker, archive progress UI. Daemon shape emerges.
 9. **Add the daemon/tray split.** Background seeding and publishing continue after GUI is closed. Tray icon shows status. Autostart hooks for each OS.
 10. **Multi-relay publish in the app.** App publishes every event to its full configured relay set in parallel. Default list baked in; user can edit. Add public relays (damus, nos.lol, etc) and confirm the board's indexer (also subscribed to these) sees the events too, not just our relay.
