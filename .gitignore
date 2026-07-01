@@ -5,6 +5,7 @@
 *cookies*.txt
 .env
 node_modules/
+.playwright-mcp/
 nostr.db*
 bk-dl/
 /deploy.sh
