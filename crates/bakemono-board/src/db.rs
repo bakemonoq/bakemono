@@ -359,7 +359,7 @@ pub async fn list_creators(
     offset: i64,
 ) -> Result<Vec<CreatorCard>> {
     let sql = format!(
-        "SELECT c.platform, c.creator_id, c.creator, c.posts, c.files, COALESCE(v.views, 0) AS views,
+        "SELECT c.platform, c.creator_id, c.creator, c.posts, c.files, COALESCE(v.views, 0)::bigint AS views,
                 cov.thumb, cov.mime
          FROM (
              SELECT platform, creator_id, MAX(creator) AS creator,

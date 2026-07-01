@@ -254,7 +254,8 @@ fn post_card(p: &db::PostCard) -> Markup {
                     br;
                     (p.files) @if p.files == 1 { " file" } @else { " files" }
                     @if let Some(at) = &p.posted_at { " - " (pretty_date(at)) }
-                    @if p.views > 0 { " - " (p.views) " views" }
+                    br;
+                    (p.views) @if p.views == 1 { " view" } @else { " views" }
                 }
             }
         }
@@ -279,7 +280,8 @@ fn creator_card(c: &db::CreatorCard) -> Markup {
                 div.cardsub {
                     span.chip.platform { (pretty_platform(&c.platform)) }
                     " " (c.posts) " posts - " (c.files) " files"
-                    @if c.views > 0 { " - " (c.views) " views" }
+                    br;
+                    (c.views) @if c.views == 1 { " view" } @else { " views" }
                 }
             }
         }
