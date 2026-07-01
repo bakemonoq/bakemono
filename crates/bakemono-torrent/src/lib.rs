@@ -180,6 +180,12 @@ impl Gateway {
         })
     }
 
+    // a completed download serves from disk with no swarm join; the HTTP layer uses this to skip
+    // cold-miss rate limiting for warm content. infohash must be the lowercase 40-hex the cache keys on
+    pub fn is_cached(&self, infohash: &str) -> bool {
+        self.cache.complete_file(infohash).is_some()
+    }
+
     // each torrent downloads into cache_dir/<infohash>/ so files never collide by name and eviction is
     // a single directory remove; returns the handle plus the infohash the cache keys on
     async fn add(&self, magnet: &str, only_files: Vec<usize>) -> Result<(Arc<ManagedTorrent>, String)> {

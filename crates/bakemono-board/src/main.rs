@@ -3,8 +3,10 @@ mod db;
 mod health;
 mod indexer;
 mod instance;
+mod ratelimit;
 mod web;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -51,8 +53,13 @@ async fn main() -> Result<()> {
         relays,
         signer,
         gateway,
+        cold_limiter: Arc::new(ratelimit::ColdLimiter::from_env()),
     };
-    axum::serve(listener, web::router(state)).await?;
+    axum::serve(
+        listener,
+        web::router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 

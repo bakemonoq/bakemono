@@ -1,8 +1,9 @@
 use std::io::SeekFrom;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{Form, FromRef, Path, Query, State};
+use axum::extract::{ConnectInfo, Form, FromRef, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Json, Redirect, Response};
 use axum::routing::{get, post};
@@ -26,6 +27,7 @@ pub struct AppState {
     pub relays: Vec<String>,
     pub signer: Option<Keys>,
     pub gateway: Arc<bakemono_torrent::Gateway>,
+    pub cold_limiter: Arc<crate::ratelimit::ColdLimiter>,
 }
 
 // lets handlers that only need the pool keep extracting State<PgPool> unchanged
@@ -1026,10 +1028,18 @@ fn carousel(files: &[db::ManifestRow]) -> Markup {
 // the gateway is the only thing here that speaks BitTorrent: it joins a swarm cold for an infohash the
 // board carries and hands the bytes back as plain HTTP, so browsers do no P2P
 
-async fn gateway_meta(State(state): State<AppState>, Path(infohash): Path<String>) -> Response {
+async fn gateway_meta(
+    State(state): State<AppState>,
+    Path(infohash): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
     let Some(magnet) = resolve_magnet(&state, &infohash).await else {
         return (StatusCode::NOT_FOUND, "unknown infohash").into_response();
     };
+    if let Some(resp) = cold_miss_guard(&state, &infohash, &headers, peer) {
+        return resp;
+    }
     match state.gateway.meta(&magnet).await {
         Ok(meta) => Json(meta).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, format!("swarm error: {e:#}")).into_response(),
@@ -1039,15 +1049,62 @@ async fn gateway_meta(State(state): State<AppState>, Path(infohash): Path<String
 async fn gateway_file(
     State(state): State<AppState>,
     Path((infohash, file_index)): Path<(String, usize)>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
     let Some(magnet) = resolve_magnet(&state, &infohash).await else {
         return (StatusCode::NOT_FOUND, "unknown infohash").into_response();
     };
+    if let Some(resp) = cold_miss_guard(&state, &infohash, &headers, peer) {
+        return resp;
+    }
     match state.gateway.open(&magnet, file_index).await {
         Ok(file) => stream_file(file, &headers).await,
         Err(e) => (StatusCode::BAD_GATEWAY, format!("swarm error: {e:#}")).into_response(),
     }
+}
+
+// warm content serves from disk and is never limited; a cold miss joins a swarm, so cap how fast one
+// client can trigger those. returns Some(429) when the client is over budget, None to proceed
+fn cold_miss_guard(
+    state: &AppState,
+    infohash: &str,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+) -> Option<Response> {
+    let infohash = infohash.trim().to_ascii_lowercase();
+    if state.gateway.is_cached(&infohash) {
+        return None;
+    }
+    let client = client_ip(headers, peer);
+    if state.cold_limiter.allow(client) {
+        return None;
+    }
+    let mut resp = (StatusCode::TOO_MANY_REQUESTS, "cold-fetch rate limit, retry shortly").into_response();
+    resp.headers_mut()
+        .insert(header::RETRY_AFTER, header::HeaderValue::from_static("2"));
+    Some(resp)
+}
+
+// the real client behind our proxy: Cloudflare sets CF-Connecting-IP, a generic proxy sets
+// X-Forwarded-For; fall back to the socket peer for a direct connection
+fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
+    if let Some(ip) = headers
+        .get("cf-connecting-ip")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse().ok())
+    {
+        return ip;
+    }
+    if let Some(ip) = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .and_then(|s| s.trim().parse().ok())
+    {
+        return ip;
+    }
+    peer.ip()
 }
 
 // only infohashes the board carries (and that pass moderation) are served, so the gateway is never an open

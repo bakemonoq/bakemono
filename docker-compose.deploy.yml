@@ -31,6 +31,9 @@ services:
       BAKEMONO_GATEWAY_PEERS: ${BAKEMONO_GATEWAY_PEERS:-}
       # on-disk cache cap in GB; over budget, least-recently-used content is evicted. 0 = unlimited
       BAKEMONO_CACHE_GB: ${BAKEMONO_CACHE_GB:-10}
+      # per-client cold-miss rate limit (a miss joins a swarm): token bucket size, 0 disables; refill per second
+      BAKEMONO_COLD_MISS_BURST: ${BAKEMONO_COLD_MISS_BURST:-20}
+      BAKEMONO_COLD_MISS_REFILL: ${BAKEMONO_COLD_MISS_REFILL:-1}
       # mod queue password (HTTP Basic auth); leave unset to disable /mod
       BAKEMONO_MOD_TOKEN: ${BAKEMONO_MOD_TOKEN:-}
       # instance keypair (nsec) that signs kind 31064 takedowns; unset keeps hides local-only
