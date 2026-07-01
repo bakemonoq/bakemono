@@ -897,9 +897,8 @@ async fn creator_page(
             div.crumbs { a href="/creators" { "Creators" } " / " span { (name) } }
             div.creatorhead {
                 h1 { (name) }
-                span.chip.platform { (platform) }
+                span.chip.platform { (pretty_platform(&platform)) }
                 span.muted { (posts.len()) @if posts.len() == 1 { " post" } @else { " posts" } }
-                a.btn.ghost href=(format!("/feed.xml?platform={}&creator={}", qs_encode(&platform), qs_encode(&creator_id))) { "seed feed" }
             }
             @if posts.is_empty() { p.muted { "Nothing here yet" } }
             (posts_grid(&posts))
@@ -1533,21 +1532,26 @@ fn render(title: &str, body: Markup) -> Html<String> {
                             @if let Some(m) = &cfg.mascot { img.brandmascot src=(m) alt=""; }
                             span { (cfg.name) }
                         }
-                        div.searchgroup {
-                            form.topsearch method="get" action="/search" {
-                                button.searchicon type="submit" aria-label="Search" { (PreEscaped(ICON_SEARCH)) }
-                                input type="search" name="q" placeholder="Search" aria-label="Search";
-                            }
-                            a.shuffle href="/random" title="Random post" aria-label="Random post" { (PreEscaped(ICON_SHUFFLE)) }
+                        // the search field is a full bar on desktop; on mobile it collapses and this checkbox
+                        // (toggled by the search icon button) reveals it as a row under the top bar
+                        input #searchtoggle.searchtoggle type="checkbox" hidden;
+                        form.topsearch method="get" action="/search" {
+                            button.searchicon type="submit" aria-label="Search" { (PreEscaped(ICON_SEARCH)) }
+                            input type="search" name="q" placeholder="Search" aria-label="Search";
                         }
-                        nav {
-                            a href="/creators" { (PreEscaped(ICON_CREATORS)) span { "Creators" } }
-                            a href="/posts" { (PreEscaped(ICON_POSTS)) span { "Posts" } }
-                            a href="/contribute" { (PreEscaped(ICON_CONTRIBUTE)) span { "Contribute" } }
+                        div.topactions {
+                            label.iconbtn.searchopen for="searchtoggle" title="Search" aria-label="Search" { (PreEscaped(ICON_SEARCH)) }
+                            a.iconbtn.shuffle href="/random" title="Random post" aria-label="Random post" { (PreEscaped(ICON_SHUFFLE)) }
+                            nav {
+                                a href="/creators" { (PreEscaped(ICON_CREATORS)) span { "Creators" } }
+                                a href="/posts" { (PreEscaped(ICON_POSTS)) span { "Posts" } }
+                                a href="/contribute" { (PreEscaped(ICON_CONTRIBUTE)) span { "Contribute" } }
+                            }
                         }
                     }
                     main { (body) }
                     (footer(cfg))
+                    script { (PreEscaped(SHELL_JS)) }
                 }
             }
         }
@@ -1662,18 +1666,20 @@ button,input,select { font:inherit }
 .brand { display:flex; align-items:center; gap:.5rem; font-weight:800; font-size:1.15rem; color:var(--text); white-space:nowrap }
 .brand:hover { text-decoration:none }
 .brandmascot { width:28px; height:28px; border-radius:7px; object-fit:cover }
-.searchgroup { flex:1; display:flex; align-items:center; justify-content:center; gap:.5rem }
-.topsearch { position:relative; display:flex; align-items:center; width:min(100%,460px) }
+.topsearch { flex:1; position:relative; display:flex; align-items:center; max-width:520px; margin:0 auto }
 .topsearch input { flex:1; height:40px; padding:0 .9rem 0 2.4rem; border-radius:10px; border:1px solid var(--surface1);
   background:var(--surface0); color:var(--text) }
 .topsearch input:focus { outline:none; border-color:var(--accent) }
 .searchicon { position:absolute; left:0; top:0; height:40px; width:2.4rem; display:grid; place-items:center;
   background:none; border:none; color:var(--subtext0); cursor:pointer; padding:0 }
 .searchicon:hover { color:var(--accent) }
-.shuffle { flex:none; display:grid; place-items:center; width:40px; height:40px; border-radius:10px;
+.topactions { display:flex; align-items:center; gap:1rem }
+.iconbtn { flex:none; display:grid; place-items:center; width:40px; height:40px; border-radius:10px;
   background:var(--surface0); color:var(--subtext1); border:1px solid var(--surface1); cursor:pointer }
-.shuffle:hover { color:var(--crust); background:var(--accent); border-color:var(--accent) }
-.topbar nav { display:flex; gap:1.1rem; margin-left:auto }
+.iconbtn:hover { color:var(--crust); background:var(--accent); border-color:var(--accent); text-decoration:none }
+.iconbtn svg { width:18px; height:18px }
+.searchopen { display:none }
+.topbar nav { display:flex; gap:1.1rem; align-items:center }
 .topbar nav a { display:inline-flex; align-items:center; gap:.4rem; color:var(--subtext1); font-weight:600 }
 .topbar nav a:hover { color:var(--text); text-decoration:none }
 .topbar nav a svg { width:17px; height:17px }
@@ -1825,10 +1831,12 @@ pre { white-space:pre-wrap; word-break:break-all; background:var(--mantle); bord
   /* top bar: brand + nav on the first row, search full-width on the second */
   .topbar { flex-wrap:wrap; gap:.5rem .6rem; padding:.55rem .7rem }
   .brand { font-size:1rem }
-  .topbar nav { gap:.75rem }
+  .topactions { margin-left:auto; gap:.5rem }
+  .searchopen { display:grid }
+  .topbar nav { gap:.5rem }
   .topbar nav a span { display:none }
-  .searchgroup { order:3; flex-basis:100%; margin:0 }
-  .topsearch { flex:1; width:auto }
+  .topsearch { display:none; order:3; flex-basis:100%; max-width:none; margin:.15rem 0 0 }
+  .searchtoggle:checked ~ .topsearch { display:flex }
   /* grids: more, smaller cards */
   .grid { grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:10px }
   .grid.wide { grid-template-columns:repeat(auto-fill,minmax(150px,1fr)) }
@@ -1856,6 +1864,12 @@ pre { white-space:pre-wrap; word-break:break-all; background:var(--mantle); bord
 @media (max-width:400px) {
   .grid { grid-template-columns:repeat(2,1fr) }
 }
+";
+
+// on mobile the search field is collapsed behind an icon; focus it the moment it opens
+const SHELL_JS: &str = "
+const st = document.getElementById('searchtoggle')
+if (st) st.addEventListener('change', () => { if (st.checked) { const i = document.querySelector('.topsearch input'); if (i) i.focus() } })
 ";
 
 const CAROUSEL_JS: &str = "
