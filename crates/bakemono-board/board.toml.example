@@ -1,0 +1,38 @@
+# Per-board customization. Copy to board.toml next to the binary, or point BAKEMONO_CONFIG at it.
+# Every field is optional; a board with no file still boots. BAKEMONO_BOARD_NAME / _DMCA_CONTACT /
+# _CONTACT env vars still work and win over the file, so existing deploys need no change.
+
+name = "化け物 bakemono"
+tagline = "a peer-to-peer content archive"
+
+# Home mascot and welcome. mascot is any <img src>: a /static path (see static_dir), a data: URL, or a URL.
+# welcome_html is rendered raw - it is operator-authored, same trust level as the binary, so links and
+# basic markup are allowed. Shown on the home page above the recent grid.
+mascot = "/static/mascot.png"
+welcome_html = """
+<p>Browse by <a href="/creators">creator</a> or jump into <a href="/posts">posts</a>.
+Files are served from a peer swarm, nothing is stored on this box.</p>
+"""
+
+# Optional accent override (defaults to Catppuccin mauve). Any CSS color.
+accent = "#cba6f7"
+
+# Serve operator assets (mascot, favicon) from this dir at /static/<file>, so the board makes no external
+# request. Flat filenames only.
+static_dir = "/var/lib/bakemono/static"
+
+dmca_contact = "dmca@example.org"
+contact = "hi@example.org"
+
+# Community links shown in the footer. Add as many as you like.
+[[community]]
+label = "Telegram"
+url = "https://t.me/yourboard"
+
+[[community]]
+label = "Discord"
+url = "https://discord.gg/yourboard"
+
+[[community]]
+label = "Reddit"
+url = "https://reddit.com/r/yourboard"

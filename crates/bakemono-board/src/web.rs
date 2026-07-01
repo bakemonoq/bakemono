@@ -17,6 +17,7 @@ use tokio_util::io::ReaderStream;
 
 use bakemono_core::{Takedown, Target};
 
+use crate::config;
 use crate::db;
 
 #[derive(Clone)]
@@ -37,6 +38,11 @@ impl FromRef<AppState> for PgPool {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(home))
+        .route("/style.css", get(style_css))
+        .route("/static/{file}", get(static_file))
+        .route("/posts", get(posts_index))
+        .route("/creators", get(creators_index))
+        .route("/random", get(random_redirect))
         .route("/feed.xml", get(seed_feed))
         .route("/contribute", get(contribute))
         .route("/keepers", get(keepers))
@@ -55,61 +61,291 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn home(State(pool): State<PgPool>, Query(query): Query<HomeQuery>) -> Html<String> {
-    let q = query.q.unwrap_or_default().trim().to_string();
-    let creators = if q.is_empty() {
-        db::creators(&pool).await.unwrap_or_default()
-    } else {
-        db::search_creators(&pool, &q).await.unwrap_or_default()
-    };
-    let recent = if q.is_empty() {
-        db::recent(&pool, 24).await.unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+// how many cards a browse page shows; one extra is fetched to detect a next page without a count query
+const PAGE: i64 = 60;
+
+async fn home(State(pool): State<PgPool>) -> Html<String> {
+    let posts = db::list_posts(&pool, db::Sort::Recent, "", 18, 0)
+        .await
+        .unwrap_or_default();
+    let creators = db::list_creators(&pool, db::Sort::Popular, "", 12, 0)
+        .await
+        .unwrap_or_default();
+    let cfg = config::get();
     render(
         "",
         html! {
-            form.search method="get" action="/" {
-                input type="search" name="q" value=(q) placeholder="search authors" autofocus;
-                button { "search" }
-            }
-            h2 { "Authors" }
-            @if creators.is_empty() {
-                @if q.is_empty() {
+            (welcome(cfg, posts.first()))
+            section.block {
+                div.blockhead { h2 { "Recent" } a.more href="/posts" { "all posts" } }
+                @if posts.is_empty() {
                     p.muted { "Nothing indexed yet. Publish some manifests to a relay the board subscribes to" }
-                } @else {
-                    p.muted { "No authors match \"" (q) "\"" }
                 }
+                (posts_grid(&posts))
             }
-            ul.list {
-                @for c in &creators {
-                    li {
-                        a href=(format!("/c/{}/{}", c.platform, c.creator_id)) { (c.creator) }
-                        span.muted { " " (c.platform) " - " (c.posts) " posts, " (c.files) " files" }
-                    }
-                }
-            }
-            @if !recent.is_empty() {
-                h2 { "Recent files" }
-                ul.list {
-                    @for m in &recent {
-                        li {
-                            a href=(format!("/p/{}/{}/{}", m.platform, m.creator_id, m.post_id)) {
-                                (m.post_title.clone().unwrap_or_else(|| m.post_id.clone()))
-                            }
-                            span.muted { " " (m.creator) " - " (m.mime) }
-                        }
-                    }
+            @if !creators.is_empty() {
+                section.block {
+                    div.blockhead { h2 { "Creators" } a.more href="/creators" { "all creators" } }
+                    (creators_grid(&creators))
                 }
             }
         },
     )
 }
 
+async fn posts_index(State(pool): State<PgPool>, Query(query): Query<BrowseQuery>) -> Html<String> {
+    let (q, sort, page) = query.parts();
+    let mut posts = db::list_posts(&pool, sort, &q, PAGE + 1, page * PAGE)
+        .await
+        .unwrap_or_default();
+    let has_next = sort != db::Sort::Random && posts.len() as i64 > PAGE;
+    posts.truncate(PAGE as usize);
+    render(
+        "posts",
+        html! {
+            h1.pagetitle { "Posts" }
+            (toolbar("/posts", &q, sort, "search posts"))
+            @if posts.is_empty() { p.muted { "No posts match" } }
+            (posts_grid(&posts))
+            (pager("/posts", sort, &q, page, has_next))
+        },
+    )
+}
+
+async fn creators_index(
+    State(pool): State<PgPool>,
+    Query(query): Query<BrowseQuery>,
+) -> Html<String> {
+    let (q, sort, page) = query.parts();
+    let mut creators = db::list_creators(&pool, sort, &q, PAGE + 1, page * PAGE)
+        .await
+        .unwrap_or_default();
+    let has_next = sort != db::Sort::Random && creators.len() as i64 > PAGE;
+    creators.truncate(PAGE as usize);
+    render(
+        "creators",
+        html! {
+            h1.pagetitle { "Creators" }
+            (toolbar("/creators", &q, sort, "search creators"))
+            @if creators.is_empty() { p.muted { "No creators match" } }
+            (creators_grid(&creators))
+            (pager("/creators", sort, &q, page, has_next))
+        },
+    )
+}
+
+async fn random_redirect(State(pool): State<PgPool>) -> Redirect {
+    match db::random_post(&pool).await {
+        Ok(Some((platform, creator_id, post_id))) => {
+            Redirect::to(&format!("/p/{platform}/{creator_id}/{post_id}"))
+        }
+        _ => Redirect::to("/posts"),
+    }
+}
+
 #[derive(serde::Deserialize)]
-struct HomeQuery {
+struct BrowseQuery {
     q: Option<String>,
+    sort: Option<String>,
+    page: Option<i64>,
+}
+
+impl BrowseQuery {
+    fn parts(self) -> (String, db::Sort, i64) {
+        (
+            self.q.unwrap_or_default().trim().to_string(),
+            db::Sort::parse(self.sort.as_deref()),
+            self.page.unwrap_or(0).max(0),
+        )
+    }
+}
+
+fn posts_grid(posts: &[db::PostCard]) -> Markup {
+    html! {
+        div.grid {
+            @for p in posts { (post_card(p)) }
+        }
+    }
+}
+
+fn post_card(p: &db::PostCard) -> Markup {
+    let href = format!("/p/{}/{}/{}", p.platform, p.creator_id, p.post_id);
+    let title = p.post_title.clone().unwrap_or_else(|| p.post_id.clone());
+    html! {
+        a.card href=(href) {
+            div.cardthumb { (card_thumb(p.thumb.as_deref(), p.infohash.as_deref(), &p.mime)) }
+            div.cardmeta {
+                div.cardtitle { (title) }
+                div.cardsub {
+                    span.strong { (p.creator) }
+                    " - " (p.files) @if p.files == 1 { " file" } @else { " files" }
+                    @if p.views > 0 { " - " (p.views) " views" }
+                }
+            }
+        }
+    }
+}
+
+fn creators_grid(creators: &[db::CreatorCard]) -> Markup {
+    html! {
+        div.grid.wide {
+            @for c in creators { (creator_card(c)) }
+        }
+    }
+}
+
+fn creator_card(c: &db::CreatorCard) -> Markup {
+    let href = format!("/c/{}/{}", c.platform, c.creator_id);
+    html! {
+        a.card href=(href) {
+            div.cardthumb.banner { (card_thumb(c.thumb.as_deref(), c.infohash.as_deref(), c.mime.as_deref().unwrap_or(""))) }
+            div.cardmeta {
+                div.cardtitle { (c.creator) }
+                div.cardsub {
+                    span.chip.platform { (c.platform) }
+                    " " (c.posts) " posts - " (c.files) " files"
+                }
+            }
+        }
+    }
+}
+
+// the thumbnail area: inline preview paints instantly with zero fetch. with none, a still image can fall back
+// to the gateway (lazy), but a video never loads its full bytes into a grid cell - it shows a placeholder
+fn card_thumb(thumb: Option<&str>, infohash: Option<&str>, mime: &str) -> Markup {
+    let is_video = mime.starts_with("video/");
+    html! {
+        @match (thumb, is_video, infohash) {
+            (Some(t), _, _) => { img.cover src=(t) loading="lazy" alt=""; }
+            (None, false, Some(ih)) => { img.cover src=(format!("/t/{ih}/f/0")) loading="lazy" alt=""; }
+            _ => { (placeholder(mime)) }
+        }
+        @if is_video { span.playbadge {} }
+    }
+}
+
+fn placeholder(mime: &str) -> Markup {
+    let label = mime.rsplit('/').next().unwrap_or("file").to_uppercase();
+    html! { div.placeholder { span { (label) } } }
+}
+
+fn toolbar(base: &str, q: &str, sort: db::Sort, placeholder: &str) -> Markup {
+    html! {
+        div.toolbar {
+            form.search method="get" action=(base) {
+                input type="search" name="q" value=(q) placeholder=(placeholder);
+                @if sort != db::Sort::Recent { input type="hidden" name="sort" value=(sort.as_str()); }
+                button { "go" }
+            }
+            div.tabs {
+                @for (label, s) in [("Recent", db::Sort::Recent), ("Popular", db::Sort::Popular), ("Random", db::Sort::Random)] {
+                    a.tab.active[sort == s] href=(browse_href(base, s, q, 0)) { (label) }
+                }
+            }
+        }
+    }
+}
+
+fn pager(base: &str, sort: db::Sort, q: &str, page: i64, has_next: bool) -> Markup {
+    html! {
+        @if page > 0 || has_next {
+            div.pager {
+                @if page > 0 {
+                    a.btn.ghost href=(browse_href(base, sort, q, page - 1)) { "prev" }
+                } @else {
+                    span.btn.ghost.off { "prev" }
+                }
+                span.muted { "page " (page + 1) }
+                @if has_next {
+                    a.btn.ghost href=(browse_href(base, sort, q, page + 1)) { "next" }
+                } @else {
+                    span.btn.ghost.off { "next" }
+                }
+            }
+        }
+    }
+}
+
+fn browse_href(base: &str, sort: db::Sort, q: &str, page: i64) -> String {
+    let mut out = format!("{base}?sort={}", sort.as_str());
+    if !q.is_empty() {
+        out.push_str(&format!("&q={}", qs_encode(q)));
+    }
+    if page > 0 {
+        out.push_str(&format!("&page={page}"));
+    }
+    out
+}
+
+fn welcome(cfg: &config::BoardConfig, featured: Option<&db::PostCard>) -> Markup {
+    html! {
+        @if cfg.mascot.is_some() || cfg.welcome_html.is_some() {
+            section.welcome {
+                @if let Some(m) = &cfg.mascot { img.mascot src=(m) alt=""; }
+                div.welcometext {
+                    h1 { (cfg.name) }
+                    @if let Some(t) = &cfg.tagline { p.tagline { (t) } }
+                    // operator-authored html, rendered raw on purpose (same trust level as the binary)
+                    @if let Some(body) = &cfg.welcome_html { div.welcomebody { (PreEscaped(body)) } }
+                }
+            }
+        } @else if let Some(f) = featured {
+            a.hero href=(format!("/p/{}/{}/{}", f.platform, f.creator_id, f.post_id)) {
+                div.cardthumb { (card_thumb(f.thumb.as_deref(), f.infohash.as_deref(), &f.mime)) }
+                div.herobody {
+                    span.eyebrow { "Latest" }
+                    h1 { (f.post_title.clone().unwrap_or_else(|| f.post_id.clone())) }
+                    p.muted { (f.creator) @if let Some(at) = &f.posted_at { " - " (pretty_date(at)) } }
+                }
+            }
+        }
+    }
+}
+
+async fn style_css() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        STYLE,
+    )
+        .into_response()
+}
+
+// operator assets (mascot, favicon) self-hosted from a configured dir so a board makes no external request.
+// flat filenames only - any separator or traversal is rejected, so this never escapes the static dir
+async fn static_file(Path(file): Path<String>) -> Response {
+    let Some(dir) = config::get().static_dir.as_deref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if file.is_empty() || file.contains('/') || file.contains('\\') || file.contains("..") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match tokio::fs::read(std::path::Path::new(dir).join(&file)).await {
+        Ok(bytes) => (
+            [
+                (header::CONTENT_TYPE, content_type_for(&file)),
+                (header::CACHE_CONTROL, "public, max-age=3600"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+fn content_type_for(name: &str) -> &'static str {
+    match name.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "css" => "text/css",
+        _ => "application/octet-stream",
+    }
 }
 
 // standard torrent RSS: point a client's auto-download rule (qBittorrent, Deluge, ruTorrent) at this and it
@@ -503,7 +739,7 @@ async fn creator_page(
     State(pool): State<PgPool>,
     Path((platform, creator_id)): Path<(String, String)>,
 ) -> Html<String> {
-    let posts = db::posts_by_creator(&pool, &platform, &creator_id)
+    let posts = db::creator_posts(&pool, &platform, &creator_id, 300, 0)
         .await
         .unwrap_or_default();
     let name = posts
@@ -513,18 +749,15 @@ async fn creator_page(
     render(
         &name,
         html! {
-            p { a href="/" { "< home" } }
-            h2 { (name) " " span.muted { "(" (platform) ")" } }
-            ul.list {
-                @for p in &posts {
-                    li {
-                        a href=(format!("/p/{}/{}/{}", p.platform, p.creator_id, p.post_id)) {
-                            (p.post_title.clone().unwrap_or_else(|| p.post_id.clone()))
-                        }
-                        span.muted { " " (p.files) " files" @if let Some(at) = &p.posted_at { " - " (pretty_date(at)) } }
-                    }
-                }
+            div.crumbs { a href="/creators" { "Creators" } " / " span { (name) } }
+            div.creatorhead {
+                h1 { (name) }
+                span.chip.platform { (platform) }
+                span.muted { (posts.len()) @if posts.len() == 1 { " post" } @else { " posts" } }
+                a.btn.ghost href=(format!("/feed.xml?platform={}&creator={}", qs_encode(&platform), qs_encode(&creator_id))) { "seed feed" }
             }
+            @if posts.is_empty() { p.muted { "Nothing here yet" } }
+            (posts_grid(&posts))
         },
     )
 }
@@ -532,7 +765,8 @@ async fn creator_page(
 async fn post_page(
     State(pool): State<PgPool>,
     Path((platform, creator_id, post_id)): Path<(String, String, String)>,
-) -> Html<String> {
+    headers: HeaderMap,
+) -> Response {
     let files = db::post_files(&pool, &platform, &creator_id, &post_id)
         .await
         .unwrap_or_default();
@@ -541,26 +775,51 @@ async fn post_page(
         .and_then(|f| f.post_title.clone())
         .unwrap_or_else(|| post_id.clone());
     let body = first.map(|f| f.content.clone()).unwrap_or_default();
+    let creator = first.map(|f| f.creator.clone());
 
-    render(
+    // count one view per browser: a rolling cookie holds the last post opened, so a refresh does not re-count
+    let token = view_token(&platform, &creator_id, &post_id);
+    let repeat = cookie_value(&headers, "lastview").as_deref() == Some(token.as_str());
+    if !repeat && !files.is_empty() {
+        let _ = db::bump_views(&pool, &platform, &creator_id, &post_id).await;
+    }
+
+    let page = render(
         &title,
         html! {
-            p {
+            div.crumbs {
+                a href="/posts" { "Posts" }
                 @if let Some(f) = first {
-                    a href=(format!("/c/{}/{}", f.platform, f.creator_id)) { "< " (f.creator) }
+                    " / " a href=(format!("/c/{}/{}", f.platform, f.creator_id)) { (f.creator) }
                 }
             }
-            h2 { (title) }
+            h1.pagetitle { (title) }
+            @if let Some(c) = &creator {
+                p.muted { "by " a.strong href=(format!("/c/{platform}/{creator_id}")) { (c) } }
+            }
             @if !body.is_empty() { div.body { (PreEscaped(body)) } }
-            @for f in &files {
-                div.file {
-                    p.muted { (f.filename.clone().unwrap_or_else(|| f.file_hash.clone())) " - " (f.size) " bytes" }
-                    (media_block(f))
+            @if files.is_empty() { p.muted { "This post has no files, or they are hidden" } }
+            div.gallery {
+                @for f in &files {
+                    figure.file {
+                        (media_block(f))
+                        figcaption.muted { (f.filename.clone().unwrap_or_else(|| f.file_hash.clone())) " - " (human_size(f.size)) }
+                    }
                 }
             }
             script { (PreEscaped(THUMB_JS)) }
         },
-    )
+    );
+
+    let mut resp = page.into_response();
+    if !repeat {
+        if let Ok(v) = header::HeaderValue::from_str(&format!(
+            "lastview={token}; Path=/; Max-Age=1800; SameSite=Lax"
+        )) {
+            resp.headers_mut().insert(header::SET_COOKIE, v);
+        }
+    }
+    resp
 }
 
 // the preview is embedded in the event as a webp data URI, so it renders with zero fetch and no seeder;
@@ -1014,15 +1273,15 @@ fn npub(pubkey_hex: &str) -> String {
 }
 
 fn board_name() -> String {
-    env_opt("BAKEMONO_BOARD_NAME").unwrap_or_else(|| "化け物 bakemono".to_string())
+    config::get().name.clone()
 }
 
 fn dmca_contact() -> Option<String> {
-    env_opt("BAKEMONO_DMCA_CONTACT")
+    config::get().dmca_contact.clone()
 }
 
 fn contact() -> Option<String> {
-    env_opt("BAKEMONO_CONTACT")
+    config::get().contact.clone()
 }
 
 fn env_opt(key: &str) -> Option<String> {
@@ -1030,6 +1289,38 @@ fn env_opt(key: &str) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+// bytes as a short human string for file captions
+fn human_size(bytes: i64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut v = bytes as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+// a stable per-post cookie token so a refresh does not re-count a view; hashed so odd ids stay cookie-safe
+fn view_token(platform: &str, creator_id: &str, post_id: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (platform, creator_id, post_id).hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
+    raw.split(';').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        (k.trim() == name).then(|| v.trim().to_string())
+    })
 }
 
 // posted_at is ISO-8601 (2026-06-23T17:46:49.000+00:00); show a humane "Jun 23, 2026"
@@ -1054,11 +1345,11 @@ fn pretty_date(raw: &str) -> String {
 }
 
 fn render(title: &str, body: Markup) -> Html<String> {
-    let board = board_name();
+    let cfg = config::get();
     let tab = if title.is_empty() {
-        board.clone()
+        cfg.name.clone()
     } else {
-        format!("{title} - {board}")
+        format!("{title} - {}", cfg.name)
     };
     Html(
         html! {
@@ -1067,26 +1358,64 @@ fn render(title: &str, body: Markup) -> Html<String> {
                 head {
                     meta charset="utf-8";
                     meta name="viewport" content="width=device-width, initial-scale=1";
+                    meta name="referrer" content="no-referrer";
                     title { (tab) }
                     link rel="alternate" type="application/rss+xml" title="seed feed" href="/feed.xml";
-                    style { (PreEscaped(STYLE)) }
+                    link rel="stylesheet" href=(concat!("/style.css?v=", env!("CARGO_PKG_VERSION")));
+                    // operator accent override; the base sheet stays static and cacheable
+                    @if let Some(accent) = &cfg.accent {
+                        style { (PreEscaped(format!(":root{{--accent:{accent}}}"))) }
+                    }
                 }
                 body {
-                    header {
-                        a.brand href="/" { (board) }
-                        nav {
-                            a href="/" { "Browse" }
-                            a href="/contribute" { "Contribute" }
-                            a href="/keepers" { "Keepers" }
-                            a href="/info" { "Info" }
+                    header.topbar {
+                        a.brand href="/" {
+                            @if let Some(m) = &cfg.mascot { img.brandmascot src=(m) alt=""; }
+                            span { (cfg.name) }
+                        }
+                        form.topsearch method="get" action="/posts" {
+                            input type="search" name="q" placeholder="Search" aria-label="Search";
+                        }
+                        div.navwrap {
+                            a.shuffle href="/random" title="Random post" aria-label="Random post" { (PreEscaped(ICON_SHUFFLE)) }
+                            nav {
+                                a href="/creators" { "Creators" }
+                                a href="/posts" { "Posts" }
+                                a href="/contribute" { "Contribute" }
+                            }
                         }
                     }
                     main { (body) }
+                    (footer(cfg))
                 }
             }
         }
         .into_string(),
     )
+}
+
+fn footer(cfg: &config::BoardConfig) -> Markup {
+    html! {
+        footer.foot {
+            @if !cfg.community.is_empty() {
+                div.community {
+                    @for l in &cfg.community {
+                        a.chip href=(l.url) rel="noopener noreferrer" target="_blank" { (l.label) }
+                    }
+                }
+            }
+            div.footlinks {
+                a href="/info" { "Info" }
+                a href="/keepers" { "Keepers" }
+                a href="/contribute" { "Contribute" }
+                @if let Some(email) = &cfg.contact { a href=(format!("mailto:{email}")) { "Contact" } }
+            }
+            p.small.muted {
+                "Files are served from a peer swarm, not stored here. "
+                a href="/info" { "How this works" }
+            }
+        }
+    }
 }
 
 const REPO: &str = env!("CARGO_PKG_REPOSITORY");
@@ -1098,44 +1427,162 @@ const DOWNLOADS: &[(&str, &str)] = &[
     ("Linux (.deb)", "Bakemono_amd64.deb"),
 ];
 
+// two crossing arrows for the Random button; inline so the page pulls no icon font or external asset
+const ICON_SHUFFLE: &str = "<svg viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M16 3h5v5'/><path d='M4 20 21 3'/><path d='M21 16v5h-5'/><path d='M15 15l6 6'/><path d='M4 4l5 5'/></svg>";
+
+// Catppuccin Mocha, self-hosted and static: no external font, no CDN, no third-party request from any page
 const STYLE: &str = "
-:root { color-scheme: light dark }
-body { font-family: system-ui, sans-serif; max-width: 820px; margin: 0 auto; padding: 1rem }
-header { display: flex; align-items: baseline; flex-wrap: wrap; gap: .5rem 1rem; border-bottom: 1px solid #8884; margin-bottom: 1rem; padding-bottom: .5rem }
-.brand { font-weight: 700; text-decoration: none; color: inherit }
-nav { margin-left: auto; display: flex; gap: 1rem }
-nav a { text-decoration: none }
-.list { list-style: none; padding: 0 }
-.list li { padding: .35rem 0; border-bottom: 1px solid #8882 }
-.muted { color: #8888 }
-.error { color: #e4564a }
-.body { margin: 1rem 0 }
-.file { margin: 1rem 0; padding: .5rem; border: 1px solid #8884; border-radius: 6px }
-.file img, .file video { max-width: 100%; display: block; margin-top: .5rem }
-.media { display: inline-block; position: relative; cursor: pointer; margin-top: .5rem }
-.media img.thumb { max-width: 360px; border-radius: 6px }
-.media.loading { opacity: .55 }
-.media.loading::after { content: 'loading...'; position: absolute; inset: 0; display: grid; place-items: center; color: #fff; background: #0007; border-radius: 6px }
-.modform { display: inline; margin: .4rem .4rem 0 0 }
-.takedown { display: flex; flex-wrap: wrap; gap: .4rem; margin: .6rem 0 1rem }
-.takedown input { flex: 1 1 12rem }
-.search { display: flex; gap: .4rem; margin-bottom: 1.2rem }
-.search input { flex: 1 }
-.steps { list-style: none; counter-reset: step; padding: 0 }
-.step { counter-increment: step; border: 1px solid #8884; border-radius: 8px; padding: 1rem 1.25rem; margin: 1rem 0 }
-.step h3 { margin: 0 0 .5rem }
-.step h3::before { content: counter(step) '. '; color: #4488ff; font-weight: 700 }
-.step img { max-width: 100%; border-radius: 6px; margin-top: .75rem; display: block }
-.downloads { display: flex; flex-wrap: wrap; gap: .5rem; margin: .75rem 0 }
-.btn { display: inline-block; padding: .55rem .9rem; border-radius: 6px; background: #4488ff; color: #fff; text-decoration: none; font-weight: 600 }
-.btn:hover { filter: brightness(1.08) }
-.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(7.5rem, 1fr)); gap: .75rem; margin: 1rem 0 1.5rem }
-.stat { border: 1px solid #8884; border-radius: 8px; padding: .9rem 1rem }
-.stat .num { font-size: 1.6rem; font-weight: 700 }
-.stat .label { color: #8888; font-size: .85em }
-code { word-break: break-all; font-size: .85em }
-pre { white-space: pre-wrap; word-break: break-all; background: #8881; padding: .6rem .8rem; border-radius: 6px }
-a { color: #4488ff }
+:root {
+  --base:#1e1e2e; --mantle:#181825; --crust:#11111b;
+  --surface0:#313244; --surface1:#45475a; --surface2:#585b70;
+  --overlay0:#6c7086; --overlay1:#7f849c;
+  --text:#cdd6f4; --subtext1:#bac2de; --subtext0:#a6adc8;
+  --mauve:#cba6f7; --red:#f38ba8;
+  --accent:var(--mauve);
+  color-scheme: dark;
+}
+* { box-sizing: border-box }
+body { margin:0; background:var(--base); color:var(--text); line-height:1.5;
+  font-family: system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif }
+a { color:var(--accent); text-decoration:none }
+a:hover { text-decoration:underline }
+img { display:block }
+h1,h2,h3 { line-height:1.2 }
+button,input,select { font:inherit }
+
+.topbar { position:sticky; top:0; z-index:20; display:flex; align-items:center; gap:1rem;
+  padding:.6rem 1.1rem; background:color-mix(in srgb, var(--mantle) 92%, transparent);
+  backdrop-filter:blur(10px); border-bottom:1px solid var(--surface0) }
+.brand { display:flex; align-items:center; gap:.5rem; font-weight:800; font-size:1.15rem; color:var(--text) }
+.brand:hover { text-decoration:none }
+.brandmascot { width:28px; height:28px; border-radius:7px; object-fit:cover }
+.topsearch { flex:1; max-width:520px; margin:0 auto }
+.topsearch input { width:100%; padding:.55rem .95rem; border-radius:999px; border:1px solid var(--surface1);
+  background:var(--surface0); color:var(--text) }
+.topsearch input:focus { outline:none; border-color:var(--accent) }
+.navwrap { display:flex; align-items:center; gap:1rem; margin-left:auto }
+.topbar nav { display:flex; gap:1.1rem }
+.topbar nav a { color:var(--subtext1); font-weight:600 }
+.topbar nav a:hover { color:var(--text); text-decoration:none }
+.shuffle { display:grid; place-items:center; width:38px; height:38px; border-radius:10px;
+  background:var(--surface0); color:var(--subtext1); border:1px solid var(--surface1) }
+.shuffle:hover { color:var(--crust); background:var(--accent); border-color:var(--accent) }
+
+main { max-width:1240px; margin:0 auto; padding:1.4rem 1.1rem 3rem }
+.pagetitle { font-size:1.6rem; margin:.2rem 0 1rem }
+.block { margin:1.8rem 0 }
+.blockhead { display:flex; align-items:baseline; justify-content:space-between; margin-bottom:.8rem }
+.blockhead h2 { margin:0; font-size:1.25rem }
+.more { font-size:.85rem; font-weight:600 }
+.crumbs { color:var(--subtext0); font-size:.85rem; margin-bottom:.6rem }
+.crumbs a { color:var(--subtext1) }
+.creatorhead { display:flex; flex-wrap:wrap; align-items:center; gap:.7rem; margin-bottom:1.2rem }
+.creatorhead h1 { margin:0; font-size:1.6rem }
+
+.grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(170px,1fr)); gap:14px }
+.grid.wide { grid-template-columns:repeat(auto-fill,minmax(230px,1fr)) }
+.card { display:flex; flex-direction:column; background:var(--surface0); border:1px solid var(--surface0);
+  border-radius:14px; overflow:hidden; color:var(--text);
+  transition:transform .12s ease, border-color .12s ease, box-shadow .12s ease }
+.card:hover { transform:translateY(-3px); border-color:var(--accent); box-shadow:0 8px 24px #0006; text-decoration:none }
+.cardthumb { position:relative; aspect-ratio:3/4; background:var(--crust); overflow:hidden }
+.cardthumb.banner { aspect-ratio:16/10 }
+.cover { width:100%; height:100%; object-fit:cover }
+.placeholder { position:absolute; inset:0; display:grid; place-items:center; color:var(--overlay1);
+  font-size:.8rem; letter-spacing:.08em; background:linear-gradient(135deg,var(--surface0),var(--crust)) }
+.playbadge { position:absolute; top:8px; left:8px; padding:.15rem .45rem; border-radius:6px;
+  background:#000a; color:#fff; font-size:.65rem; font-weight:700; letter-spacing:.06em }
+.playbadge::before { content:'VIDEO' }
+.cardmeta { padding:.55rem .6rem .65rem }
+.cardtitle { font-weight:600; font-size:.9rem; display:-webkit-box; -webkit-line-clamp:2;
+  -webkit-box-orient:vertical; overflow:hidden }
+.cardsub { margin-top:.3rem; color:var(--subtext0); font-size:.76rem }
+.cardsub .strong { color:var(--subtext1); font-weight:600 }
+
+.chip { display:inline-block; padding:.12rem .5rem; border-radius:999px; background:var(--surface1);
+  color:var(--subtext1); font-size:.72rem; font-weight:600 }
+.chip.platform { background:color-mix(in srgb, var(--accent) 22%, var(--surface1)); color:var(--text) }
+
+.hero { display:block; position:relative; border-radius:18px; overflow:hidden; margin-bottom:1.6rem; color:#fff }
+.hero .cardthumb { aspect-ratio:21/9 }
+.hero:hover { text-decoration:none }
+.herobody { position:absolute; left:0; right:0; bottom:0; padding:1.4rem 1.6rem;
+  background:linear-gradient(to top,#000e,#0000) }
+.herobody h1 { margin:.2rem 0 .1rem; font-size:1.9rem }
+.eyebrow { text-transform:uppercase; letter-spacing:.12em; font-size:.72rem; color:var(--accent); font-weight:700 }
+.hero .muted { color:#cdd6f4bb }
+
+.toolbar { display:flex; flex-wrap:wrap; gap:.8rem; align-items:center; justify-content:space-between; margin-bottom:1.1rem }
+.toolbar .search { display:flex; gap:.4rem; flex:1; min-width:220px; max-width:420px; margin:0 }
+.toolbar .search input { flex:1; padding:.5rem .8rem; border-radius:10px; border:1px solid var(--surface1);
+  background:var(--surface0); color:var(--text) }
+.tabs { display:flex; gap:.4rem; background:var(--surface0); padding:.25rem; border-radius:12px }
+.tab { padding:.4rem .85rem; border-radius:9px; color:var(--subtext1); font-weight:600; font-size:.9rem }
+.tab:hover { color:var(--text); text-decoration:none }
+.tab.active { background:var(--accent); color:var(--crust) }
+
+.btn { display:inline-block; padding:.5rem .9rem; border-radius:10px; background:var(--accent);
+  color:var(--crust); font-weight:700; border:none; cursor:pointer }
+.btn:hover { filter:brightness(1.08); text-decoration:none }
+.btn.ghost { background:var(--surface0); color:var(--text); border:1px solid var(--surface1) }
+.btn.ghost.off { opacity:.4; pointer-events:none }
+.search button, .takedown button { padding:.5rem .8rem; border-radius:10px; background:var(--accent);
+  color:var(--crust); font-weight:700; border:none; cursor:pointer }
+.pager { display:flex; gap:1rem; align-items:center; justify-content:center; margin:1.6rem 0 }
+
+.welcome { display:flex; gap:1.4rem; align-items:center; background:var(--mantle); border:1px solid var(--surface0);
+  border-radius:16px; padding:1.4rem 1.6rem; margin-bottom:1.6rem }
+.mascot { width:150px; height:auto; border-radius:12px; flex:none }
+.welcometext h1 { margin:0 0 .3rem }
+.tagline { color:var(--subtext0); margin:.2rem 0 .6rem }
+.welcomebody { color:var(--subtext1) }
+
+.gallery { display:flex; flex-direction:column; gap:1.2rem; margin-top:1rem }
+.file { margin:0; padding:0; border:none }
+figcaption { margin-top:.4rem; font-size:.8rem }
+.media { display:inline-block; position:relative; cursor:pointer; border-radius:12px; overflow:hidden; background:var(--crust) }
+.media img.thumb { max-width:min(100%,520px); height:auto; display:block; border-radius:12px }
+.media.loading { opacity:.6 }
+.media.loading::after { content:'loading...'; position:absolute; inset:0; display:grid; place-items:center; color:#fff; background:#0007 }
+.file img, .file video { max-width:min(100%,760px); border-radius:12px }
+.body { margin:1rem 0; color:var(--subtext1) }
+.body img { max-width:100%; border-radius:10px }
+
+.foot { border-top:1px solid var(--surface0); margin-top:2.5rem; padding:1.6rem 1.1rem; text-align:center; color:var(--subtext0) }
+.community { display:flex; flex-wrap:wrap; gap:.5rem; justify-content:center; margin-bottom:1rem }
+.community .chip { padding:.35rem .8rem; font-size:.85rem; background:var(--surface0); border:1px solid var(--surface1) }
+.community .chip:hover { border-color:var(--accent); color:var(--text); text-decoration:none }
+.footlinks { display:flex; gap:1.2rem; justify-content:center; flex-wrap:wrap; margin-bottom:.6rem }
+.footlinks a { color:var(--subtext1); font-weight:600 }
+.small { font-size:.8rem }
+
+.muted { color:var(--subtext0) }
+.strong { color:var(--subtext1); font-weight:600 }
+.error { color:var(--red) }
+.list { list-style:none; padding:0 }
+.list li { padding:.5rem 0; border-bottom:1px solid var(--surface0) }
+.stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(8rem,1fr)); gap:.75rem; margin:1rem 0 1.5rem }
+.stat { border:1px solid var(--surface0); background:var(--mantle); border-radius:12px; padding:1rem }
+.stat .num { font-size:1.7rem; font-weight:800 }
+.stat .label { color:var(--subtext0); font-size:.85em }
+.steps { list-style:none; counter-reset:step; padding:0 }
+.step { counter-increment:step; border:1px solid var(--surface0); background:var(--mantle); border-radius:14px; padding:1.1rem 1.3rem; margin:1rem 0 }
+.step h3 { margin:0 0 .5rem }
+.step h3::before { content:counter(step) '. '; color:var(--accent); font-weight:800 }
+.step img { max-width:100%; border-radius:8px; margin-top:.6rem }
+.downloads { display:flex; flex-wrap:wrap; gap:.5rem; margin:.75rem 0 }
+.modform { display:inline; margin:.4rem .4rem 0 0 }
+.takedown { display:flex; flex-wrap:wrap; gap:.4rem; margin:.6rem 0 1rem }
+.takedown input, .takedown select { flex:1 1 12rem; padding:.5rem .7rem; border-radius:9px; border:1px solid var(--surface1); background:var(--surface0); color:var(--text) }
+code { background:var(--surface0); padding:.1rem .35rem; border-radius:5px; word-break:break-all; font-size:.85em }
+pre { white-space:pre-wrap; word-break:break-all; background:var(--mantle); border:1px solid var(--surface0); padding:.7rem .9rem; border-radius:10px }
+
+@media (max-width:640px) {
+  .topsearch { display:none }
+  .grid { grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:10px }
+  .welcome { flex-direction:column; text-align:center }
+  .mascot { width:120px }
+}
 ";
 
 const THUMB_JS: &str = "

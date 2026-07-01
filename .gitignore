@@ -12,3 +12,6 @@ bk-dl/
 crates/bakemono-app/gen/schemas/
 crates/bakemono-app/binaries/
 crates/bakemono-app/sidecars/
+
+# operator board config (use board.toml.example as a template)
+board.toml

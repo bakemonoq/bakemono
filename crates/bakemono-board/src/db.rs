@@ -117,33 +117,6 @@ pub async fn gc_pending(pool: &PgPool, ttl_secs: i64) -> Result<u64> {
     Ok(res.rows_affected())
 }
 
-pub async fn creators(pool: &PgPool) -> Result<Vec<CreatorRow>> {
-    let rows = sqlx::query_as::<_, CreatorRow>(
-        "SELECT platform, creator_id, MAX(creator) AS creator,
-                COUNT(DISTINCT post_id) AS posts, COUNT(DISTINCT file_hash) AS files
-         FROM visible_manifests
-         GROUP BY platform, creator_id ORDER BY creator",
-    )
-    .fetch_all(pool)
-    .await?;
-    Ok(rows)
-}
-
-pub async fn search_creators(pool: &PgPool, query: &str) -> Result<Vec<CreatorRow>> {
-    let rows = sqlx::query_as::<_, CreatorRow>(
-        "SELECT platform, creator_id, MAX(creator) AS creator,
-                COUNT(DISTINCT post_id) AS posts, COUNT(DISTINCT file_hash) AS files
-         FROM visible_manifests
-         GROUP BY platform, creator_id
-         HAVING MAX(creator) ILIKE '%' || $1 || '%'
-         ORDER BY creator",
-    )
-    .bind(query)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows)
-}
-
 pub async fn stats(pool: &PgPool) -> Result<Stats> {
     let row = sqlx::query_as::<_, Stats>(
         "SELECT
@@ -156,27 +129,6 @@ pub async fn stats(pool: &PgPool) -> Result<Stats> {
     .fetch_one(pool)
     .await?;
     Ok(row)
-}
-
-pub async fn posts_by_creator(
-    pool: &PgPool,
-    platform: &str,
-    creator_id: &str,
-) -> Result<Vec<PostRow>> {
-    let rows = sqlx::query_as::<_, PostRow>(
-        "SELECT platform, creator_id, post_id, MAX(creator) AS creator,
-                MAX(post_title) AS post_title, MAX(posted_at) AS posted_at,
-                COUNT(DISTINCT file_hash) AS files
-         FROM visible_manifests
-         WHERE platform = $1 AND creator_id = $2
-         GROUP BY platform, creator_id, post_id
-         ORDER BY MAX(posted_at) DESC NULLS LAST, MAX(created_at) DESC",
-    )
-    .bind(platform)
-    .bind(creator_id)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows)
 }
 
 pub async fn post_files(
@@ -303,17 +255,165 @@ pub async fn endangered(pool: &PgPool, limit: i64) -> Result<Vec<EndangeredRow>>
     Ok(rows)
 }
 
-pub async fn recent(pool: &PgPool, limit: i64) -> Result<Vec<ManifestRow>> {
-    let rows = sqlx::query_as::<_, ManifestRow>(
-        "SELECT * FROM (
-             SELECT DISTINCT ON (file_hash) * FROM visible_manifests
-             ORDER BY file_hash, created_at DESC
-         ) t ORDER BY created_at DESC LIMIT $1",
+// how a browse grid is ordered; the string comes from a fixed set, never user input, so it is safe to
+// splice into the query. "popular" leans on post_views, everything else needs no extra join
+#[derive(Clone, Copy, PartialEq)]
+pub enum Sort {
+    Recent,
+    Popular,
+    Random,
+}
+
+impl Sort {
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw {
+            Some("popular") => Sort::Popular,
+            Some("random") => Sort::Random,
+            _ => Sort::Recent,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Sort::Recent => "recent",
+            Sort::Popular => "popular",
+            Sort::Random => "random",
+        }
+    }
+    fn post_order(self) -> &'static str {
+        match self {
+            Sort::Recent => "posted_at DESC NULLS LAST, created_at DESC",
+            Sort::Popular => "views DESC, posted_at DESC NULLS LAST, created_at DESC",
+            Sort::Random => "random()",
+        }
+    }
+    fn creator_order(self) -> &'static str {
+        match self {
+            Sort::Recent => "last_at DESC",
+            Sort::Popular => "files DESC, posts DESC",
+            Sort::Random => "random()",
+        }
+    }
+}
+
+// one card per post: the cover is the post's first file that carries an inline thumb, so a grid paints with
+// zero swarm fetch. an extra row is fetched so the caller can tell there is a next page without a count
+pub async fn list_posts(
+    pool: &PgPool,
+    sort: Sort,
+    q: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<PostCard>> {
+    let sql = format!(
+        "SELECT t.*, COALESCE(pv.views, 0) AS views FROM (
+             SELECT DISTINCT ON (platform, creator_id, post_id)
+                    platform, creator_id, post_id, creator, post_title, posted_at, created_at,
+                    mime, thumb, infohash,
+                    COUNT(*) OVER (PARTITION BY platform, creator_id, post_id) AS files
+             FROM visible_manifests
+             WHERE ($1 = '' OR post_title ILIKE '%' || $1 || '%' OR creator ILIKE '%' || $1 || '%')
+             ORDER BY platform, creator_id, post_id, (thumb IS NULL), file_index
+         ) t
+         LEFT JOIN post_views pv USING (platform, creator_id, post_id)
+         ORDER BY {} LIMIT $2 OFFSET $3",
+        sort.post_order()
+    );
+    let rows = sqlx::query_as::<_, PostCard>(&sql)
+        .bind(q)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
+// one card per creator, cover thumb pulled from their newest file that has one
+pub async fn list_creators(
+    pool: &PgPool,
+    sort: Sort,
+    q: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<CreatorCard>> {
+    let sql = format!(
+        "SELECT c.platform, c.creator_id, c.creator, c.posts, c.files,
+                cov.thumb, cov.infohash, cov.mime
+         FROM (
+             SELECT platform, creator_id, MAX(creator) AS creator,
+                    COUNT(DISTINCT post_id) AS posts, COUNT(DISTINCT file_hash) AS files,
+                    MAX(created_at) AS last_at
+             FROM visible_manifests
+             WHERE ($1 = '' OR creator ILIKE '%' || $1 || '%')
+             GROUP BY platform, creator_id
+         ) c
+         LEFT JOIN LATERAL (
+             SELECT thumb, infohash, mime FROM visible_manifests v
+             WHERE v.platform = c.platform AND v.creator_id = c.creator_id
+             ORDER BY (thumb IS NULL), created_at DESC LIMIT 1
+         ) cov ON true
+         ORDER BY {} LIMIT $2 OFFSET $3",
+        sort.creator_order()
+    );
+    let rows = sqlx::query_as::<_, CreatorCard>(&sql)
+        .bind(q)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
+// one creator's posts as grid cards, newest first
+pub async fn creator_posts(
+    pool: &PgPool,
+    platform: &str,
+    creator_id: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<PostCard>> {
+    let rows = sqlx::query_as::<_, PostCard>(
+        "SELECT t.*, COALESCE(pv.views, 0) AS views FROM (
+             SELECT DISTINCT ON (platform, creator_id, post_id)
+                    platform, creator_id, post_id, creator, post_title, posted_at, created_at,
+                    mime, thumb, infohash,
+                    COUNT(*) OVER (PARTITION BY platform, creator_id, post_id) AS files
+             FROM visible_manifests
+             WHERE platform = $1 AND creator_id = $2
+             ORDER BY platform, creator_id, post_id, (thumb IS NULL), file_index
+         ) t
+         LEFT JOIN post_views pv USING (platform, creator_id, post_id)
+         ORDER BY posted_at DESC NULLS LAST, created_at DESC LIMIT $3 OFFSET $4",
     )
+    .bind(platform)
+    .bind(creator_id)
     .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await?;
     Ok(rows)
+}
+
+pub async fn random_post(pool: &PgPool) -> Result<Option<(String, String, String)>> {
+    let row = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT platform, creator_id, post_id FROM visible_manifests ORDER BY random() LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+// popularity signal for the Popular sort; deduped per browser by the caller so a refresh does not inflate it
+pub async fn bump_views(pool: &PgPool, platform: &str, creator_id: &str, post_id: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO post_views (platform, creator_id, post_id, views) VALUES ($1, $2, $3, 1)
+         ON CONFLICT (platform, creator_id, post_id) DO UPDATE SET views = post_views.views + 1",
+    )
+    .bind(platform)
+    .bind(creator_id)
+    .bind(post_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 pub async fn pending_pubkeys(pool: &PgPool, limit: i64) -> Result<Vec<PendingRow>> {
@@ -483,24 +583,33 @@ pub struct Stats {
     pub contributors: i64,
 }
 
+// a post reduced to one grid card: cover thumb + counts, no per-file rows
 #[derive(sqlx::FromRow)]
-pub struct CreatorRow {
-    pub platform: String,
-    pub creator_id: String,
-    pub creator: String,
-    pub posts: i64,
-    pub files: i64,
-}
-
-#[derive(sqlx::FromRow)]
-pub struct PostRow {
+pub struct PostCard {
     pub platform: String,
     pub creator_id: String,
     pub post_id: String,
     pub creator: String,
     pub post_title: Option<String>,
     pub posted_at: Option<String>,
+    pub mime: String,
+    pub thumb: Option<String>,
+    pub infohash: Option<String>,
     pub files: i64,
+    pub views: i64,
+}
+
+// a creator reduced to one grid card: cover thumb from their newest previewable file + counts
+#[derive(sqlx::FromRow)]
+pub struct CreatorCard {
+    pub platform: String,
+    pub creator_id: String,
+    pub creator: String,
+    pub posts: i64,
+    pub files: i64,
+    pub thumb: Option<String>,
+    pub infohash: Option<String>,
+    pub mime: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -601,6 +710,15 @@ CREATE TABLE IF NOT EXISTS torrent_health (
     checked_at BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS torrent_health_checked ON torrent_health (checked_at);
+
+-- view tally per post, the signal behind the Popular sort; deduped per browser so a refresh does not inflate it
+CREATE TABLE IF NOT EXISTS post_views (
+    platform   TEXT NOT NULL,
+    creator_id TEXT NOT NULL,
+    post_id    TEXT NOT NULL,
+    views      BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (platform, creator_id, post_id)
+);
 
 CREATE TABLE IF NOT EXISTS takedowns (
     d_tag       TEXT PRIMARY KEY,
