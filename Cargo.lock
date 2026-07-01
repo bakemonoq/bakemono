@@ -342,6 +342,8 @@ dependencies = [
  "sqlx",
  "tokio",
  "tokio-util",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

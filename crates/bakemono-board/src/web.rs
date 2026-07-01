@@ -615,7 +615,7 @@ async fn publish_takedown(state: &AppState, keys: &Keys, takedown: &Takedown) {
     let event = match takedown.to_event(keys) {
         Ok(event) => event,
         Err(e) => {
-            eprintln!("takedown sign failed: {e}");
+            tracing::error!("takedown sign failed: {e}");
             let _ = db::record_takedown(&state.pool, takedown, "local", None).await;
             return;
         }
@@ -629,7 +629,7 @@ async fn publish_takedown(state: &AppState, keys: &Keys, takedown: &Takedown) {
     )
     .await;
     if let Err(e) = send_to_relays(&state.relays, keys, &event).await {
-        eprintln!("takedown {id} publish failed (kept local): {e:#}");
+        tracing::warn!("takedown {id} publish failed (kept local): {e:#}");
     }
 }
 

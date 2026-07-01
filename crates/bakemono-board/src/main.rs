@@ -9,6 +9,7 @@ use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    init_tracing();
     let _ = rustls::crypto::ring::default_provider().install_default();
     let database_url = env_or(
         "DATABASE_URL",
@@ -34,12 +35,12 @@ async fn main() -> Result<()> {
     let indexer_relays = relays.clone();
     tokio::spawn(async move {
         if let Err(e) = indexer::run(indexer_pool, indexer_relays, trusted).await {
-            eprintln!("indexer stopped: {e:#}");
+            tracing::error!("indexer stopped: {e:#}");
         }
     });
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
-    println!("board on http://{bind}");
+    tracing::info!("board on http://{bind}");
     let state = web::AppState {
         pool,
         relays,
@@ -48,6 +49,21 @@ async fn main() -> Result<()> {
     };
     axum::serve(listener, web::router(state)).await?;
     Ok(())
+}
+
+// stdout logs so `docker logs` shows the gateway/indexer; librqbit's own chatter is pinned to warn by
+// default (RUST_LOG overrides) so cache/session lines stay legible
+fn init_tracing() {
+    use tracing_subscriber::prelude::*;
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new(
+            "info,librqbit=warn,librqbit_dht=warn,librqbit_utp=warn,librqbit_upnp=warn",
+        )
+    });
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
+        .init();
 }
 
 // persistent cache dir so downloads survive a restart (warm); in Docker point BAKEMONO_GATEWAY_DIR at a volume

@@ -28,7 +28,7 @@ pub async fn run(pool: PgPool, relays: Vec<String>, trusted: Vec<PublicKey>) -> 
             )
             .await?;
     }
-    println!(
+    tracing::info!(
         "indexer subscribed to {} relay(s), honoring takedowns from {} instance(s)",
         relays.len(),
         trusted.len()
