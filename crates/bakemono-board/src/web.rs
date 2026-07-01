@@ -1831,10 +1831,14 @@ pre { white-space:pre-wrap; word-break:break-all; background:var(--mantle); bord
   /* top bar: brand + nav on the first row, search full-width on the second */
   .topbar { flex-wrap:wrap; gap:.5rem .6rem; padding:.55rem .7rem }
   .brand { font-size:1rem }
-  .topactions { margin-left:auto; gap:.5rem }
+  /* all actions on their own centered row, every one a boxed icon button like search + shuffle */
+  .topactions { flex-basis:100%; justify-content:center; gap:.5rem; margin:.15rem 0 0 }
   .searchopen { display:grid }
   .topbar nav { gap:.5rem }
   .topbar nav a span { display:none }
+  .topbar nav a { display:grid; place-items:center; width:40px; height:40px; border-radius:10px;
+    background:var(--surface0); border:1px solid var(--surface1); gap:0 }
+  .topbar nav a:hover { color:var(--crust); background:var(--accent); border-color:var(--accent) }
   .topsearch { display:none; order:3; flex-basis:100%; max-width:none; margin:.15rem 0 0 }
   .searchtoggle:checked ~ .topsearch { display:flex }
   /* grids: more, smaller cards */
