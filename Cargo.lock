@@ -417,19 +417,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bakemono-seednode"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bakemono-engine",
- "rustls",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
 name = "bakemono-torrent"
 version = "0.1.0"
 dependencies = [

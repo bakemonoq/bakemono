@@ -10,7 +10,7 @@ pub struct AppConfig {
     pub trackers: Vec<String>,
     pub seed: bool,
     pub max_up_mbit: u32,
-    // 0 = unlimited; download cap matters mainly for farm nodes fetching content
+    // 0 = unlimited; the download cap bounds background fetching
     #[serde(default)]
     pub max_down_mbit: u32,
     // default false: closing the desktop app leaves the daemon seeding in the background
