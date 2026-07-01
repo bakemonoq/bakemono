@@ -70,6 +70,7 @@ The UI comes up at `http://localhost:3000`. Configure it with environment variab
 | `BAKEMONO_RELAYS`                            | comma-separated relay URLs the indexer subscribes to (default: the bundled relay container) |
 | `BAKEMONO_GATEWAY_PORT`                      | BT peer port the gateway listens on so seeders can dial in (default 4240); open it at the firewall |
 | `BAKEMONO_GATEWAY_PEERS`                     | comma-separated `ip:port` seeders the gateway dials directly (e.g. a known seedbox), bypassing tracker/DHT |
+| `BAKEMONO_CACHE_GB`                          | on-disk gateway cache cap in GB; over budget the least-recently-used content is evicted (default 10, `0` = unlimited) |
 | `BAKEMONO_BOARD_NAME`                        | title shown in the header and browser tab                                                   |
 | `BAKEMONO_MOD_TOKEN`                         | password for the `/mod` queue (HTTP Basic); unset disables `/mod`                           |
 | `BAKEMONO_INSTANCE_NSEC`                     | instance key that signs kind 31064 takedowns; unset keeps hides local-only                  |

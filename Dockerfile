@@ -16,6 +16,8 @@ COPY --from=builder /src/target/release/bakemono-board /usr/local/bin/bakemono-b
 ENV BAKEMONO_BIND=0.0.0.0:3000
 # BT peer port the gateway listens on, so NAT'd seeders can dial in; keep in sync with BAKEMONO_GATEWAY_PORT
 ENV BAKEMONO_GATEWAY_PORT=4240
+# persistent on-disk cache; mount a volume here so downloads survive container recreation
+ENV BAKEMONO_GATEWAY_DIR=/cache
 EXPOSE 3000
 EXPOSE 4240
 EXPOSE 4240/udp

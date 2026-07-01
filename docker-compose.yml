@@ -28,6 +28,8 @@ services:
       BAKEMONO_GATEWAY_PORT: ${BAKEMONO_GATEWAY_PORT:-4240}
       # optional: comma-separated ip:port seeders to dial directly (a known seedbox), bypassing tracker/DHT
       BAKEMONO_GATEWAY_PEERS: ${BAKEMONO_GATEWAY_PEERS:-}
+      # on-disk cache cap in GB; over budget, least-recently-used content is evicted. 0 = unlimited
+      BAKEMONO_CACHE_GB: ${BAKEMONO_CACHE_GB:-10}
       # mod queue password (HTTP Basic auth); leave unset to disable /mod
       BAKEMONO_MOD_TOKEN: ${BAKEMONO_MOD_TOKEN:-}
       # instance keypair (nsec) that signs kind 31064 takedowns; unset keeps hides local-only
@@ -43,6 +45,8 @@ services:
       - "3000:3000"
       - "${BAKEMONO_GATEWAY_PORT:-4240}:${BAKEMONO_GATEWAY_PORT:-4240}"
       - "${BAKEMONO_GATEWAY_PORT:-4240}:${BAKEMONO_GATEWAY_PORT:-4240}/udp"
+    volumes:
+      - bakemono-cache:/cache
     depends_on:
       - postgres
       - relay
@@ -51,3 +55,4 @@ services:
 volumes:
   bakemono-pg:
   bakemono-relay:
+  bakemono-cache:
