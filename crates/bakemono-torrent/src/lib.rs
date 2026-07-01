@@ -1,9 +1,11 @@
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
+use librqbit::limits::LimitsConfig;
 use librqbit::{
     AddTorrent, AddTorrentOptions, CreateTorrentOptions, ManagedTorrent, Session, SessionOptions,
 };
@@ -165,6 +167,8 @@ impl Seeder {
         session_dir: PathBuf,
         trackers: Vec<String>,
         listen_port: Option<u16>,
+        up_bps: Option<u32>,
+        down_bps: Option<u32>,
     ) -> Result<Self> {
         std::fs::create_dir_all(&session_dir)
             .with_context(|| format!("creating session dir {}", session_dir.display()))?;
@@ -173,6 +177,11 @@ impl Seeder {
             // reuse of the stored DHT port collides when several sessions run on one host; take a fresh port
             disable_dht_persistence: true,
             listen_port_range: listen_port.map(|p| p..p + 1),
+            // session-wide rate caps in bytes/sec; None (or 0) is unlimited
+            ratelimits: LimitsConfig {
+                upload_bps: up_bps.and_then(NonZeroU32::new),
+                download_bps: down_bps.and_then(NonZeroU32::new),
+            },
             ..Default::default()
         };
         let session = Session::new_with_opts(session_dir, opts)

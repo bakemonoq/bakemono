@@ -117,7 +117,13 @@ impl<C: ContentSource> Daemon<C> {
     }
 
     async fn ensure_seeder(&self) -> Result<()> {
-        self.seeder.ensure_started(&self.config.trackers).await
+        self.seeder
+            .ensure_started(
+                &self.config.trackers,
+                self.config.max_up_mbit,
+                self.config.max_down_mbit,
+            )
+            .await
     }
 
     fn begin(&self) -> Result<JobGuard<'_>> {
