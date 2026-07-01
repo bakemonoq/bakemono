@@ -59,16 +59,26 @@ pub async fn upsert(pool: &PgPool, event: &Event, manifest: &Manifest) -> Result
         .bind(&manifest.thumb_x)
         .bind(&manifest.thumb_magnet)
         .bind(bakemono_torrent::infohash_from_magnet(&manifest.magnet))
+        .bind(
+            manifest
+                .thumb_magnet
+                .as_deref()
+                .and_then(bakemono_torrent::infohash_from_magnet),
+        )
         .execute(pool)
         .await?;
     Ok(())
 }
 
 // the gateway only serves infohashes the board actually carries (and that pass moderation), so resolve
-// through visible_manifests; an unknown or hidden hash returns None and the route 404s
+// through visible_manifests; an unknown or hidden hash returns None and the route 404s. matches the
+// full-file infohash or a thumbnail infohash, returning the magnet for whichever it is
 pub async fn magnet_by_infohash(pool: &PgPool, infohash: &str) -> Result<Option<String>> {
     let magnet = sqlx::query_scalar(
-        "SELECT magnet FROM visible_manifests WHERE infohash = $1 LIMIT 1",
+        "SELECT magnet FROM visible_manifests WHERE infohash = $1
+         UNION ALL
+         SELECT thumb_magnet FROM visible_manifests WHERE thumb_infohash = $1
+         LIMIT 1",
     )
     .bind(infohash)
     .fetch_optional(pool)
@@ -426,6 +436,7 @@ pub struct ManifestRow {
     pub thumb_x: Option<String>,
     pub thumb_magnet: Option<String>,
     pub infohash: Option<String>,
+    pub thumb_infohash: Option<String>,
 }
 
 const SCHEMA: &str = "
@@ -450,19 +461,24 @@ CREATE TABLE IF NOT EXISTS manifests (
     content    TEXT NOT NULL,
     thumb_x      TEXT,
     thumb_magnet TEXT,
-    infohash   TEXT
+    infohash   TEXT,
+    thumb_infohash TEXT
 );
 -- add the preview columns to boards indexed before thumbnails existed
 ALTER TABLE manifests ADD COLUMN IF NOT EXISTS thumb_x TEXT;
 ALTER TABLE manifests ADD COLUMN IF NOT EXISTS thumb_magnet TEXT;
 -- the gateway keys on the v1 btih; carry it as its own column so a lookup is an index hit, not a magnet scan
 ALTER TABLE manifests ADD COLUMN IF NOT EXISTS infohash TEXT;
+ALTER TABLE manifests ADD COLUMN IF NOT EXISTS thumb_infohash TEXT;
 UPDATE manifests SET infohash = lower(substring(magnet from 'xt=urn:btih:([0-9A-Fa-f]{40})'))
 WHERE infohash IS NULL AND magnet ~ 'xt=urn:btih:[0-9A-Fa-f]{40}';
+UPDATE manifests SET thumb_infohash = lower(substring(thumb_magnet from 'xt=urn:btih:([0-9A-Fa-f]{40})'))
+WHERE thumb_infohash IS NULL AND thumb_magnet ~ 'xt=urn:btih:[0-9A-Fa-f]{40}';
 CREATE INDEX IF NOT EXISTS manifests_creator ON manifests (platform, creator_id);
 CREATE INDEX IF NOT EXISTS manifests_post ON manifests (platform, creator_id, post_id);
 CREATE INDEX IF NOT EXISTS manifests_hash ON manifests (file_hash);
 CREATE INDEX IF NOT EXISTS manifests_infohash ON manifests (infohash);
+CREATE INDEX IF NOT EXISTS manifests_thumb_infohash ON manifests (thumb_infohash);
 CREATE INDEX IF NOT EXISTS manifests_recent ON manifests (created_at DESC);
 
 CREATE TABLE IF NOT EXISTS pubkeys (
@@ -504,8 +520,8 @@ const INSERT: &str = "
 INSERT INTO manifests (
     event_id, pubkey, created_at, d_tag, file_hash, size, mime, magnet,
     platform, creator, creator_id, post_id, file_index, filename, post_title, posted_at, tier, content,
-    thumb_x, thumb_magnet, infohash
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+    thumb_x, thumb_magnet, infohash, thumb_infohash
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
 ON CONFLICT (event_id) DO NOTHING
 ";
 

@@ -274,25 +274,37 @@ async fn post_page(
             @for f in &files {
                 div.file {
                     p.muted { (f.filename.clone().unwrap_or_else(|| f.file_hash.clone())) " - " (f.size) " bytes" }
-                    @match f.infohash.as_deref() {
-                        Some(ih) => (media_tag(ih, &f.mime)),
-                        None => p.muted { "unavailable: manifest carries no infohash" }
-                    }
+                    (media_block(f))
                 }
             }
+            script { (PreEscaped(THUMB_JS)) }
         },
     )
 }
 
-// the browser fetches bytes straight from the gateway over HTTP; the immutable, content-addressed URL
-// lets the browser and any CDN cache it forever
-fn media_tag(infohash: &str, mime: &str) -> Markup {
-    let src = format!("/t/{infohash}/f/0");
+// browser fetches bytes straight from the gateway over HTTP; the immutable, content-addressed URL lets
+// the browser cache it forever. when a thumbnail exists, show it first (small, fast) and swap to the
+// full file on click; the full is prefetched in parallel so the swap is instant once it lands
+fn media_block(f: &db::ManifestRow) -> Markup {
+    let Some(infohash) = f.infohash.as_deref() else {
+        return html! { p.muted { "unavailable: manifest carries no infohash" } };
+    };
+    let full = format!("/t/{infohash}/f/0");
+    let is_video = f.mime.starts_with("video/");
     html! {
-        @if mime.starts_with("video/") {
-            video controls preload="metadata" src=(src) {}
-        } @else {
-            img src=(src) loading="lazy" alt="";
+        @match f.thumb_infohash.as_deref() {
+            Some(th) => {
+                div.media data-full=(full) data-video=[is_video.then_some("1")] {
+                    img.thumb src=(format!("/t/{th}/f/0")) loading="lazy" alt="";
+                }
+            }
+            None => {
+                @if is_video {
+                    video controls preload="metadata" src=(full) {}
+                } @else {
+                    img src=(full) loading="lazy" alt="";
+                }
+            }
         }
     }
 }
@@ -818,6 +830,10 @@ nav a { text-decoration: none }
 .body { margin: 1rem 0 }
 .file { margin: 1rem 0; padding: .5rem; border: 1px solid #8884; border-radius: 6px }
 .file img, .file video { max-width: 100%; display: block; margin-top: .5rem }
+.media { display: inline-block; position: relative; cursor: pointer; margin-top: .5rem }
+.media img.thumb { max-width: 360px; border-radius: 6px }
+.media.loading { opacity: .55 }
+.media.loading::after { content: 'loading...'; position: absolute; inset: 0; display: grid; place-items: center; color: #fff; background: #0007; border-radius: 6px }
 .modform { display: inline; margin: .4rem .4rem 0 0 }
 .takedown { display: flex; flex-wrap: wrap; gap: .4rem; margin: .6rem 0 1rem }
 .takedown input { flex: 1 1 12rem }
@@ -839,6 +855,31 @@ code { word-break: break-all; font-size: .85em }
 a { color: #4488ff }
 ";
 
+const THUMB_JS: &str = "
+for (const el of document.querySelectorAll('.media')) {
+  const full = el.dataset.full
+  const isVideo = el.dataset.video === '1'
+  // pull the full file in parallel with the thumbnail so a click is instant once it lands; video streams
+  // on demand via Range, so there is nothing to prefetch for it
+  let ready = isVideo
+  if (!isVideo) { const pre = new Image(); pre.onload = () => { ready = true }; pre.src = full }
+  el.title = 'click to load the full file'
+  el.addEventListener('click', () => {
+    if (el.dataset.open) return
+    el.dataset.open = '1'
+    if (isVideo) {
+      const v = document.createElement('video'); v.controls = true; v.autoplay = true; v.src = full
+      el.replaceChildren(v)
+    } else {
+      const img = document.createElement('img'); img.alt = ''
+      if (!ready) el.classList.add('loading')
+      img.onload = () => el.classList.remove('loading')
+      img.src = full
+      el.replaceChildren(img)
+    }
+  })
+}
+";
 
 #[cfg(test)]
 mod tests {
