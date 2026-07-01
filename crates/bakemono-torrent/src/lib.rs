@@ -76,18 +76,55 @@ impl Gateway {
     }
 
     pub async fn meta(&self, magnet: &str) -> Result<TorrentMeta> {
-        let (handle, infohash) = self.add(magnet, vec![0]).await?;
+        let infohash =
+            infohash_from_magnet(magnet).ok_or_else(|| anyhow!("magnet carries no infohash"))?;
+        // cache hit: describe the file from disk, no peer needed
+        if let Some((path, size)) = self.cache.complete_file(&infohash) {
+            let name = file_name(&path);
+            self.cache.touch(&infohash, size, None);
+            return Ok(TorrentMeta {
+                files: vec![FileMeta {
+                    index: 0,
+                    mime: mime_for(&name),
+                    path: name.clone(),
+                    size,
+                }],
+                name,
+                info_hash: infohash,
+            });
+        }
+        let (handle, _) = self.add(magnet, vec![0]).await?;
         let meta = meta_from_handle(&handle)?;
         let size = meta.files.first().map(|f| f.size).unwrap_or(0);
-        self.cache.touch(&infohash, size, handle.id().into());
+        self.cache.touch(&infohash, size, Some(handle.id().into()));
         self.cache.evict(&self.session).await;
         Ok(meta)
     }
 
     pub async fn open(&self, magnet: &str, file_index: usize) -> Result<OpenFile> {
-        let (handle, infohash) = self.add(magnet, vec![file_index]).await?;
+        let infohash =
+            infohash_from_magnet(magnet).ok_or_else(|| anyhow!("magnet carries no infohash"))?;
+        // cache hit: a fully-downloaded file serves straight from disk over HTTP, no torrent, no peer.
+        // scoped to single-file torrents (index 0), which is what our manifests produce
+        if file_index == 0 {
+            if let Some((path, size)) = self.cache.complete_file(&infohash) {
+                let file = tokio::fs::File::open(&path)
+                    .await
+                    .with_context(|| format!("opening cached {}", path.display()))?;
+                let name = file_name(&path);
+                self.cache.touch(&infohash, size, None);
+                return Ok(OpenFile {
+                    stream: Box::pin(file),
+                    size,
+                    mime: mime_for(&name),
+                    name,
+                });
+            }
+        }
+        // miss: pull from the swarm (needs a live seeder), streaming pieces as they arrive
+        let (handle, _) = self.add(magnet, vec![file_index]).await?;
         let (name, size) = file_entry(&handle, file_index)?;
-        self.cache.touch(&infohash, size, handle.id().into());
+        self.cache.touch(&infohash, size, Some(handle.id().into()));
         self.cache.evict(&self.session).await;
         let stream = handle
             .clone()
@@ -106,12 +143,7 @@ impl Gateway {
     async fn add(&self, magnet: &str, only_files: Vec<usize>) -> Result<(Arc<ManagedTorrent>, String)> {
         let infohash =
             infohash_from_magnet(magnet).ok_or_else(|| anyhow!("magnet carries no infohash"))?;
-        let output_folder = self
-            .cache
-            .dir
-            .join(&infohash)
-            .to_string_lossy()
-            .into_owned();
+        let dir = self.cache.dir.join(&infohash);
         let initial_peers =
             (!self.initial_peers.is_empty()).then(|| self.initial_peers.clone());
         let resp = self
@@ -121,7 +153,7 @@ impl Gateway {
                 Some(AddTorrentOptions {
                     only_files: Some(only_files),
                     overwrite: true,
-                    output_folder: Some(output_folder),
+                    output_folder: Some(dir.to_string_lossy().into_owned()),
                     initial_peers,
                     ..Default::default()
                 }),
@@ -135,8 +167,22 @@ impl Gateway {
             .wait_until_initialized()
             .await
             .context("waiting for torrent metadata")?;
+        // when the selected file finishes, drop a .done marker so later requests serve it from disk
+        // with no peer (offline cache hit) and survive a board restart
+        let h = handle.clone();
+        tokio::spawn(async move {
+            if h.wait_until_completed().await.is_ok() {
+                let _ = std::fs::write(dir.join(".done"), b"");
+            }
+        });
         Ok((handle, infohash))
     }
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 // on-SSD file cache keyed by infohash, bounded by a size budget with LRU eviction ("download, display,
@@ -195,12 +241,15 @@ impl Cache {
         Ok(cache)
     }
 
-    fn touch(&self, infohash: &str, size: u64, id: TorrentIdOrHash) {
+    fn touch(&self, infohash: &str, size: u64, id: Option<TorrentIdOrHash>) {
         let mut st = self.state.lock().unwrap();
         match st.entries.get_mut(infohash) {
             Some(e) => {
                 e.last = SystemTime::now();
-                e.id = Some(id);
+                // keep a known session id; a cache hit (id None) must not clear it
+                if id.is_some() {
+                    e.id = id;
+                }
             }
             None => {
                 st.total += size;
@@ -209,11 +258,28 @@ impl Cache {
                     Entry {
                         size,
                         last: SystemTime::now(),
-                        id: Some(id),
+                        id,
                     },
                 );
             }
         }
+    }
+
+    // the cached file for an infohash, but only if its download finished (a .done marker is present),
+    // so it serves from disk with no peer. single-file torrents, so returns the one non-marker file
+    fn complete_file(&self, infohash: &str) -> Option<(PathBuf, u64)> {
+        let dir = self.dir.join(infohash);
+        if !dir.join(".done").is_file() {
+            return None;
+        }
+        for e in std::fs::read_dir(&dir).ok()?.flatten() {
+            let p = e.path();
+            if p.is_file() && p.file_name().map(|n| n != ".done").unwrap_or(false) {
+                let size = e.metadata().ok()?.len();
+                return Some((p, size));
+            }
+        }
+        None
     }
 
     async fn evict(&self, session: &Session) {

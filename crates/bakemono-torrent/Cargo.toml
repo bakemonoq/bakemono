@@ -8,7 +8,7 @@ repository.workspace = true
 
 [dependencies]
 librqbit = "8"
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs"] }
 anyhow.workspace = true
 tracing.workspace = true
 serde = { version = "1", features = ["derive"] }

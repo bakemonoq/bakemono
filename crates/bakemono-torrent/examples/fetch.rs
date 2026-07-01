@@ -22,7 +22,11 @@ async fn main() -> Result<()> {
         synth_magnet(&target, &PUBLIC_TRACKERS.map(String::from))
     };
 
-    let dir = std::env::temp_dir().join(format!("bakemono-fetch-{}", std::process::id()));
+    let dir = std::env::var("BAKEMONO_GATEWAY_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("bakemono-fetch-{}", std::process::id())));
     let peers = std::env::var("BAKEMONO_GATEWAY_PEERS")
         .unwrap_or_default()
         .split(',')
