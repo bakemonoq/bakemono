@@ -265,7 +265,9 @@ mod tests {
         };
         manifest.file_hash = hash.clone();
         manifest.size = 1;
-        let manifest_event = manifest.to_event(&contributor).unwrap();
+        let manifest_event = manifest
+            .to_event_pow(&contributor, bakemono_core::protocol::POW_DIFFICULTY)
+            .unwrap();
         publisher.send_event(&manifest_event).await.unwrap();
 
         // the contributor lands in the queue on first sight; approve so the file would be visible

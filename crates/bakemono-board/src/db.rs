@@ -616,6 +616,150 @@ pub struct TakedownRow {
     pub applied_at: String,
 }
 
+const MAX_OPEN_REPORTS: i64 = 5_000;
+
+// tally a report: an existing (post, reason) row always increments and re-opens; a new row is created
+// only while the open backlog is under the cap, so a spread-out flood cannot grow the table without bound
+pub async fn record_report(
+    pool: &PgPool,
+    platform: &str,
+    creator_id: &str,
+    post_id: &str,
+    reason: &str,
+) -> Result<()> {
+    let updated = sqlx::query(
+        "UPDATE reports
+         SET count = count + 1, last_seen = EXTRACT(EPOCH FROM now())::bigint, status = 'open'
+         WHERE platform = $1 AND creator_id = $2 AND post_id = $3 AND reason = $4",
+    )
+    .bind(platform)
+    .bind(creator_id)
+    .bind(post_id)
+    .bind(reason)
+    .execute(pool)
+    .await?;
+    if updated.rows_affected() == 0 {
+        sqlx::query(
+            "INSERT INTO reports (platform, creator_id, post_id, reason, count, first_seen, last_seen, status)
+             SELECT $1, $2, $3, $4, 1, EXTRACT(EPOCH FROM now())::bigint, EXTRACT(EPOCH FROM now())::bigint, 'open'
+             WHERE (SELECT COUNT(*) FROM reports WHERE status = 'open') < $5
+             ON CONFLICT (platform, creator_id, post_id, reason) DO NOTHING",
+        )
+        .bind(platform)
+        .bind(creator_id)
+        .bind(post_id)
+        .bind(reason)
+        .bind(MAX_OPEN_REPORTS)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+pub async fn post_is_visible(
+    pool: &PgPool,
+    platform: &str,
+    creator_id: &str,
+    post_id: &str,
+) -> Result<bool> {
+    let row: (bool,) = sqlx::query_as(
+        "SELECT EXISTS(
+             SELECT 1 FROM visible_manifests WHERE platform = $1 AND creator_id = $2 AND post_id = $3
+         )",
+    )
+    .bind(platform)
+    .bind(creator_id)
+    .bind(post_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
+// open reports collapsed to one row per post: severity (csam) first, then most-reported
+pub async fn open_reports(pool: &PgPool, limit: i64) -> Result<Vec<ReportGroup>> {
+    let rows = sqlx::query_as::<_, ReportGroup>(
+        "SELECT r.platform, r.creator_id, r.post_id,
+                SUM(r.count)::bigint AS total,
+                string_agg(r.reason || ' x' || r.count::text, ' - ' ORDER BY r.count DESC) AS reasons,
+                BOOL_OR(r.reason = 'csam') AS has_csam,
+                COALESCE(MAX(m.creator), '') AS creator,
+                MAX(m.post_title) AS post_title
+         FROM reports r
+         LEFT JOIN LATERAL (
+             SELECT creator, post_title FROM manifests
+             WHERE platform = r.platform AND creator_id = r.creator_id AND post_id = r.post_id
+             LIMIT 1
+         ) m ON true
+         WHERE r.status = 'open'
+         GROUP BY r.platform, r.creator_id, r.post_id
+         ORDER BY BOOL_OR(r.reason = 'csam') DESC, SUM(r.count) DESC, MAX(r.last_seen) DESC
+         LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+pub async fn resolve_report(
+    pool: &PgPool,
+    platform: &str,
+    creator_id: &str,
+    post_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE reports SET status = 'dismissed'
+         WHERE platform = $1 AND creator_id = $2 AND post_id = $3",
+    )
+    .bind(platform)
+    .bind(creator_id)
+    .bind(post_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn open_report_count(pool: &PgPool) -> Result<i64> {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM (
+             SELECT 1 FROM reports WHERE status = 'open'
+             GROUP BY platform, creator_id, post_id
+         ) t",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
+pub async fn post_event_ids(
+    pool: &PgPool,
+    platform: &str,
+    creator_id: &str,
+    post_id: &str,
+) -> Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT event_id FROM manifests WHERE platform = $1 AND creator_id = $2 AND post_id = $3",
+    )
+    .bind(platform)
+    .bind(creator_id)
+    .bind(post_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.0).collect())
+}
+
+#[derive(sqlx::FromRow)]
+pub struct ReportGroup {
+    pub platform: String,
+    pub creator_id: String,
+    pub post_id: String,
+    pub total: i64,
+    pub reasons: Option<String>,
+    pub has_csam: bool,
+    pub creator: String,
+    pub post_title: Option<String>,
+}
+
 #[derive(sqlx::FromRow)]
 pub struct PendingRow {
     pub pubkey: String,
@@ -797,6 +941,21 @@ CREATE TABLE IF NOT EXISTS takedowns (
     applied_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS takedowns_target ON takedowns (target_type, target);
+
+-- user reports of a post, aggregated one row per (post, reason); no free text, so nothing here is
+-- attacker-controlled prose the mod panel has to render
+CREATE TABLE IF NOT EXISTS reports (
+    platform   TEXT NOT NULL,
+    creator_id TEXT NOT NULL,
+    post_id    TEXT NOT NULL,
+    reason     TEXT NOT NULL,
+    count      BIGINT NOT NULL DEFAULT 0,
+    first_seen BIGINT NOT NULL,
+    last_seen  BIGINT NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'open',
+    PRIMARY KEY (platform, creator_id, post_id, reason)
+);
+CREATE INDEX IF NOT EXISTS reports_status ON reports (status);
 
 -- the single definition of what the public UI shows: approved pubkeys, minus anything a takedown hides
 CREATE OR REPLACE VIEW visible_manifests AS
@@ -1076,6 +1235,80 @@ mod tests {
             .unwrap();
         sqlx::query("DELETE FROM pubkeys WHERE pubkey = $1")
             .bind(fresh.public_key().to_hex())
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reports_aggregate_and_resolve() {
+        let Ok(url) = std::env::var("BAKEMONO_TEST_DB") else {
+            eprintln!("skipping: BAKEMONO_TEST_DB not set");
+            return;
+        };
+        let pool = match connect(&url).await {
+            Ok(pool) => pool,
+            Err(e) => {
+                eprintln!("skipping: cannot reach test db: {e}");
+                return;
+            }
+        };
+        let keys = Keys::generate();
+        let creator_id = format!("rep-{}", std::process::id());
+        let manifest = sample(&creator_id);
+        let event = manifest.to_event_at(&keys, 1_000).unwrap();
+        upsert(&pool, &event, &manifest).await.unwrap();
+        approve_pubkey(&pool, &keys.public_key().to_hex())
+            .await
+            .unwrap();
+
+        let (p, c, post) = (
+            manifest.platform.as_str(),
+            creator_id.as_str(),
+            manifest.post_id.as_str(),
+        );
+        assert!(post_is_visible(&pool, p, c, post).await.unwrap());
+        assert!(!post_is_visible(&pool, p, c, "nope").await.unwrap());
+
+        record_report(&pool, p, c, post, "spam").await.unwrap();
+        record_report(&pool, p, c, post, "spam").await.unwrap();
+        record_report(&pool, p, c, post, "csam").await.unwrap();
+
+        let open = open_reports(&pool, 100).await.unwrap();
+        let group = open
+            .iter()
+            .find(|r| r.post_id == post && r.creator_id == c)
+            .expect("reported post present");
+        assert_eq!(group.total, 3);
+        assert!(group.has_csam);
+        let reasons = group.reasons.clone().unwrap_or_default();
+        assert!(reasons.contains("spam x2"), "reasons: {reasons}");
+        assert!(reasons.contains("csam x1"), "reasons: {reasons}");
+        assert_eq!(group.creator, manifest.creator);
+        assert!(open_report_count(&pool).await.unwrap() >= 1);
+
+        let ids = post_event_ids(&pool, p, c, post).await.unwrap();
+        assert_eq!(ids, vec![event.id.to_hex()]);
+
+        resolve_report(&pool, p, c, post).await.unwrap();
+        assert!(open_reports(&pool, 100)
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| !(r.post_id == post && r.creator_id == c)));
+
+        sqlx::query("DELETE FROM reports WHERE creator_id = $1")
+            .bind(&creator_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM manifests WHERE creator_id = $1")
+            .bind(&creator_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM pubkeys WHERE pubkey = $1")
+            .bind(keys.public_key().to_hex())
             .execute(&pool)
             .await
             .unwrap();

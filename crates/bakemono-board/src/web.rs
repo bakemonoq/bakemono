@@ -1,6 +1,7 @@
 use std::io::SeekFrom;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Form, FromRef, Path, Query, State};
@@ -9,6 +10,8 @@ use axum::response::{Html, IntoResponse, Json, Redirect, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use base64::Engine;
+use hmac::{Hmac, Mac};
+use sha2::{Digest, Sha256};
 use chrono::Utc;
 use maud::{html, Markup, PreEscaped, DOCTYPE};
 use nostr_sdk::prelude::{Client, Event, Keys, PublicKey, ToBech32};
@@ -59,6 +62,9 @@ pub fn router(state: AppState) -> Router {
         .route("/mod/reject-creator", post(mod_reject_creator))
         .route("/mod/takedown", post(mod_takedown))
         .route("/mod/untakedown", post(mod_untakedown))
+        .route("/report", post(submit_report))
+        .route("/mod/report-dismiss", post(mod_report_dismiss))
+        .route("/mod/report-hide", post(mod_report_hide))
         .route("/t/{infohash}/meta", get(gateway_meta))
         .route("/t/{infohash}/f/{file_index}", get(gateway_file))
         .with_state(state)
@@ -911,6 +917,7 @@ async fn creator_page(
 async fn post_page(
     State(pool): State<PgPool>,
     Path((platform, creator_id, post_id)): Path<(String, String, String)>,
+    Query(query): Query<ReportedQuery>,
     headers: HeaderMap,
 ) -> Response {
     let files = db::post_files(&pool, &platform, &creator_id, &post_id)
@@ -958,7 +965,8 @@ async fn post_page(
             }
             @if files.is_empty() { p.muted { "This post has no files, or they are hidden" } }
             (carousel(&files))
-            @if !body.is_empty() { div.body { (PreEscaped(body)) } }
+            @if !body.is_empty() { div.body { (body) } }
+            (report_box(&platform, &creator_id, &post_id, query.reported.is_some()))
             script { (PreEscaped(CAROUSEL_JS)) }
         },
     );
@@ -1201,11 +1209,14 @@ async fn mod_queue(State(state): State<AppState>, headers: HeaderMap) -> Respons
     let groups = db::pending_groups(&state.pool, 50).await.unwrap_or_default();
     let pending = db::pending_pubkeys(&state.pool, 100).await.unwrap_or_default();
     let takedowns = db::takedowns(&state.pool).await.unwrap_or_default();
+    let reports = db::open_reports(&state.pool, 100).await.unwrap_or_default();
+    let report_count = db::open_report_count(&state.pool).await.unwrap_or(0);
     render(
         "mod queue",
         html! {
             p { a href="/" { "< home" } }
             h2 { "Mod queue" }
+            (reports_section(&reports, report_count))
             p.muted { "first-seen pubkeys wait here; approve to publish their files, reject to drop them" }
             @if groups.is_empty() && pending.is_empty() { p.muted { "nothing awaiting review" } }
             @if !groups.is_empty() {
@@ -1426,6 +1437,314 @@ async fn mod_untakedown(
     }
     let _ = db::remove_takedown(&pool, &form.d_tag).await;
     Redirect::to("/mod").into_response()
+}
+
+const REPORT_REASONS: &[&str] = &[
+    "csam", "dmca", "spam", "malware", "mislabeled", "broken", "other",
+];
+
+// unauthenticated: the one write path a random visitor reaches, so it is gated by a honeypot, an
+// issue-time token that forces a real page load first, and a per-ip + per-post rate limit
+async fn submit_report(
+    State(pool): State<PgPool>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Form(form): Form<ReportForm>,
+) -> Response {
+    let back = format!("/p/{}/{}/{}", form.platform, form.creator_id, form.post_id);
+    if !form.website.trim().is_empty() {
+        return Redirect::to(&back).into_response();
+    }
+    if !REPORT_REASONS.contains(&form.reason.as_str()) {
+        return Redirect::to(&back).into_response();
+    }
+    let now = now_secs();
+    if !verify_report_token(&form.platform, &form.creator_id, &form.post_id, &form.token, now) {
+        return Redirect::to(&back).into_response();
+    }
+    let ip = client_ip(&headers, peer);
+    let post_key = format!("{}:{}:{}", form.platform, form.creator_id, form.post_id);
+    if !report_limiter().allow(&ip_hash(&ip.to_string()), &post_key, now) {
+        return Redirect::to(&back).into_response();
+    }
+    if !matches!(
+        db::post_is_visible(&pool, &form.platform, &form.creator_id, &form.post_id).await,
+        Ok(true)
+    ) {
+        return Redirect::to(&back).into_response();
+    }
+    let _ =
+        db::record_report(&pool, &form.platform, &form.creator_id, &form.post_id, &form.reason).await;
+    Redirect::to(&format!("{back}?reported=1")).into_response()
+}
+
+async fn mod_report_dismiss(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Form(form): Form<PostForm>,
+) -> Response {
+    if let Err(denied) = require_mod(&headers) {
+        return denied;
+    }
+    let _ = db::resolve_report(&pool, &form.platform, &form.creator_id, &form.post_id).await;
+    Redirect::to("/mod").into_response()
+}
+
+// hide every file of a reported post with one kind 31064 event-id takedown each, then clear the flag;
+// piece two folds this into a single post-target event
+async fn mod_report_hide(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<PostForm>,
+) -> Response {
+    if let Err(denied) = require_mod(&headers) {
+        return denied;
+    }
+    let ids = db::post_event_ids(&state.pool, &form.platform, &form.creator_id, &form.post_id)
+        .await
+        .unwrap_or_default();
+    for id in ids {
+        let takedown = Takedown {
+            target: Target::Event(id),
+            reason: "reported".into(),
+            applied_at: Some(Utc::now().to_rfc3339()),
+            explanation: String::new(),
+        };
+        match &state.signer {
+            Some(keys) => publish_takedown(&state, keys, &takedown).await,
+            None => {
+                let _ = db::record_takedown(&state.pool, &takedown, "local", None).await;
+            }
+        }
+    }
+    let _ = db::resolve_report(&state.pool, &form.platform, &form.creator_id, &form.post_id).await;
+    Redirect::to("/mod").into_response()
+}
+
+fn reports_section(reports: &[db::ReportGroup], open_count: i64) -> Markup {
+    html! {
+        h3 { "Reports" @if open_count > 0 { " (" (open_count) " open)" } }
+        @if reports.is_empty() {
+            p.muted { "no open reports" }
+        } @else {
+            p.muted { "user-flagged posts, most severe first; hide publishes a takedown, dismiss clears the flag" }
+            ul.list {
+                @for r in reports {
+                    li class=(if r.has_csam { "report csam" } else { "report" }) {
+                        div {
+                            a href=(format!("/p/{}/{}/{}", r.platform, r.creator_id, r.post_id)) {
+                                (r.post_title.clone().unwrap_or_else(|| r.post_id.clone()))
+                            }
+                            " " span.muted {
+                                "(" (pretty_platform(&r.platform))
+                                @if !r.creator.is_empty() { " / " (r.creator) }
+                                ")"
+                            }
+                        }
+                        span.muted {
+                            @if let Some(rs) = &r.reasons { (rs) " - " }
+                            (r.total) " report(s)"
+                        }
+                        div {
+                            form method="post" action="/mod/report-hide" class="modform" {
+                                input type="hidden" name="platform" value=(r.platform);
+                                input type="hidden" name="creator_id" value=(r.creator_id);
+                                input type="hidden" name="post_id" value=(r.post_id);
+                                button { "hide post" }
+                            }
+                            form method="post" action="/mod/report-dismiss" class="modform" {
+                                input type="hidden" name="platform" value=(r.platform);
+                                input type="hidden" name="creator_id" value=(r.creator_id);
+                                input type="hidden" name="post_id" value=(r.post_id);
+                                button { "dismiss" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn report_box(platform: &str, creator_id: &str, post_id: &str, reported: bool) -> Markup {
+    html! {
+        @if reported {
+            p.reported { "Thanks - a moderator will review this post" }
+        } @else {
+            details.reportbox {
+                summary { "Report this post" }
+                form method="post" action="/report" {
+                    input type="hidden" name="platform" value=(platform);
+                    input type="hidden" name="creator_id" value=(creator_id);
+                    input type="hidden" name="post_id" value=(post_id);
+                    input type="hidden" name="token" value=(report_token(platform, creator_id, post_id, now_secs()));
+                    input.hp type="text" name="website" tabindex="-1" autocomplete="off" aria-hidden="true";
+                    select name="reason" {
+                        option value="csam" { "illegal / CSAM" }
+                        option value="dmca" { "copyright / DMCA" }
+                        option value="spam" { "spam" }
+                        option value="malware" { "malware" }
+                        option value="mislabeled" { "mislabeled" }
+                        option value="broken" { "broken / unavailable" }
+                        option value="other" { "other" }
+                    }
+                    button { "Submit report" }
+                }
+            }
+        }
+    }
+}
+
+fn now_secs() -> i64 {
+    Utc::now().timestamp()
+}
+
+// derived from the mod token so it is stable across restarts with no rng dep; it salts the ip hash
+// and keys the anti-replay token
+fn report_secret() -> &'static [u8; 32] {
+    static SECRET: OnceLock<[u8; 32]> = OnceLock::new();
+    SECRET.get_or_init(|| {
+        let token = std::env::var("BAKEMONO_MOD_TOKEN").unwrap_or_default();
+        let mut h = Sha256::new();
+        h.update(b"bakemono-report-secret-v1");
+        h.update(token.as_bytes());
+        let out = h.finalize();
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&out);
+        key
+    })
+}
+
+type HmacSha256 = Hmac<Sha256>;
+
+fn report_token(platform: &str, creator_id: &str, post_id: &str, issued_at: i64) -> String {
+    let mut mac = HmacSha256::new_from_slice(report_secret()).expect("hmac key");
+    mac.update(format!("{platform}:{creator_id}:{post_id}:{issued_at}").as_bytes());
+    let tag = mac.finalize().into_bytes();
+    let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&tag[..16]);
+    format!("{issued_at}.{sig}")
+}
+
+const REPORT_TOKEN_MIN_AGE: i64 = 2;
+const REPORT_TOKEN_MAX_AGE: i64 = 3600;
+
+fn verify_report_token(
+    platform: &str,
+    creator_id: &str,
+    post_id: &str,
+    token: &str,
+    now: i64,
+) -> bool {
+    let Some((ts, sig_b64)) = token.split_once('.') else {
+        return false;
+    };
+    let Ok(issued_at) = ts.parse::<i64>() else {
+        return false;
+    };
+    let age = now - issued_at;
+    if !(REPORT_TOKEN_MIN_AGE..=REPORT_TOKEN_MAX_AGE).contains(&age) {
+        return false;
+    }
+    let Ok(sig) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(sig_b64) else {
+        return false;
+    };
+    let mut mac = HmacSha256::new_from_slice(report_secret()).expect("hmac key");
+    mac.update(format!("{platform}:{creator_id}:{post_id}:{issued_at}").as_bytes());
+    mac.verify_truncated_left(&sig).is_ok()
+}
+
+// hashed with the secret so a raw ip is never stored or logged; keying only, privacy per project stance
+fn ip_hash(ip: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(b"bakemono-report-ip-v1");
+    h.update(report_secret());
+    h.update(ip.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(h.finalize())
+}
+
+const REPORT_WINDOW_SECS: i64 = 600;
+const REPORT_PER_POST_MAX: u32 = 3;
+const REPORT_PER_IP_MAX: u32 = 20;
+const REPORT_GLOBAL_MAX: u32 = 500;
+const REPORT_MAX_TRACKED: usize = 50_000;
+
+fn report_limiter() -> &'static ReportLimiter {
+    static L: OnceLock<ReportLimiter> = OnceLock::new();
+    L.get_or_init(ReportLimiter::default)
+}
+
+// fixed-window limiter over hashed ip, hashed ip+post, and a global ceiling; a submit bumps all three
+// so hammering a blocked key keeps it blocked
+#[derive(Default)]
+struct ReportLimiter {
+    state: Mutex<ReportLimiterState>,
+}
+
+#[derive(Default)]
+struct ReportLimiterState {
+    windows: HashMap<String, ReportWindow>,
+    global: ReportWindow,
+}
+
+#[derive(Default, Clone, Copy)]
+struct ReportWindow {
+    start: i64,
+    count: u32,
+}
+
+impl ReportLimiter {
+    fn allow(&self, ip_hash: &str, post_key: &str, now: i64) -> bool {
+        let mut st = self.state.lock().unwrap();
+        if st.windows.len() > REPORT_MAX_TRACKED {
+            st.windows.retain(|_, w| now - w.start < REPORT_WINDOW_SECS);
+        }
+        let per_ip = bump_window(
+            st.windows.entry(format!("ip:{ip_hash}")).or_default(),
+            now,
+            REPORT_PER_IP_MAX,
+        );
+        let per_post = bump_window(
+            st.windows.entry(format!("pp:{ip_hash}:{post_key}")).or_default(),
+            now,
+            REPORT_PER_POST_MAX,
+        );
+        let mut global = st.global;
+        let global_ok = bump_window(&mut global, now, REPORT_GLOBAL_MAX);
+        st.global = global;
+        per_ip && per_post && global_ok
+    }
+}
+
+fn bump_window(w: &mut ReportWindow, now: i64, max: u32) -> bool {
+    if now - w.start >= REPORT_WINDOW_SECS {
+        w.start = now;
+        w.count = 0;
+    }
+    w.count += 1;
+    w.count <= max
+}
+
+#[derive(serde::Deserialize)]
+struct ReportForm {
+    platform: String,
+    creator_id: String,
+    post_id: String,
+    reason: String,
+    token: String,
+    #[serde(default)]
+    website: String,
+}
+
+#[derive(serde::Deserialize)]
+struct PostForm {
+    platform: String,
+    creator_id: String,
+    post_id: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ReportedQuery {
+    reported: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1844,7 +2163,15 @@ main { max-width:1240px; margin:0 auto; padding:1.4rem 1.1rem 3rem }
 .lbnav:hover { background:var(--accent); color:var(--crust); border-color:var(--accent) }
 .lbcount { position:fixed; bottom:16px; left:50%; transform:translateX(-50%); background:#000a; color:#fff; padding:.2rem .7rem; border-radius:8px; font-size:.8rem; z-index:2 }
 .lbcount[hidden] { display:none }
-.body { margin:1rem auto 0; max-width:720px; color:var(--subtext1) }
+.body { margin:1rem auto 0; max-width:720px; color:var(--subtext1); white-space:pre-wrap; overflow-wrap:anywhere }
+.reportbox { max-width:720px; margin:1.2rem auto 0 }
+.reportbox summary { cursor:pointer; color:var(--subtext0); font-size:.85rem; list-style:none }
+.reportbox form { display:flex; gap:.5rem; align-items:center; flex-wrap:wrap; margin-top:.6rem }
+.reportbox select { padding:.35rem .6rem; border-radius:8px; background:var(--surface0); color:var(--text); border:1px solid var(--surface1) }
+.reportbox button { padding:.35rem .7rem; border-radius:8px; background:var(--accent); color:var(--crust); border:none; cursor:pointer; font-weight:600 }
+.reported { max-width:720px; margin:1.2rem auto 0; color:#a6e3a1; font-size:.9rem }
+.hp { position:absolute; left:-9999px; width:1px; height:1px; opacity:0 }
+li.report.csam { border-left:3px solid var(--red); padding-left:.6rem }
 .body img { max-width:100%; border-radius:10px }
 
 .foot { border-top:1px solid var(--surface0); margin-top:2.5rem; padding:2rem 1.1rem }
@@ -2082,7 +2409,42 @@ for (const el of document.querySelectorAll('.carousel')) {
 #[cfg(test)]
 mod tests {
     use super::{build_feed, endangered_item, feed_item, pretty_date};
+    use super::{report_token, verify_report_token, ReportLimiter, REPORT_WINDOW_SECS};
     use crate::db::{EndangeredRow, ManifestRow};
+
+    #[test]
+    fn report_token_round_trips_within_window() {
+        let t = report_token("patreon", "c1", "p1", 1_000);
+        assert!(verify_report_token("patreon", "c1", "p1", &t, 1_010));
+    }
+
+    #[test]
+    fn report_token_rejects_too_fast_and_too_old() {
+        let t = report_token("patreon", "c1", "p1", 1_000);
+        assert!(!verify_report_token("patreon", "c1", "p1", &t, 1_001));
+        assert!(!verify_report_token("patreon", "c1", "p1", &t, 5_000));
+    }
+
+    #[test]
+    fn report_token_is_bound_to_the_post() {
+        let t = report_token("patreon", "c1", "p1", 1_000);
+        assert!(!verify_report_token("patreon", "c1", "p2", &t, 1_010));
+        assert!(!verify_report_token("patreon", "c2", "p1", &t, 1_010));
+    }
+
+    #[test]
+    fn report_token_rejects_garbage() {
+        assert!(!verify_report_token("patreon", "c1", "p1", "not-a-token", 1_010));
+        assert!(!verify_report_token("patreon", "c1", "p1", "1000.zzzz", 1_010));
+    }
+
+    #[test]
+    fn report_limiter_caps_per_post_then_resets() {
+        let lim = ReportLimiter::default();
+        let first: Vec<bool> = (0..5).map(|_| lim.allow("iphash", "post", 1_000)).collect();
+        assert_eq!(first, vec![true, true, true, false, false]);
+        assert!(lim.allow("iphash", "post", 1_000 + REPORT_WINDOW_SECS));
+    }
 
     #[test]
     fn formats_iso_dates_and_passes_junk_through() {
