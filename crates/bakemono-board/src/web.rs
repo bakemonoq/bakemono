@@ -1650,6 +1650,12 @@ main { max-width:1240px; margin:0 auto; padding:1.4rem 1.1rem 3rem }
 .cprev, .cnext { flex:none; width:44px; height:44px; border-radius:50%; border:1px solid var(--surface1); background:var(--surface0); color:var(--text); display:grid; place-items:center; cursor:pointer }
 .cprev:hover, .cnext:hover { background:var(--accent); color:var(--crust); border-color:var(--accent) }
 .ccount { position:absolute; bottom:12px; left:50%; transform:translateX(-50%); background:#000a; color:#fff; padding:.15rem .65rem; border-radius:999px; font-size:.75rem }
+.lightbox { position:fixed; inset:0; z-index:100; background:#000e }
+.lightbox[hidden] { display:none }
+.lbstage { position:absolute; inset:0; overflow:auto; display:flex; align-items:safe center; justify-content:safe center }
+.lbimg { display:block; max-width:none; cursor:zoom-in; user-select:none; -webkit-user-drag:none }
+.lbclose { position:fixed; top:14px; right:16px; width:42px; height:42px; border-radius:50%; border:1px solid var(--surface1); background:#000a; color:#fff; display:grid; place-items:center; cursor:pointer }
+.lbclose:hover { background:var(--accent); color:var(--crust); border-color:var(--accent) }
 .body { margin:1rem auto 0; max-width:720px; color:var(--subtext1) }
 .body img { max-width:100%; border-radius:10px }
 
@@ -1694,9 +1700,52 @@ pre { white-space:pre-wrap; word-break:break-all; background:var(--mantle); bord
 ";
 
 const CAROUSEL_JS: &str = "
-// full media pulled from the gateway, one item at a time and only when first shown. each element is built
-// once and kept, so returning to an already-loaded item shows it instantly with no flicker; the fixed-size
-// stage shows a loading state only while an item is genuinely still fetching
+// lightbox: click a carousel image to open it fullscreen at real size. click toggles fit/100%, the wheel
+// zooms around the cursor, and drag pans - the way a raw image opens in the browser. built once, shared
+const lb = document.createElement('div'); lb.className = 'lightbox'; lb.hidden = true
+const lbstage = document.createElement('div'); lbstage.className = 'lbstage'
+const lbclose = document.createElement('button'); lbclose.className = 'lbclose'; lbclose.setAttribute('aria-label', 'Close')
+lbclose.innerHTML = `<svg viewBox='0 0 24 24' width='20' height='20' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round'><path d='M6 6l12 12M18 6L6 18'/></svg>`
+lb.append(lbstage, lbclose); document.body.appendChild(lb)
+let lbimg = null, natW = 0, natH = 0, scale = 1
+const fitScale = () => Math.min(window.innerWidth / natW, window.innerHeight / natH, 1)
+const centre = () => { lbstage.scrollLeft = (lbstage.scrollWidth - lbstage.clientWidth) / 2; lbstage.scrollTop = (lbstage.scrollHeight - lbstage.clientHeight) / 2 }
+const apply = (s) => { scale = Math.max(0.08, Math.min(s, 8)); if (lbimg) lbimg.style.width = (natW * scale) + 'px' }
+const openLightbox = (src) => {
+  const probe = new Image()
+  probe.onload = () => {
+    natW = probe.naturalWidth; natH = probe.naturalHeight
+    lbimg = document.createElement('img'); lbimg.className = 'lbimg'; lbimg.alt = ''; lbimg.src = src
+    lbstage.replaceChildren(lbimg)
+    lb.hidden = false; document.body.style.overflow = 'hidden'
+    apply(fitScale()); centre()
+  }
+  probe.src = src
+}
+const closeLightbox = () => { lb.hidden = true; lbstage.replaceChildren(); lbimg = null; document.body.style.overflow = '' }
+lbclose.addEventListener('click', closeLightbox)
+lb.addEventListener('click', (e) => { if (e.target === lb || e.target === lbstage) closeLightbox() })
+lbstage.addEventListener('click', (e) => { if (e.target === lbimg) { apply(Math.abs(scale - 1) < 0.01 ? fitScale() : 1); centre() } })
+lbstage.addEventListener('wheel', (e) => {
+  if (lb.hidden || !lbimg) return
+  e.preventDefault()
+  const rect = lbstage.getBoundingClientRect()
+  const ax = e.clientX - rect.left + lbstage.scrollLeft
+  const ay = e.clientY - rect.top + lbstage.scrollTop
+  const prev = scale
+  apply(scale * (e.deltaY < 0 ? 1.15 : 0.87))
+  const r = scale / prev
+  lbstage.scrollLeft = ax * r - (e.clientX - rect.left)
+  lbstage.scrollTop = ay * r - (e.clientY - rect.top)
+}, { passive: false })
+let drag = false, dx = 0, dy = 0, dl = 0, dt = 0
+lbstage.addEventListener('mousedown', (e) => { if (e.target !== lbimg) return; drag = true; dx = e.clientX; dy = e.clientY; dl = lbstage.scrollLeft; dt = lbstage.scrollTop; e.preventDefault() })
+window.addEventListener('mousemove', (e) => { if (!drag) return; lbstage.scrollLeft = dl - (e.clientX - dx); lbstage.scrollTop = dt - (e.clientY - dy) })
+window.addEventListener('mouseup', () => { drag = false })
+window.addEventListener('keydown', (e) => { if (!lb.hidden && e.key === 'Escape') closeLightbox() })
+
+// full media pulled from the gateway, built once per item and kept, so returning to an already-loaded item
+// shows it instantly with no flicker; the fixed-size stage shows a loading state only while still fetching
 for (const el of document.querySelectorAll('.carousel')) {
   let items = []
   try { items = JSON.parse(el.dataset.items || '[]') } catch (e) {}
@@ -1722,7 +1771,7 @@ for (const el of document.querySelectorAll('.carousel')) {
     const it = items[idx]
     let n
     if (it.v) { n = document.createElement('video'); n.controls = true; n.preload = 'metadata' }
-    else { n = new Image(); n.alt = '' }
+    else { n = new Image(); n.alt = ''; n.style.cursor = 'zoom-in'; n.title = 'click to view full size'; n.addEventListener('click', () => openLightbox(it.u)) }
     n.className = 'cmedia'
     const settle = () => { if (cur === idx) render(idx) }
     if (it.v) n.onloadeddata = settle; else n.onload = settle
@@ -1740,6 +1789,7 @@ for (const el of document.querySelectorAll('.carousel')) {
   el.querySelector('.cnext')?.addEventListener('click', () => show(cur + 1))
   if (items.length > 1) {
     document.addEventListener('keydown', (e) => {
+      if (!lb.hidden) return
       if (e.key === 'ArrowLeft') show(cur - 1)
       else if (e.key === 'ArrowRight') show(cur + 1)
     })
