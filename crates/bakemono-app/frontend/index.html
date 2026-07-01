@@ -230,8 +230,6 @@
       <textarea id="relays"></textarea>
       <label>trackers (one per line)</label>
       <textarea id="trackers"></textarea>
-      <label>STUN servers (one per line)</label>
-      <textarea id="stun"></textarea>
       <div class="row">
         <div>
           <label>max upload (Mbit/s, 0 = unlimited)</label>
@@ -244,14 +242,10 @@
       </div>
       <label>sidecar binaries (optional; blank = bundled, then PATH)</label>
       <p class="hint">point the daemon at machine binaries; an exported BAKEMONO_* var still wins</p>
-      <label>node binary</label>
-      <input id="nodeBin" type="text" placeholder="e.g. /opt/homebrew/bin/node">
       <label>ffmpeg binary</label>
       <input id="ffmpegBin" type="text" placeholder="ffmpeg">
       <label>gallery-dl binary</label>
       <input id="galleryDlBin" type="text" placeholder="gallery-dl">
-      <label>webtorrent seed.mjs</label>
-      <input id="webtorrentScript" type="text" placeholder="sidecars/webtorrent/seed.mjs">
       <div class="actions"><button id="saveSettings" class="primary">Save</button></div>
       <p class="hint">saving restarts the daemon so the new settings take effect</p>
     </details>

@@ -79,13 +79,10 @@ async function refreshConfig() {
   const cfg = await invoke('get_config')
   $('relays').value = cfg.relays.join('\n')
   $('trackers').value = cfg.trackers.join('\n')
-  $('stun').value = cfg.stun.join('\n')
   $('maxUp').value = cfg.max_up_mbit
   $('maxDown').value = cfg.max_down_mbit
-  $('nodeBin').value = cfg.node_bin || ''
   $('ffmpegBin').value = cfg.ffmpeg_bin || ''
   $('galleryDlBin').value = cfg.gallery_dl_bin || ''
-  $('webtorrentScript').value = cfg.webtorrent_script || ''
   $('stopOnExit').checked = !!cfg.stop_daemon_on_exit
 }
 
@@ -167,16 +164,13 @@ $('exp').onclick = async () => {
 $('saveSettings').onclick = async () => {
   const relays = lines('relays')
   const trackers = lines('trackers')
-  const stun = lines('stun')
   const maxUpMbit = Number($('maxUp').value) || 0
   const maxDownMbit = Number($('maxDown').value) || 0
-  const nodeBin = $('nodeBin').value.trim() || null
   const ffmpegBin = $('ffmpegBin').value.trim() || null
   const galleryDlBin = $('galleryDlBin').value.trim() || null
-  const webtorrentScript = $('webtorrentScript').value.trim() || null
   await invoke('save_settings', {
-    relays, trackers, stun, maxUpMbit, maxDownMbit,
-    nodeBin, ffmpegBin, galleryDlBin, webtorrentScript,
+    relays, trackers, maxUpMbit, maxDownMbit,
+    ffmpegBin, galleryDlBin,
   })
   log(`saved settings; restarting daemon`)
   applyToDaemon()
