@@ -7,5 +7,4 @@ bk-dl/
 *.nsec
 *cookies*.txt
 nostr.db*
-tools/webtorrent.min.js
 .idea/
