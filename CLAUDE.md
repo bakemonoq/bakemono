@@ -95,3 +95,4 @@ Minimal, like a human jotting a quick note mid-work:
 - `docs/PROTOCOL.md` - Nostr event kinds, tag schema, signing, relay protocol
 - `docs/GLOSSARY.md` - terminology cheat sheet
 - `docs/ROADMAP.md` - what comes after MVP
+- `docs/SEEDING.md` - the board seed feed, scoped feeds, and full-mirror backfill

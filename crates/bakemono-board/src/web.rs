@@ -37,7 +37,9 @@ impl FromRef<AppState> for PgPool {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(home))
+        .route("/feed.xml", get(seed_feed))
         .route("/contribute", get(contribute))
+        .route("/keepers", get(keepers))
         .route("/info", get(info_page))
         .route("/c/{platform}/{creator_id}", get(creator_page))
         .route("/p/{platform}/{creator_id}/{post_id}", get(post_page))
@@ -110,6 +112,217 @@ struct HomeQuery {
     q: Option<String>,
 }
 
+// standard torrent RSS: point a client's auto-download rule (qBittorrent, Deluge, ruTorrent) at this and it
+// adds + seeds every new magnet, so any commodity client can help keep content alive with no bakemono software
+const DEFAULT_FEED: i64 = 200;
+const MAX_FEED: i64 = 1000;
+
+async fn seed_feed(
+    State(pool): State<PgPool>,
+    Query(q): Query<FeedQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let base = base_url(&headers);
+    let limit = q.limit.unwrap_or(DEFAULT_FEED).clamp(1, MAX_FEED);
+    let (self_href, next_href, items_xml) = if q.sort.as_deref() == Some("endangered") {
+        endangered_feed(&pool, &base, limit).await
+    } else {
+        catalog_feed(&pool, &base, limit, &q).await
+    };
+    let xml = build_feed(&base, &self_href, next_href.as_deref(), &items_xml);
+    (
+        [(header::CONTENT_TYPE, "application/rss+xml; charset=utf-8")],
+        xml,
+    )
+        .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct FeedQuery {
+    limit: Option<i64>,
+    before: Option<i64>,
+    sort: Option<String>,
+    platform: Option<String>,
+    creator: Option<String>,
+    post: Option<String>,
+    npub: Option<String>,
+}
+
+impl FeedQuery {
+    fn scope(&self) -> db::FeedScope {
+        db::FeedScope {
+            platform: self.platform.clone(),
+            creator_id: self.creator.clone(),
+            post_id: self.post.clone(),
+            // accept hex or npub; a malformed key filters to nothing rather than 500ing
+            pubkey: self
+                .npub
+                .as_deref()
+                .map(|s| PublicKey::parse(s).map(|p| p.to_hex()).unwrap_or_default()),
+        }
+    }
+}
+
+// the default feed: newest torrents in this scope, with a cursor so a mirror can page back through it all
+async fn catalog_feed(
+    pool: &PgPool,
+    base: &str,
+    limit: i64,
+    q: &FeedQuery,
+) -> (String, Option<String>, String) {
+    let scope = q.scope();
+    let scope_qs = scope_query(&scope);
+    let rows = db::feed(pool, limit, q.before, &scope).await.unwrap_or_default();
+    let items = rows.iter().map(|m| feed_item(base, m)).collect();
+    let self_href = format!("{base}/feed.xml?limit={limit}{scope_qs}");
+    // a full page means older torrents remain: hand out the cursor to the next page of this same slice
+    let next = (rows.len() as i64 == limit)
+        .then(|| rows.last())
+        .flatten()
+        .map(|last| format!("{base}/feed.xml?before={}&limit={limit}{scope_qs}", last.created_at));
+    (self_href, next, items)
+}
+
+// the keeper work list: fewest-seeded torrents first. no cursor - it is a priority list, not a full mirror
+async fn endangered_feed(pool: &PgPool, base: &str, limit: i64) -> (String, Option<String>, String) {
+    let rows = db::endangered(pool, limit).await.unwrap_or_default();
+    let items = rows.iter().map(|r| endangered_item(base, r)).collect();
+    (format!("{base}/feed.xml?sort=endangered&limit={limit}"), None, items)
+}
+
+// rebuild the active scope as a query suffix so the self and next links stay inside the same slice
+fn scope_query(scope: &db::FeedScope) -> String {
+    let mut qs = String::new();
+    let mut push = |key: &str, val: &Option<String>| {
+        if let Some(v) = val {
+            qs.push_str(&format!("&{key}={}", qs_encode(v)));
+        }
+    };
+    push("platform", &scope.platform);
+    push("creator", &scope.creator_id);
+    push("post", &scope.post_id);
+    push("npub", &scope.pubkey);
+    qs
+}
+
+fn build_feed(base: &str, self_href: &str, next_href: Option<&str>, items_xml: &str) -> String {
+    let board = board_name();
+    let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    out.push_str("<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\">\n<channel>\n");
+    out.push_str(&format!("<title>{} - seed feed</title>\n", xml_escape(&board)));
+    out.push_str(&format!("<link>{base}/</link>\n"));
+    out.push_str(&format!(
+        "<atom:link href=\"{}\" rel=\"self\" type=\"application/rss+xml\"/>\n",
+        xml_escape(self_href)
+    ));
+    out.push_str("<description>Torrents to seed. Point your BitTorrent client's RSS auto-download at this feed to help keep content online; follow the next link to page through the whole catalog</description>\n");
+    if let Some(next) = next_href {
+        out.push_str(&format!(
+            "<atom:link rel=\"next\" href=\"{}\"/>\n",
+            xml_escape(next)
+        ));
+    }
+    out.push_str(items_xml);
+    out.push_str("</channel>\n</rss>\n");
+    out
+}
+
+fn feed_item(base: &str, m: &db::ManifestRow) -> String {
+    let guid = m.infohash.clone().unwrap_or_else(|| m.event_id.clone());
+    feed_item_xml(
+        base, &m.platform, &m.creator_id, &m.post_id, &m.creator,
+        &item_label(m.post_title.as_deref(), m.filename.as_deref(), &m.post_id),
+        &guid, m.created_at, &m.magnet, m.size, None,
+    )
+}
+
+fn endangered_item(base: &str, r: &db::EndangeredRow) -> String {
+    let guid = r.infohash.clone().unwrap_or_else(|| r.event_id.clone());
+    let note = r.seeders.map(|s| format!("{s} seeder(s)"));
+    feed_item_xml(
+        base, &r.platform, &r.creator_id, &r.post_id, &r.creator,
+        &item_label(r.post_title.as_deref(), r.filename.as_deref(), &r.post_id),
+        &guid, r.created_at, &r.magnet, r.size, note.as_deref(),
+    )
+}
+
+fn item_label(post_title: Option<&str>, filename: Option<&str>, post_id: &str) -> String {
+    post_title
+        .or(filename)
+        .unwrap_or(post_id)
+        .to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn feed_item_xml(
+    base: &str,
+    platform: &str,
+    creator_id: &str,
+    post_id: &str,
+    creator: &str,
+    label: &str,
+    guid: &str,
+    created_at: i64,
+    magnet: &str,
+    size: i64,
+    note: Option<&str>,
+) -> String {
+    let title = xml_escape(&format!("{creator} - {label}"));
+    let link = format!("{base}/p/{platform}/{creator_id}/{post_id}");
+    let desc = note
+        .map(|n| format!("<description>{}</description>\n", xml_escape(n)))
+        .unwrap_or_default();
+    format!(
+        "<item>\n<title>{title}</title>\n<link>{link}</link>\n{desc}\
+         <guid isPermaLink=\"false\">{guid}</guid>\n<pubDate>{}</pubDate>\n\
+         <enclosure url=\"{}\" length=\"{}\" type=\"application/x-bittorrent\"/>\n</item>\n",
+        rfc822(created_at),
+        xml_escape(magnet),
+        size,
+    )
+}
+
+// absolute links for feed readers: honor the proxy's forwarded scheme (Cloudflare sets it), else assume http
+fn base_url(headers: &HeaderMap) -> String {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost");
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("http");
+    format!("{proto}://{host}")
+}
+
+fn rfc822(unix_secs: i64) -> String {
+    match chrono::DateTime::from_timestamp(unix_secs, 0) {
+        Some(dt) => dt.to_rfc2822(),
+        None => String::new(),
+    }
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn qs_encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 async fn contribute() -> Html<String> {
     render(
         "contribute",
@@ -157,6 +370,74 @@ fn download_buttons() -> Markup {
             }
         }
     }
+}
+
+async fn keepers(State(state): State<AppState>, headers: HeaderMap) -> Html<String> {
+    let base = base_url(&headers);
+    let feed = format!("{base}/feed.xml");
+    let backfill = format!(
+        "curl -s \"{feed}?limit=1000\" \\\n  | grep -oE 'magnet:[^\"]+' | sed 's/&amp;/\\&/g'"
+    );
+    let endangered = db::endangered(&state.pool, 30).await.unwrap_or_default();
+    render(
+        "keepers",
+        html! {
+            h2 { "Become a keeper" }
+            p { "Every file here lives in a BitTorrent swarm, not on the board. When the last person seeding a file goes offline, that file is gone. Keepers are volunteers who adopt part of the archive and keep seeding it, so nothing rests on one machine. The model is borrowed from RuTracker's keepers" }
+            p.muted { "No Bakemono software needed. Any BitTorrent client - qBittorrent, Deluge, Transmission - can seed. The board publishes a feed of what to seed and your client does the rest" }
+
+            ol.steps {
+                li.step {
+                    h3 { "Pick what to keep" }
+                    p { "Seed the whole board, or just the creators you care about. The feed is:" }
+                    p { code { (feed) } }
+                    p { "Narrow it to adopt one slice:" }
+                    ul {
+                        li { code { (format!("{feed}?platform=patreon&creator=<id>")) } " - one creator" }
+                        li { code { (format!("{feed}?npub=<npub>")) } " - one contributor" }
+                        li { code { (format!("{feed}?sort=endangered")) } " - whatever is closest to dying" }
+                    }
+                }
+                li.step {
+                    h3 { "Point your client at it" }
+                    p { "In qBittorrent: View -> RSS, add the feed URL, then add an auto-download rule that matches everything. Deluge uses the YaRSS2 plugin, ruTorrent has an RSS plugin. Your client then adds and seeds every new torrent on its own" }
+                }
+                li.step {
+                    h3 { "Mirror everything (optional)" }
+                    p { "Auto-download only catches torrents added from now on. To back-fill the whole archive, walk the feed and hand the magnets to your client:" }
+                    pre { code { (backfill) } }
+                    p.muted {
+                        "Robust walker and per-client setup: "
+                        a href=(format!("{REPO}/blob/main/docs/SEEDING.md")) { "docs/SEEDING.md" }
+                    }
+                }
+                li.step {
+                    h3 { "Leave it seeding" }
+                    p { "That is the whole job. The longer your client stays online, the more resilient the archive. Seeder counts are shown below so you can see where help is needed" }
+                }
+            }
+
+            h2 { "Endangered now" }
+            @if endangered.is_empty() {
+                p.muted { "Seeder counts are still being gathered, or everything is healthy. Check back soon" }
+            } @else {
+                p.muted { "Fewest seeders first - adopt these before they vanish" }
+                ul.list {
+                    @for e in &endangered {
+                        li {
+                            a href=(format!("/p/{}/{}/{}", e.platform, e.creator_id, e.post_id)) {
+                                (item_label(e.post_title.as_deref(), e.filename.as_deref(), &e.post_id))
+                            }
+                            span.muted { " " (e.creator) " - " (e.seeders.unwrap_or(0)) " seeder(s) " }
+                            a href=(e.magnet) { "magnet" }
+                            " "
+                            a href=(format!("/feed.xml?platform={}&creator={}", qs_encode(&e.platform), qs_encode(&e.creator_id))) { "adopt creator" }
+                        }
+                    }
+                }
+            }
+        },
+    )
 }
 
 async fn info_page(State(state): State<AppState>) -> Html<String> {
@@ -787,6 +1068,7 @@ fn render(title: &str, body: Markup) -> Html<String> {
                     meta charset="utf-8";
                     meta name="viewport" content="width=device-width, initial-scale=1";
                     title { (tab) }
+                    link rel="alternate" type="application/rss+xml" title="seed feed" href="/feed.xml";
                     style { (PreEscaped(STYLE)) }
                 }
                 body {
@@ -795,6 +1077,7 @@ fn render(title: &str, body: Markup) -> Html<String> {
                         nav {
                             a href="/" { "Browse" }
                             a href="/contribute" { "Contribute" }
+                            a href="/keepers" { "Keepers" }
                             a href="/info" { "Info" }
                         }
                     }
@@ -851,6 +1134,7 @@ nav a { text-decoration: none }
 .stat .num { font-size: 1.6rem; font-weight: 700 }
 .stat .label { color: #8888; font-size: .85em }
 code { word-break: break-all; font-size: .85em }
+pre { white-space: pre-wrap; word-break: break-all; background: #8881; padding: .6rem .8rem; border-radius: 6px }
 a { color: #4488ff }
 ";
 
@@ -888,12 +1172,91 @@ for (const el of document.querySelectorAll('.media')) {
 
 #[cfg(test)]
 mod tests {
-    use super::pretty_date;
+    use super::{build_feed, endangered_item, feed_item, pretty_date};
+    use crate::db::{EndangeredRow, ManifestRow};
 
     #[test]
     fn formats_iso_dates_and_passes_junk_through() {
         assert_eq!(pretty_date("2026-06-23T17:46:49.000+00:00"), "Jun 23, 2026");
         assert_eq!(pretty_date("2026-01-03 10:00:00"), "Jan 3, 2026");
         assert_eq!(pretty_date("whenever"), "whenever");
+    }
+
+    #[test]
+    fn item_emits_magnet_enclosure_and_escapes() {
+        let xml = feed_item("https://board.example", &row("evt", 1_700_000_000));
+        assert!(xml.contains("<link>https://board.example/p/patreon/c1/p1</link>"));
+        assert!(xml.contains("url=\"magnet:?xt=urn:btih:abc&amp;tr=udp://t\""));
+        assert!(xml.contains("type=\"application/x-bittorrent\""));
+        // no infohash -> guid falls back to the event id
+        assert!(xml.contains("<guid isPermaLink=\"false\">evt</guid>"));
+        assert!(xml.contains("Foo &amp; Bar"));
+    }
+
+    #[test]
+    fn endangered_item_carries_seeder_note() {
+        let xml = endangered_item(
+            "https://board.example",
+            &EndangeredRow {
+                platform: "patreon".into(),
+                creator_id: "c1".into(),
+                post_id: "p1".into(),
+                creator: "C".into(),
+                post_title: Some("Hi".into()),
+                filename: None,
+                magnet: "magnet:?xt=urn:btih:abc".into(),
+                infohash: Some("abc".into()),
+                event_id: "evt".into(),
+                created_at: 10,
+                size: 1,
+                seeders: Some(2),
+            },
+        );
+        assert!(xml.contains("<description>2 seeder(s)</description>"));
+        // the infohash is the stable guid when present
+        assert!(xml.contains("<guid isPermaLink=\"false\">abc</guid>"));
+    }
+
+    #[test]
+    fn build_feed_wraps_self_and_next_links() {
+        let items = feed_item("https://board.example", &row("evt", 10));
+        let next = "https://board.example/feed.xml?before=10&limit=3&creator=xyz";
+        let xml = build_feed(
+            "https://board.example",
+            "https://board.example/feed.xml?limit=3&creator=xyz",
+            Some(next),
+            &items,
+        );
+        assert!(xml.contains("rel=\"self\""));
+        // the cursor href is xml-escaped so its & separators do not break the feed
+        assert!(xml.contains(
+            "rel=\"next\" href=\"https://board.example/feed.xml?before=10&amp;limit=3&amp;creator=xyz\""
+        ));
+        assert!(xml.contains("<guid isPermaLink=\"false\">evt</guid>"));
+    }
+
+    fn row(event_id: &str, created_at: i64) -> ManifestRow {
+        ManifestRow {
+            event_id: event_id.into(),
+            pubkey: "pk".into(),
+            created_at,
+            d_tag: "d".into(),
+            file_hash: "h".into(),
+            size: 4096,
+            mime: "image/jpeg".into(),
+            magnet: "magnet:?xt=urn:btih:abc&tr=udp://t".into(),
+            platform: "patreon".into(),
+            creator: "Foo & Bar".into(),
+            creator_id: "c1".into(),
+            post_id: "p1".into(),
+            file_index: 0,
+            filename: None,
+            post_title: Some("Hi".into()),
+            posted_at: None,
+            tier: None,
+            content: "body".into(),
+            thumb: None,
+            infohash: None,
+        }
     }
 }

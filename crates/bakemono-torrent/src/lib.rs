@@ -1,3 +1,6 @@
+mod scrape;
+pub use scrape::scrape_seeders;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;

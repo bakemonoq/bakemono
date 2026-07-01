@@ -1,4 +1,5 @@
 mod db;
+mod health;
 mod indexer;
 mod instance;
 mod web;
@@ -38,6 +39,9 @@ async fn main() -> Result<()> {
             tracing::error!("indexer stopped: {e:#}");
         }
     });
+
+    let health_pool = pool.clone();
+    tokio::spawn(health::run(health_pool, bakemono_core::default_trackers()));
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!("board on http://{bind}");

@@ -201,6 +201,108 @@ pub async fn post_files(
     Ok(rows)
 }
 
+// optional narrowing of the seed feed so a keeper can subscribe to just one creator/post/contributor
+#[derive(Default)]
+pub struct FeedScope {
+    pub platform: Option<String>,
+    pub creator_id: Option<String>,
+    pub post_id: Option<String>,
+    pub pubkey: Option<String>,
+}
+
+// seed feed: one row per distinct torrent (infohash), newest first, `before` is a created_at cursor so a
+// seedbox can page back through the whole catalog instead of only catching the newest window
+pub async fn feed(
+    pool: &PgPool,
+    limit: i64,
+    before: Option<i64>,
+    scope: &FeedScope,
+) -> Result<Vec<ManifestRow>> {
+    let rows = sqlx::query_as::<_, ManifestRow>(
+        "SELECT * FROM (
+             SELECT DISTINCT ON (infohash) * FROM visible_manifests
+             WHERE infohash IS NOT NULL
+               AND ($2::bigint IS NULL OR created_at < $2)
+               AND ($3::text IS NULL OR platform = $3)
+               AND ($4::text IS NULL OR creator_id = $4)
+               AND ($5::text IS NULL OR post_id = $5)
+               AND ($6::text IS NULL OR pubkey = $6)
+             ORDER BY infohash, created_at DESC
+         ) t ORDER BY created_at DESC, event_id DESC LIMIT $1",
+    )
+    .bind(limit)
+    .bind(before)
+    .bind(&scope.platform)
+    .bind(&scope.creator_id)
+    .bind(&scope.post_id)
+    .bind(&scope.pubkey)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+// distinct torrents the health prober is responsible for, so it can size each batch to cover them all
+// within the recheck window instead of a fixed guess
+pub async fn health_catalog_size(pool: &PgPool) -> Result<i64> {
+    let n = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(DISTINCT infohash) FROM visible_manifests WHERE infohash IS NOT NULL",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
+}
+
+// visible torrents whose seeder count is unknown or gone stale, least-recently-checked first, so the
+// health prober keeps every torrent's count fresh without re-scraping the whole catalog each pass
+pub async fn health_batch(pool: &PgPool, limit: i64, recheck_after: i64) -> Result<Vec<String>> {
+    let rows = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT m.infohash
+         FROM visible_manifests m
+         LEFT JOIN torrent_health h ON h.infohash = m.infohash
+         WHERE m.infohash IS NOT NULL
+           AND (h.checked_at IS NULL OR h.checked_at < EXTRACT(EPOCH FROM now())::bigint - $2)
+         ORDER BY m.infohash
+         LIMIT $1",
+    )
+    .bind(limit)
+    .bind(recheck_after)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+pub async fn record_health(pool: &PgPool, infohash: &str, seeders: i32) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO torrent_health (infohash, seeders, checked_at)
+         VALUES ($1, $2, EXTRACT(EPOCH FROM now())::bigint)
+         ON CONFLICT (infohash) DO UPDATE SET seeders = EXCLUDED.seeders, checked_at = EXCLUDED.checked_at",
+    )
+    .bind(infohash)
+    .bind(seeders)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// probed torrents ordered by fewest seeders first: the keeper work list. only rows with a known count,
+// so a not-yet-probed catalog shows an empty list rather than a misleading one
+pub async fn endangered(pool: &PgPool, limit: i64) -> Result<Vec<EndangeredRow>> {
+    let rows = sqlx::query_as::<_, EndangeredRow>(
+        "SELECT * FROM (
+             SELECT DISTINCT ON (m.infohash)
+                    m.platform, m.creator_id, m.post_id, m.creator, m.post_title, m.filename,
+                    m.magnet, m.infohash, m.event_id, m.created_at, m.size, h.seeders
+             FROM visible_manifests m
+             JOIN torrent_health h ON h.infohash = m.infohash
+             ORDER BY m.infohash, m.created_at DESC
+         ) t ORDER BY seeders ASC, created_at DESC LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 pub async fn recent(pool: &PgPool, limit: i64) -> Result<Vec<ManifestRow>> {
     let rows = sqlx::query_as::<_, ManifestRow>(
         "SELECT * FROM (
@@ -402,6 +504,22 @@ pub struct PostRow {
 }
 
 #[derive(sqlx::FromRow)]
+pub struct EndangeredRow {
+    pub platform: String,
+    pub creator_id: String,
+    pub post_id: String,
+    pub creator: String,
+    pub post_title: Option<String>,
+    pub filename: Option<String>,
+    pub magnet: String,
+    pub infohash: Option<String>,
+    pub event_id: String,
+    pub created_at: i64,
+    pub size: i64,
+    pub seeders: Option<i32>,
+}
+
+#[derive(sqlx::FromRow)]
 #[allow(dead_code)]
 pub struct ManifestRow {
     pub event_id: String,
@@ -476,6 +594,13 @@ CREATE INDEX IF NOT EXISTS pubkeys_status ON pubkeys (status);
 INSERT INTO pubkeys (pubkey, status, first_seen)
 SELECT pubkey, 'pending', MIN(created_at) FROM manifests GROUP BY pubkey
 ON CONFLICT (pubkey) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS torrent_health (
+    infohash   TEXT PRIMARY KEY,
+    seeders    INTEGER NOT NULL,
+    checked_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS torrent_health_checked ON torrent_health (checked_at);
 
 CREATE TABLE IF NOT EXISTS takedowns (
     d_tag       TEXT PRIMARY KEY,
