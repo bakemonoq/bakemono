@@ -919,16 +919,17 @@ fn nav_btn(
     tip: Option<&str>,
     is_prev: bool,
 ) -> Markup {
-    let (icon, label) = if is_prev { (ICON_PREV, "Prev") } else { (ICON_NEXT, "Next") };
+    let (icon, fallback) = if is_prev { (ICON_PREV, "Prev") } else { (ICON_NEXT, "Next") };
+    let label = tip.unwrap_or(fallback);
     html! {
         @match target {
             Some(id) => a.pnav href=(format!("/p/{platform}/{creator_id}/{id}")) title=[tip] {
-                @if is_prev { (PreEscaped(icon)) span { (label) } }
-                @else { span { (label) } (PreEscaped(icon)) }
+                @if is_prev { (PreEscaped(icon)) span.ptitle { (label) } }
+                @else { span.ptitle { (label) } (PreEscaped(icon)) }
             }
             None => span.pnav.off {
-                @if is_prev { (PreEscaped(icon)) span { (label) } }
-                @else { span { (label) } (PreEscaped(icon)) }
+                @if is_prev { (PreEscaped(icon)) span.ptitle { (label) } }
+                @else { span.ptitle { (label) } (PreEscaped(icon)) }
             }
         }
     }
@@ -1639,8 +1640,10 @@ main { max-width:1240px; margin:0 auto; padding:1.4rem 1.1rem 3rem }
 .posttitle { margin:0; font-size:1.4rem; overflow-wrap:anywhere }
 .postmeta { margin:.2rem 0 0; color:var(--subtext0) }
 .postmeta a { color:var(--subtext1); font-weight:600 }
-.pnav { flex:none; display:inline-flex; align-items:center; gap:.35rem; color:var(--subtext1); font-weight:600;
-  background:var(--surface0); border:1px solid var(--surface1); padding:.45rem .7rem; border-radius:10px; white-space:nowrap }
+.pnav { flex:none; max-width:22%; display:inline-flex; align-items:center; gap:.35rem; color:var(--subtext1); font-weight:600;
+  background:var(--surface0); border:1px solid var(--surface1); padding:.45rem .7rem; border-radius:10px }
+.pnav svg { flex:none }
+.pnav .ptitle { overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
 .pnav:hover { border-color:var(--accent); text-decoration:none }
 .pnav.off { visibility:hidden }
 .carousel { position:relative; display:flex; align-items:center; justify-content:center; gap:.6rem; margin:.4rem auto 1.4rem; max-width:960px }
@@ -1654,8 +1657,16 @@ main { max-width:1240px; margin:0 auto; padding:1.4rem 1.1rem 3rem }
 .lightbox[hidden] { display:none }
 .lbstage { position:absolute; inset:0; overflow:auto; display:flex; align-items:safe center; justify-content:safe center }
 .lbimg { display:block; max-width:none; cursor:zoom-in; user-select:none; -webkit-user-drag:none }
+.lbvideo { max-width:100%; max-height:100%; display:block }
 .lbclose { position:fixed; top:14px; right:16px; width:42px; height:42px; border-radius:50%; border:1px solid var(--surface1); background:#000a; color:#fff; display:grid; place-items:center; cursor:pointer }
 .lbclose:hover { background:var(--accent); color:var(--crust); border-color:var(--accent) }
+.lbnav { position:fixed; top:50%; transform:translateY(-50%); width:48px; height:48px; border-radius:50%; border:1px solid var(--surface1); background:#000a; color:#fff; display:grid; place-items:center; cursor:pointer; z-index:2 }
+.lbnav[hidden] { display:none }
+.lbprev { left:14px }
+.lbnext { right:14px }
+.lbnav:hover { background:var(--accent); color:var(--crust); border-color:var(--accent) }
+.lbcount { position:fixed; bottom:16px; left:50%; transform:translateX(-50%); background:#000a; color:#fff; padding:.2rem .7rem; border-radius:999px; font-size:.8rem; z-index:2 }
+.lbcount[hidden] { display:none }
 .body { margin:1rem auto 0; max-width:720px; color:var(--subtext1) }
 .body img { max-width:100%; border-radius:10px }
 
@@ -1700,30 +1711,56 @@ pre { white-space:pre-wrap; word-break:break-all; background:var(--mantle); bord
 ";
 
 const CAROUSEL_JS: &str = "
-// lightbox: click a carousel image to open it fullscreen at real size. click toggles fit/100%, the wheel
-// zooms around the cursor, and drag pans - the way a raw image opens in the browser. built once, shared
+// lightbox: click a carousel image to open it fullscreen. click toggles fit/100%, the wheel zooms around the
+// cursor, drag pans, and prev/next (buttons or arrow keys) walk the whole post at full size. built once, shared
 const lb = document.createElement('div'); lb.className = 'lightbox'; lb.hidden = true
 const lbstage = document.createElement('div'); lbstage.className = 'lbstage'
-const lbclose = document.createElement('button'); lbclose.className = 'lbclose'; lbclose.setAttribute('aria-label', 'Close')
-lbclose.innerHTML = `<svg viewBox='0 0 24 24' width='20' height='20' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round'><path d='M6 6l12 12M18 6L6 18'/></svg>`
-lb.append(lbstage, lbclose); document.body.appendChild(lb)
-let lbimg = null, natW = 0, natH = 0, scale = 1
+const mkbtn = (cls, label, svg) => { const btn = document.createElement('button'); btn.className = cls; btn.setAttribute('aria-label', label); btn.innerHTML = svg; return btn }
+const chevron = (d) => `<svg viewBox='0 0 24 24' width='26' height='26' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='${d}'/></svg>`
+const lbprev = mkbtn('lbnav lbprev', 'Previous', chevron('M15 18l-6-6 6-6'))
+const lbnext = mkbtn('lbnav lbnext', 'Next', chevron('M9 18l6-6-6-6'))
+const lbcount = document.createElement('div'); lbcount.className = 'lbcount'
+const lbclose = mkbtn('lbclose', 'Close', `<svg viewBox='0 0 24 24' width='20' height='20' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round'><path d='M6 6l12 12M18 6L6 18'/></svg>`)
+lb.append(lbstage, lbprev, lbnext, lbcount, lbclose); document.body.appendChild(lb)
+
+let lbItems = [], lbIdx = 0, lbSync = null, lbimg = null, natW = 0, natH = 0, scale = 1
+const lbCache = {}
 const fitScale = () => Math.min(window.innerWidth / natW, window.innerHeight / natH, 1)
 const centre = () => { lbstage.scrollLeft = (lbstage.scrollWidth - lbstage.clientWidth) / 2; lbstage.scrollTop = (lbstage.scrollHeight - lbstage.clientHeight) / 2 }
 const apply = (s) => { scale = Math.max(0.08, Math.min(s, 8)); if (lbimg) lbimg.style.width = (natW * scale) + 'px' }
-const openLightbox = (src) => {
-  const probe = new Image()
-  probe.onload = () => {
-    natW = probe.naturalWidth; natH = probe.naturalHeight
-    lbimg = document.createElement('img'); lbimg.className = 'lbimg'; lbimg.alt = ''; lbimg.src = src
-    lbstage.replaceChildren(lbimg)
-    lb.hidden = false; document.body.style.overflow = 'hidden'
-    apply(fitScale()); centre()
+const showImage = (img) => { natW = img.naturalWidth; natH = img.naturalHeight; lbimg = img; lbstage.replaceChildren(img); apply(fitScale()); centre() }
+const showLbItem = (idx) => {
+  lbIdx = (idx + lbItems.length) % lbItems.length
+  if (lbSync) lbSync(lbIdx)
+  lbcount.textContent = (lbIdx + 1) + ' / ' + lbItems.length
+  const it = lbItems[lbIdx]
+  lbimg = null
+  if (it.v) {
+    const v = document.createElement('video'); v.className = 'lbvideo'; v.controls = true; v.src = it.u
+    lbstage.replaceChildren(v)
+    return
   }
-  probe.src = src
+  const cached = lbCache[it.u]
+  if (cached && cached.complete && cached.naturalWidth > 0) { showImage(cached); return }
+  const load = document.createElement('div'); load.className = 'cload'; load.textContent = 'Loading...'
+  lbstage.replaceChildren(load)
+  const img = cached || new Image(); img.className = 'lbimg'; img.alt = ''
+  const at = lbIdx
+  img.onload = () => { if (at === lbIdx) showImage(img) }
+  img.onerror = () => { if (at === lbIdx) load.textContent = 'unavailable - no seeders online right now' }
+  if (!cached) { lbCache[it.u] = img; img.src = it.u }
+}
+const openLightbox = (items, idx, sync) => {
+  lbItems = items; lbSync = sync || null
+  const multi = items.length > 1
+  lbprev.hidden = !multi; lbnext.hidden = !multi; lbcount.hidden = !multi
+  lb.hidden = false; document.body.style.overflow = 'hidden'
+  showLbItem(idx)
 }
 const closeLightbox = () => { lb.hidden = true; lbstage.replaceChildren(); lbimg = null; document.body.style.overflow = '' }
 lbclose.addEventListener('click', closeLightbox)
+lbprev.addEventListener('click', (e) => { e.stopPropagation(); showLbItem(lbIdx - 1) })
+lbnext.addEventListener('click', (e) => { e.stopPropagation(); showLbItem(lbIdx + 1) })
 lb.addEventListener('click', (e) => { if (e.target === lb || e.target === lbstage) closeLightbox() })
 lbstage.addEventListener('click', (e) => { if (e.target === lbimg) { apply(Math.abs(scale - 1) < 0.01 ? fitScale() : 1); centre() } })
 lbstage.addEventListener('wheel', (e) => {
@@ -1742,7 +1779,12 @@ let drag = false, dx = 0, dy = 0, dl = 0, dt = 0
 lbstage.addEventListener('mousedown', (e) => { if (e.target !== lbimg) return; drag = true; dx = e.clientX; dy = e.clientY; dl = lbstage.scrollLeft; dt = lbstage.scrollTop; e.preventDefault() })
 window.addEventListener('mousemove', (e) => { if (!drag) return; lbstage.scrollLeft = dl - (e.clientX - dx); lbstage.scrollTop = dt - (e.clientY - dy) })
 window.addEventListener('mouseup', () => { drag = false })
-window.addEventListener('keydown', (e) => { if (!lb.hidden && e.key === 'Escape') closeLightbox() })
+window.addEventListener('keydown', (e) => {
+  if (lb.hidden) return
+  if (e.key === 'Escape') closeLightbox()
+  else if (e.key === 'ArrowLeft') showLbItem(lbIdx - 1)
+  else if (e.key === 'ArrowRight') showLbItem(lbIdx + 1)
+})
 
 // full media pulled from the gateway, built once per item and kept, so returning to an already-loaded item
 // shows it instantly with no flicker; the fixed-size stage shows a loading state only while still fetching
@@ -1771,7 +1813,7 @@ for (const el of document.querySelectorAll('.carousel')) {
     const it = items[idx]
     let n
     if (it.v) { n = document.createElement('video'); n.controls = true; n.preload = 'metadata' }
-    else { n = new Image(); n.alt = ''; n.style.cursor = 'zoom-in'; n.title = 'click to view full size'; n.addEventListener('click', () => openLightbox(it.u)) }
+    else { n = new Image(); n.alt = ''; n.style.cursor = 'zoom-in'; n.title = 'click to view full size'; n.addEventListener('click', () => openLightbox(items, idx, show)) }
     n.className = 'cmedia'
     const settle = () => { if (cur === idx) render(idx) }
     if (it.v) n.onloadeddata = settle; else n.onload = settle
