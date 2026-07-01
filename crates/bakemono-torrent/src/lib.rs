@@ -47,7 +47,7 @@ pub struct Gateway {
     session: Arc<Session>,
     // operator-pinned seeders tried directly, so a known seedbox works without waiting on tracker/DHT
     initial_peers: Vec<SocketAddr>,
-    cache: Cache,
+    cache: Arc<Cache>,
     // cap on resolving a cold torrent's metadata, so a request with no reachable peers fails instead of hanging
     fetch_timeout: Duration,
 }
@@ -59,7 +59,7 @@ impl Gateway {
         initial_peers: Vec<SocketAddr>,
         budget_bytes: u64,
     ) -> Result<Self> {
-        let cache = Cache::load(cache_dir.clone(), budget_bytes)?;
+        let cache = Arc::new(Cache::load(cache_dir.clone(), budget_bytes)?);
         let opts = SessionOptions {
             persistence: None,
             // reuse of the stored DHT port collides when several sessions run on one host; take a fresh port
@@ -76,12 +76,42 @@ impl Gateway {
                 .and_then(|s| s.trim().parse().ok())
                 .unwrap_or(20),
         );
-        Ok(Self {
+        let drop_idle_interval = Duration::from_secs(
+            std::env::var("BAKEMONO_DROP_IDLE_SECS")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(60),
+        );
+        let gateway = Self {
             session,
             initial_peers,
             cache,
             fetch_timeout,
-        })
+        };
+        gateway.spawn_drop_idle(drop_idle_interval);
+        Ok(gateway)
+    }
+
+    // a board that only ever leeches accumulates one librqbit torrent per post viewed; each keeps
+    // announcing to DHT/trackers forever. sweep completed downloads out of the session on a timer (their
+    // bytes stay on disk and serve from there), so the session only ever holds in-flight downloads
+    fn spawn_drop_idle(&self, interval: Duration) {
+        if interval.is_zero() {
+            return;
+        }
+        let session = Arc::downgrade(&self.session);
+        let cache = Arc::downgrade(&self.cache);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let (Some(session), Some(cache)) = (session.upgrade(), cache.upgrade()) else {
+                    break; // gateway dropped, stop sweeping
+                };
+                cache.drop_idle(&session).await;
+            }
+        });
     }
 
     pub async fn meta(&self, magnet: &str) -> Result<TorrentMeta> {
@@ -345,6 +375,41 @@ impl Cache {
         }
     }
 
+    // drop completed, idle torrents from the session while keeping their files, so the session tracks only
+    // in-flight downloads; a dropped entry then serves purely from disk via complete_file
+    async fn drop_idle(&self, session: &Session) {
+        let victims = self.idle_complete_victims();
+        let dropped = victims.len();
+        for (infohash, id) in victims {
+            let _ = session.delete(id, false).await; // false = keep the downloaded files
+            if let Some(e) = self.state.lock().unwrap().entries.get_mut(&infohash) {
+                e.id = None; // now pure disk cache; a later evict just removes the dir
+            }
+        }
+        if dropped > 0 {
+            tracing::info!(dropped, "released completed torrents from the session");
+        }
+    }
+
+    // entries that finished downloading (a .done marker), are still managed in the session, and have not
+    // been touched within the grace window, so no stream is mid-flight
+    fn idle_complete_victims(&self) -> Vec<(String, TorrentIdOrHash)> {
+        let now = SystemTime::now();
+        let st = self.state.lock().unwrap();
+        st.entries
+            .iter()
+            .filter_map(|(ih, e)| {
+                let id = e.id?;
+                let idle = now
+                    .duration_since(e.last)
+                    .map(|d| d > EVICT_GRACE)
+                    .unwrap_or(true);
+                let done = self.dir.join(ih).join(".done").is_file();
+                (idle && done).then_some((ih.clone(), id))
+            })
+            .collect()
+    }
+
     // startup-only: evict oldest dirs over budget without a session (nothing is managed yet)
     fn evict_cold(&self) {
         if self.budget == 0 {
@@ -565,6 +630,41 @@ mod tests {
         );
         assert!(m.starts_with("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"));
         assert!(m.contains("&tr=udp%3A%2F%2Ftracker.example%3A1337%2Fannounce"));
+    }
+
+    #[test]
+    fn drop_idle_picks_only_completed_idle_managed_entries() {
+        let base = std::env::temp_dir().join(format!("bmdropidle-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // load on an empty dir, then wire up entries by hand so the selection logic is isolated
+        let cache = Cache::load(base.clone(), 0).unwrap();
+        let id = TorrentIdOrHash::parse(&"a".repeat(40)).unwrap();
+        let stale = SystemTime::now() - EVICT_GRACE - Duration::from_secs(60);
+        let done = |ih: &str| {
+            let d = base.join(ih);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(".done"), b"").unwrap();
+        };
+        done("aaaa"); // done + managed + idle -> victim
+        done("bbbb"); // done + managed but fresh -> keep (stream may be live)
+        std::fs::create_dir_all(base.join("cccc")).unwrap(); // managed + idle but still downloading
+        done("dddd"); // done + idle but already unmanaged (id None)
+        {
+            let mut st = cache.state.lock().unwrap();
+            let e = |last, id| Entry { size: 0, last, id };
+            st.entries.insert("aaaa".into(), e(stale, Some(id)));
+            st.entries.insert("bbbb".into(), e(SystemTime::now(), Some(id)));
+            st.entries.insert("cccc".into(), e(stale, Some(id)));
+            st.entries.insert("dddd".into(), e(stale, None));
+        }
+        let victims: Vec<String> = cache
+            .idle_complete_victims()
+            .into_iter()
+            .map(|(ih, _)| ih)
+            .collect();
+        assert_eq!(victims, vec!["aaaa".to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
