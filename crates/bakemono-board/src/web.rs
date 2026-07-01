@@ -1659,7 +1659,7 @@ button,input,select { font:inherit }
 .topbar { position:sticky; top:0; z-index:20; display:flex; align-items:center; gap:1rem;
   padding:.6rem 1.1rem; background:color-mix(in srgb, var(--mantle) 92%, transparent);
   backdrop-filter:blur(10px); border-bottom:1px solid var(--surface0) }
-.brand { display:flex; align-items:center; gap:.5rem; font-weight:800; font-size:1.15rem; color:var(--text) }
+.brand { display:flex; align-items:center; gap:.5rem; font-weight:800; font-size:1.15rem; color:var(--text); white-space:nowrap }
 .brand:hover { text-decoration:none }
 .brandmascot { width:28px; height:28px; border-radius:7px; object-fit:cover }
 .searchgroup { flex:1; display:flex; align-items:center; justify-content:center; gap:.5rem }
@@ -1769,7 +1769,7 @@ main { max-width:1240px; margin:0 auto; padding:1.4rem 1.1rem 3rem }
 .ccount { position:absolute; bottom:12px; left:50%; transform:translateX(-50%); background:#000a; color:#fff; padding:.15rem .65rem; border-radius:8px; font-size:.75rem }
 .lightbox { position:fixed; inset:0; z-index:100; background:#000e }
 .lightbox[hidden] { display:none }
-.lbstage { position:absolute; inset:0; overflow:auto; display:flex; align-items:safe center; justify-content:safe center }
+.lbstage { position:absolute; inset:0; overflow:auto; -webkit-overflow-scrolling:touch; display:flex; align-items:safe center; justify-content:safe center }
 .lbimg { display:block; max-width:none; cursor:zoom-in; user-select:none; -webkit-user-drag:none }
 .lbvideo { max-width:100%; max-height:100%; display:block }
 .lbclose { position:fixed; top:14px; right:16px; width:42px; height:42px; border-radius:10px; border:1px solid var(--surface1); background:#000a; color:#fff; display:grid; place-items:center; cursor:pointer }
@@ -1820,13 +1820,41 @@ code { background:var(--surface0); padding:.1rem .35rem; border-radius:5px; word
 pre { white-space:pre-wrap; word-break:break-all; background:var(--mantle); border:1px solid var(--surface0); padding:.7rem .9rem; border-radius:10px }
 
 @media (max-width:720px) {
+  main { padding:1.1rem .8rem 2.5rem }
+  .pagetitle { font-size:1.35rem }
+  /* top bar: brand + nav on the first row, search full-width on the second */
+  .topbar { flex-wrap:wrap; gap:.5rem .6rem; padding:.55rem .7rem }
+  .brand { font-size:1rem }
+  .topbar nav { gap:.75rem }
   .topbar nav a span { display:none }
-  .topbar { gap:.6rem; padding:.6rem .8rem }
+  .searchgroup { order:3; flex-basis:100%; margin:0 }
+  .topsearch { flex:1; width:auto }
+  /* grids: more, smaller cards */
   .grid { grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:10px }
+  .grid.wide { grid-template-columns:repeat(auto-fill,minmax(150px,1fr)) }
+  /* filter bar: search on its own row, the two selects share the next row */
+  .filters { gap:.5rem }
+  .searchfield { flex-basis:100%; min-width:0 }
+  .filtersel { flex:1 }
+  .filtersel select { width:100% }
+  /* welcome + post header */
   .welcome { flex-direction:column; text-align:center }
   .mascot { width:120px }
+  .pnav { max-width:none }
   .pnav span { display:none }
   .posthead { gap:.5rem }
+  /* carousel: arrows overlay the image edges so it uses the full width */
+  .carousel { gap:0; max-width:100% }
+  .cstage { height:min(64vh,620px); border-radius:10px }
+  .cprev, .cnext { position:absolute; top:50%; transform:translateY(-50%); z-index:2; width:38px; height:38px; background:#000b; color:#fff; border-color:transparent }
+  .cprev { left:8px }
+  .cnext { right:8px }
+  .lbnav { width:42px; height:42px }
+  .soc, .footlinks a { font-size:.85rem }
+}
+
+@media (max-width:400px) {
+  .grid { grid-template-columns:repeat(2,1fr) }
 }
 ";
 
@@ -1905,6 +1933,16 @@ window.addEventListener('keydown', (e) => {
   else if (e.key === 'ArrowLeft') showLbItem(lbIdx - 1)
   else if (e.key === 'ArrowRight') showLbItem(lbIdx + 1)
 })
+// touch: a horizontal swipe navigates, but only when the image is not zoomed wider than the screen, so
+// panning a zoomed image (native scroll) is never hijacked
+let lsx = 0, lsy = 0
+lbstage.addEventListener('touchstart', (e) => { lsx = e.changedTouches[0].clientX; lsy = e.changedTouches[0].clientY }, { passive: true })
+lbstage.addEventListener('touchend', (e) => {
+  const dx = e.changedTouches[0].clientX - lsx, dy = e.changedTouches[0].clientY - lsy
+  if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5 && lbstage.scrollWidth <= lbstage.clientWidth + 2) {
+    showLbItem(lbIdx + (dx < 0 ? 1 : -1))
+  }
+}, { passive: true })
 
 // full media pulled from the gateway, built once per item and kept, so returning to an already-loaded item
 // shows it instantly with no flicker; the fixed-size stage shows a loading state only while still fetching
@@ -1955,6 +1993,12 @@ for (const el of document.querySelectorAll('.carousel')) {
       if (e.key === 'ArrowLeft') show(cur - 1)
       else if (e.key === 'ArrowRight') show(cur + 1)
     })
+    let sx = 0
+    el.addEventListener('touchstart', (e) => { sx = e.changedTouches[0].clientX }, { passive: true })
+    el.addEventListener('touchend', (e) => {
+      const dx = e.changedTouches[0].clientX - sx
+      if (Math.abs(dx) > 40) show(cur + (dx < 0 ? 1 : -1))
+    }, { passive: true })
   }
   if (items.length) show(0)
 }
