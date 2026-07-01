@@ -856,13 +856,11 @@ a { color: #4488ff }
 ";
 
 const THUMB_JS: &str = "
+// the full file is fetched only on click, never prefetched, so a page of thumbnails stays cheap.
+// the thumbnail stays visible under a loading overlay until the full lands, then swaps in
 for (const el of document.querySelectorAll('.media')) {
   const full = el.dataset.full
   const isVideo = el.dataset.video === '1'
-  // pull the full file in parallel with the thumbnail so a click is instant once it lands; video streams
-  // on demand via Range, so there is nothing to prefetch for it
-  let ready = isVideo
-  if (!isVideo) { const pre = new Image(); pre.onload = () => { ready = true }; pre.src = full }
   el.title = 'click to load the full file'
   el.addEventListener('click', () => {
     if (el.dataset.open) return
@@ -870,13 +868,13 @@ for (const el of document.querySelectorAll('.media')) {
     if (isVideo) {
       const v = document.createElement('video'); v.controls = true; v.autoplay = true; v.src = full
       el.replaceChildren(v)
-    } else {
-      const img = document.createElement('img'); img.alt = ''
-      if (!ready) el.classList.add('loading')
-      img.onload = () => el.classList.remove('loading')
-      img.src = full
-      el.replaceChildren(img)
+      return
     }
+    el.classList.add('loading')
+    const img = new Image(); img.alt = ''
+    img.onload = () => { el.classList.remove('loading'); el.replaceChildren(img) }
+    img.onerror = () => { el.classList.remove('loading'); el.dataset.open = '' }
+    img.src = full
   })
 }
 ";
