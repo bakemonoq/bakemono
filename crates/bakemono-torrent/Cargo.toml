@@ -1,0 +1,14 @@
+[package]
+name = "bakemono-torrent"
+description = "Classic BitTorrent engine wrapper: join swarms by magnet, stream files over byte ranges, seed local files"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+librqbit = "8"
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+serde = { version = "1", features = ["derive"] }
