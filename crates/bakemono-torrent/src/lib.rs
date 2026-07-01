@@ -189,7 +189,7 @@ impl Seeder {
         })
     }
 
-    // webtorrent mis-hashed pieces from odd source paths, so keep seeding a sanitized hardlink
+    // seed a sanitized hardlink so odd source filenames yield a clean, deterministic torrent name
     pub async fn seed(&self, file: &Path) -> Result<SeedInfo> {
         let staged = self.stage(file)?;
         let created = librqbit::create_torrent(

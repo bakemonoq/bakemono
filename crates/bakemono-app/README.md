@@ -5,7 +5,7 @@ Desktop client. A Tauri shell over a Tauri-free core (`src/core`):
 - `identity` - nsec gen/import/export, persisted
 - `config` - relay list + settings
 - `scrape` - gallery-dl output (media + `.json`) -> `Manifest`
-- `seeder` - long-lived webtorrent handle (one sidecar for the whole app)
+- `seeder` - long-lived librqbit seed session for the whole app
 - `library` - catalog of shared files (`library.json`), drives stats and re-seed
 - `pipeline` - the scrape/ingest -> seed -> sign -> publish flow, emitting `Progress`
 
@@ -21,7 +21,7 @@ cargo run -p bakemono-app
 
 The whole pipeline runs without the GUI via the `scrapetest` bin (gated behind the `harness` feature). It spins up an embedded relay, runs the core, then subscribes and verifies every published event round-trips.
 
-Ingest a local folder of media + `.json` sidecars and seed over WebTorrent:
+Ingest a local folder of media + `.json` sidecars and seed over BitTorrent:
 
 ```
 cargo run -p bakemono-app --no-default-features --features harness --bin scrapetest -- ingest out
@@ -34,4 +34,4 @@ cargo run -p bakemono-app --no-default-features --features harness --bin scrapet
   scrape <creator> --limit 5 --cookies patreon-cookies.txt
 ```
 
-Run from the workspace root so `out/` and `sidecars/webtorrent/seed.mjs` resolve. `BAKEMONO_NSEC` pins an identity; `--no-seed` skips the Node sidecar; `--limit N` caps to N posts
+Run from the workspace root so `out/` resolves. `BAKEMONO_NSEC` pins an identity; `--no-seed` skips seeding; `--limit N` caps to N posts

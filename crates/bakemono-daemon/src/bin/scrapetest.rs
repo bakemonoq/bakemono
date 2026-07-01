@@ -20,11 +20,6 @@ use bakemono_engine::ipc;
 async fn main() -> Result<()> {
     let opts = Opts::parse(std::env::args().skip(1).collect())?;
 
-    // keep webtorrent off DHT/LSD so the local test swarm stays clean
-    if std::env::var_os("BAKEMONO_ISOLATE").is_none() {
-        std::env::set_var("BAKEMONO_ISOLATE", "1");
-    }
-
     let mut config = AppConfig::default();
     config.seed = opts.seed;
     if !opts.trackers.is_empty() {
