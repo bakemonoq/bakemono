@@ -64,7 +64,8 @@ pub fn router(state: AppState) -> Router {
         .route("/mod/untakedown", post(mod_untakedown))
         .route("/report", post(submit_report))
         .route("/mod/report-dismiss", post(mod_report_dismiss))
-        .route("/mod/report-hide", post(mod_report_hide))
+        .route("/mod/ban-post", post(mod_ban_post))
+        .route("/mod/ban-creator", post(mod_ban_creator))
         .route("/t/{infohash}/meta", get(gateway_meta))
         .route("/t/{infohash}/f/{file_index}", get(gateway_file))
         .with_state(state)
@@ -891,6 +892,7 @@ fn stat_card(num: i64, label: &str) -> Markup {
 async fn creator_page(
     State(pool): State<PgPool>,
     Path((platform, creator_id)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Html<String> {
     let posts = db::creator_posts(&pool, &platform, &creator_id, 300, 0)
         .await
@@ -908,6 +910,7 @@ async fn creator_page(
                 span.chip.platform { (pretty_platform(&platform)) }
                 span.muted { (posts.len()) @if posts.len() == 1 { " post" } @else { " posts" } }
             }
+            @if is_mod(&headers) { (mod_bar_creator(&platform, &creator_id)) }
             @if posts.is_empty() { p.muted { "Nothing here yet" } }
             (posts_grid(&posts))
         },
@@ -966,6 +969,7 @@ async fn post_page(
             @if files.is_empty() { p.muted { "This post has no files, or they are hidden" } }
             (carousel(&files))
             @if !body.is_empty() { div.body { (body) } }
+            @if is_mod(&headers) { (mod_bar_post(&platform, &creator_id, &post_id)) }
             (report_box(&platform, &creator_id, &post_id, query.reported.is_some()))
             script { (PreEscaped(CAROUSEL_JS)) }
         },
@@ -1211,7 +1215,7 @@ async fn mod_queue(State(state): State<AppState>, headers: HeaderMap) -> Respons
     let takedowns = db::takedowns(&state.pool).await.unwrap_or_default();
     let reports = db::open_reports(&state.pool, 100).await.unwrap_or_default();
     let report_count = db::open_report_count(&state.pool).await.unwrap_or(0);
-    render(
+    let page = render(
         "mod queue",
         html! {
             p { a href="/" { "< home" } }
@@ -1249,6 +1253,7 @@ async fn mod_queue(State(state): State<AppState>, headers: HeaderMap) -> Respons
                 ul.list {
                     @for p in &pending {
                         li {
+                            @if let Some(t) = &p.thumb { img.pendthumb src=(t) alt="preview" title="hover to reveal"; }
                             div { code { (npub(&p.pubkey)) } }
                             span.muted {
                                 (p.files) " file(s)"
@@ -1271,8 +1276,12 @@ async fn mod_queue(State(state): State<AppState>, headers: HeaderMap) -> Respons
             }
             (takedown_section(&state, &takedowns))
         },
-    )
-    .into_response()
+    );
+    let mut resp = page.into_response();
+    if let Ok(v) = header::HeaderValue::from_str(&mod_session_cookie()) {
+        resp.headers_mut().insert(header::SET_COOKIE, v);
+    }
+    resp
 }
 
 fn takedown_section(state: &AppState, takedowns: &[db::TakedownRow]) -> Markup {
@@ -1287,6 +1296,8 @@ fn takedown_section(state: &AppState, takedowns: &[db::TakedownRow]) -> Markup {
                 option value="e" { "event id" }
                 option value="x" { "file hash" }
                 option value="p" { "pubkey" }
+                option value="post" { "post (platform:creator_id:post_id)" }
+                option value="creator" { "creator (platform:creator_id)" }
             }
             input type="text" name="target" placeholder="target value (id / hash / npub or hex)" required;
             input type="text" name="reason" placeholder="reason (dmca-us, csam, spam...)" required;
@@ -1490,35 +1501,112 @@ async fn mod_report_dismiss(
     Redirect::to("/mod").into_response()
 }
 
-// hide every file of a reported post with one kind 31064 event-id takedown each, then clear the flag;
-// piece two folds this into a single post-target event
-async fn mod_report_hide(
+// hide a whole post with one kind 31064 post-target event (federates), then clear any report on it
+async fn mod_ban_post(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Form(form): Form<PostForm>,
+    Form(form): Form<BanPostForm>,
 ) -> Response {
     if let Err(denied) = require_mod(&headers) {
         return denied;
     }
-    let ids = db::post_event_ids(&state.pool, &form.platform, &form.creator_id, &form.post_id)
-        .await
-        .unwrap_or_default();
-    for id in ids {
-        let takedown = Takedown {
-            target: Target::Event(id),
-            reason: "reported".into(),
-            applied_at: Some(Utc::now().to_rfc3339()),
-            explanation: String::new(),
-        };
-        match &state.signer {
-            Some(keys) => publish_takedown(&state, keys, &takedown).await,
-            None => {
-                let _ = db::record_takedown(&state.pool, &takedown, "local", None).await;
-            }
+    apply_ban(&state, Target::post(&form.platform, &form.creator_id, &form.post_id)).await;
+    let _ = db::resolve_report(&state.pool, &form.platform, &form.creator_id, &form.post_id).await;
+    Redirect::to(&safe_back(&form.back)).into_response()
+}
+
+// hide every post from a creator with one kind 31064 creator-target event, so a fresh approved
+// contributor re-uploading the same creator stays hidden too
+async fn mod_ban_creator(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<BanCreatorForm>,
+) -> Response {
+    if let Err(denied) = require_mod(&headers) {
+        return denied;
+    }
+    apply_ban(&state, Target::creator(&form.platform, &form.creator_id)).await;
+    Redirect::to(&safe_back(&form.back)).into_response()
+}
+
+// sign + fan the takedown to peers when the board has an instance key, else record it locally only
+async fn apply_ban(state: &AppState, target: Target) {
+    let takedown = Takedown {
+        target,
+        reason: "moderator".into(),
+        applied_at: Some(Utc::now().to_rfc3339()),
+        explanation: String::new(),
+    };
+    match &state.signer {
+        Some(keys) => publish_takedown(state, keys, &takedown).await,
+        None => {
+            let _ = db::record_takedown(&state.pool, &takedown, "local", None).await;
         }
     }
-    let _ = db::resolve_report(&state.pool, &form.platform, &form.creator_id, &form.post_id).await;
-    Redirect::to("/mod").into_response()
+}
+
+// only ever bounce to a local path so a crafted back field cannot turn this into an open redirect
+fn safe_back(back: &str) -> String {
+    if back.starts_with('/') && !back.starts_with("//") {
+        back.to_string()
+    } else {
+        "/mod".to_string()
+    }
+}
+
+fn mod_bar_post(platform: &str, creator_id: &str, post_id: &str) -> Markup {
+    let back = format!("/c/{platform}/{creator_id}");
+    html! {
+        div.modbar {
+            span.muted { "mod" }
+            form method="post" action="/mod/ban-post" class="modform" {
+                input type="hidden" name="platform" value=(platform);
+                input type="hidden" name="creator_id" value=(creator_id);
+                input type="hidden" name="post_id" value=(post_id);
+                input type="hidden" name="back" value=(back);
+                button { "hide post" }
+            }
+            form method="post" action="/mod/ban-creator" class="modform" {
+                input type="hidden" name="platform" value=(platform);
+                input type="hidden" name="creator_id" value=(creator_id);
+                input type="hidden" name="back" value=(back);
+                button { "ban author" }
+            }
+            a.btn.ghost href="/mod" { "mod queue" }
+        }
+    }
+}
+
+fn mod_bar_creator(platform: &str, creator_id: &str) -> Markup {
+    html! {
+        div.modbar {
+            span.muted { "mod" }
+            form method="post" action="/mod/ban-creator" class="modform" {
+                input type="hidden" name="platform" value=(platform);
+                input type="hidden" name="creator_id" value=(creator_id);
+                input type="hidden" name="back" value="/creators";
+                button { "ban author" }
+            }
+            a.btn.ghost href="/mod" { "mod queue" }
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct BanPostForm {
+    platform: String,
+    creator_id: String,
+    post_id: String,
+    #[serde(default)]
+    back: String,
+}
+
+#[derive(serde::Deserialize)]
+struct BanCreatorForm {
+    platform: String,
+    creator_id: String,
+    #[serde(default)]
+    back: String,
 }
 
 fn reports_section(reports: &[db::ReportGroup], open_count: i64) -> Markup {
@@ -1546,11 +1634,18 @@ fn reports_section(reports: &[db::ReportGroup], open_count: i64) -> Markup {
                             (r.total) " report(s)"
                         }
                         div {
-                            form method="post" action="/mod/report-hide" class="modform" {
+                            form method="post" action="/mod/ban-post" class="modform" {
                                 input type="hidden" name="platform" value=(r.platform);
                                 input type="hidden" name="creator_id" value=(r.creator_id);
                                 input type="hidden" name="post_id" value=(r.post_id);
+                                input type="hidden" name="back" value="/mod";
                                 button { "hide post" }
+                            }
+                            form method="post" action="/mod/ban-creator" class="modform" {
+                                input type="hidden" name="platform" value=(r.platform);
+                                input type="hidden" name="creator_id" value=(r.creator_id);
+                                input type="hidden" name="back" value="/mod";
+                                button { "ban author" }
                             }
                             form method="post" action="/mod/report-dismiss" class="modform" {
                                 input type="hidden" name="platform" value=(r.platform);
@@ -1787,15 +1882,17 @@ fn takedown_source(source: &str) -> String {
 
 // the mod routes require HTTP Basic auth with the password set in BAKEMONO_MOD_TOKEN
 fn require_mod(headers: &HeaderMap) -> Result<(), Response> {
-    let token = std::env::var("BAKEMONO_MOD_TOKEN").unwrap_or_default();
-    if token.is_empty() {
+    if std::env::var("BAKEMONO_MOD_TOKEN")
+        .unwrap_or_default()
+        .is_empty()
+    {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "mod queue disabled; set BAKEMONO_MOD_TOKEN on the board",
         )
             .into_response());
     }
-    if basic_auth_password(headers).as_deref() == Some(token.as_str()) {
+    if is_mod(headers) {
         return Ok(());
     }
     Err((
@@ -1804,6 +1901,55 @@ fn require_mod(headers: &HeaderMap) -> Result<(), Response> {
         "authentication required",
     )
         .into_response())
+}
+
+// true when the request carries the mod token (Basic auth) or a live mod-session cookie; gates the
+// mod actions and decides whether public post/creator pages render in-context ban controls
+fn is_mod(headers: &HeaderMap) -> bool {
+    let token = std::env::var("BAKEMONO_MOD_TOKEN").unwrap_or_default();
+    if token.is_empty() {
+        return false;
+    }
+    basic_auth_password(headers).as_deref() == Some(token.as_str())
+        || valid_mod_cookie(headers, now_secs())
+}
+
+const MOD_SESSION_TTL: i64 = 8 * 3600;
+
+// a signed, expiring cookie minted when a mod loads /mod with the token, so ban buttons work on the
+// public pages without re-prompting; keyed on report_secret (mod-token-derived) so rotating the token
+// invalidates every outstanding session
+fn mod_session_cookie() -> String {
+    let expiry = now_secs() + MOD_SESSION_TTL;
+    let sig = mod_session_sig(expiry);
+    format!("modsession={expiry}.{sig}; Path=/; Max-Age={MOD_SESSION_TTL}; HttpOnly; SameSite=Strict")
+}
+
+fn mod_session_sig(expiry: i64) -> String {
+    let mut mac = HmacSha256::new_from_slice(report_secret()).expect("hmac key");
+    mac.update(format!("modsession:{expiry}").as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&mac.finalize().into_bytes()[..16])
+}
+
+fn valid_mod_cookie(headers: &HeaderMap, now: i64) -> bool {
+    let Some(raw) = cookie_value(headers, "modsession") else {
+        return false;
+    };
+    let Some((exp, sig_b64)) = raw.split_once('.') else {
+        return false;
+    };
+    let Ok(expiry) = exp.parse::<i64>() else {
+        return false;
+    };
+    if expiry < now {
+        return false;
+    }
+    let Ok(sig) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(sig_b64) else {
+        return false;
+    };
+    let mut mac = HmacSha256::new_from_slice(report_secret()).expect("hmac key");
+    mac.update(format!("modsession:{expiry}").as_bytes());
+    mac.verify_truncated_left(&sig).is_ok()
 }
 
 fn basic_auth_password(headers: &HeaderMap) -> Option<String> {
@@ -2172,6 +2318,10 @@ main { max-width:1240px; margin:0 auto; padding:1.4rem 1.1rem 3rem }
 .reported { max-width:720px; margin:1.2rem auto 0; color:#a6e3a1; font-size:.9rem }
 .hp { position:absolute; left:-9999px; width:1px; height:1px; opacity:0 }
 li.report.csam { border-left:3px solid var(--red); padding-left:.6rem }
+.modbar { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; max-width:720px; margin:1rem auto 0; padding:.5rem .7rem; border:1px solid var(--surface1); border-radius:10px; background:var(--mantle) }
+.modbar button { padding:.3rem .65rem; border-radius:8px; border:none; background:var(--red); color:var(--crust); cursor:pointer; font-weight:600 }
+.pendthumb { width:56px; height:56px; object-fit:cover; border-radius:8px; float:left; margin-right:.6rem; filter:blur(11px); transition:filter .08s; cursor:pointer }
+.pendthumb:hover { filter:none }
 .body img { max-width:100%; border-radius:10px }
 
 .foot { border-top:1px solid var(--surface0); margin-top:2.5rem; padding:2rem 1.1rem }

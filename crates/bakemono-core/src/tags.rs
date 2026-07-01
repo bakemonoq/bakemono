@@ -21,6 +21,8 @@ pub const EVENT_REF: &str = "e";
 pub const PUBKEY_REF: &str = "p";
 pub const REASON: &str = "reason";
 pub const APPLIED_AT: &str = "applied_at";
+pub const POST_REF: &str = "post";
+pub const CREATOR_REF: &str = "creator";
 
 pub fn require(event: &Event, key: &'static str) -> Result<String> {
     first(event, key).ok_or(Error::MissingTag(key))

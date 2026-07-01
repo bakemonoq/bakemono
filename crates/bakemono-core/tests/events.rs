@@ -172,6 +172,36 @@ fn takedown_d_tag_is_replaceable_per_target() {
 }
 
 #[test]
+fn post_and_creator_takedowns_round_trip() {
+    let keys = Keys::generate();
+    for target in [Target::post("patreon", "c1", "p1"), Target::creator("patreon", "c1")] {
+        let takedown = Takedown {
+            target: target.clone(),
+            reason: "csam".into(),
+            applied_at: None,
+            explanation: String::new(),
+        };
+        let event = takedown.to_event(&keys).unwrap();
+        assert!(event.verify().is_ok());
+        assert_eq!(Takedown::from_event(&event).unwrap().target, target);
+    }
+}
+
+#[test]
+fn post_and_creator_targets_build_composite_d_tags() {
+    assert_eq!(Target::post("patreon", "c1", "p1"), Target::Post("patreon:c1:p1".into()));
+    assert_eq!(Target::creator("patreon", "c1"), Target::Creator("patreon:c1".into()));
+    let t = Takedown {
+        target: Target::post("patreon", "c1", "p1"),
+        reason: "spam".into(),
+        applied_at: None,
+        explanation: String::new(),
+    };
+    assert_eq!(t.d_tag(), "takedown:post:patreon:c1:p1");
+    assert_eq!(Target::from_parts("creator", "patreon:c1".into()), Some(Target::Creator("patreon:c1".into())));
+}
+
+#[test]
 fn target_from_parts_rejects_unknown_kind() {
     assert_eq!(
         Target::from_parts("x", "hash".into()),

@@ -16,6 +16,8 @@ pub enum Target {
     Event(String),
     FileHash(String),
     Pubkey(String),
+    Post(String),
+    Creator(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,7 +57,10 @@ impl Takedown {
     fn validate(&self) -> Result<()> {
         use crate::validation as v;
         let (key, value) = self.target.parts();
-        v::hex_hash(key, value)?;
+        match self.target {
+            Target::Post(_) | Target::Creator(_) => v::require_field(key, value, v::MAX_TARGET)?,
+            _ => v::hex_hash(key, value)?,
+        }
         v::require_field(tags::REASON, &self.reason, v::MAX_REASON)?;
         v::optional_field(tags::APPLIED_AT, &self.applied_at, v::MAX_TIMESTAMP)?;
         v::within("explanation", &self.explanation, v::MAX_EXPLANATION)?;
@@ -90,12 +95,23 @@ impl Takedown {
 }
 
 impl Target {
-    // tag key (`e`/`x`/`p`) and value, the same pair used in the d_tag and the target tag
+    pub fn post(platform: &str, creator_id: &str, post_id: &str) -> Self {
+        Target::Post(format!("{platform}:{creator_id}:{post_id}"))
+    }
+
+    pub fn creator(platform: &str, creator_id: &str) -> Self {
+        Target::Creator(format!("{platform}:{creator_id}"))
+    }
+
+    // tag key and value, the same pair used in the d_tag and the target tag. e/x/p carry a 64-hex
+    // value; post/creator carry a `platform:creator_id[:post_id]` key the board matches by column
     pub fn parts(&self) -> (&'static str, &str) {
         match self {
             Target::Event(v) => (tags::EVENT_REF, v),
             Target::FileHash(v) => (tags::X, v),
             Target::Pubkey(v) => (tags::PUBKEY_REF, v),
+            Target::Post(v) => (tags::POST_REF, v),
+            Target::Creator(v) => (tags::CREATOR_REF, v),
         }
     }
 
@@ -104,6 +120,8 @@ impl Target {
             tags::EVENT_REF => Some(Target::Event(value)),
             tags::X => Some(Target::FileHash(value)),
             tags::PUBKEY_REF => Some(Target::Pubkey(value)),
+            tags::POST_REF => Some(Target::Post(value)),
+            tags::CREATOR_REF => Some(Target::Creator(value)),
             _ => None,
         }
     }
@@ -115,6 +133,10 @@ impl Target {
             Ok(Target::FileHash(v))
         } else if let Some(v) = tags::first(event, tags::PUBKEY_REF) {
             Ok(Target::Pubkey(v))
+        } else if let Some(v) = tags::first(event, tags::POST_REF) {
+            Ok(Target::Post(v))
+        } else if let Some(v) = tags::first(event, tags::CREATOR_REF) {
+            Ok(Target::Creator(v))
         } else {
             Err(Error::MissingTag(tags::EVENT_REF))
         }

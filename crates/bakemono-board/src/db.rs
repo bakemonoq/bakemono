@@ -477,7 +477,10 @@ pub async fn bump_views(pool: &PgPool, platform: &str, creator_id: &str, post_id
 pub async fn pending_pubkeys(pool: &PgPool, limit: i64) -> Result<Vec<PendingRow>> {
     let rows = sqlx::query_as::<_, PendingRow>(
         "SELECT p.pubkey, COUNT(m.event_id) AS files,
-                MAX(m.creator) AS creator, MAX(m.post_title) AS sample
+                MAX(m.creator) AS creator, MAX(m.post_title) AS sample,
+                (SELECT thumb FROM manifests mm
+                 WHERE mm.pubkey = p.pubkey AND mm.thumb IS NOT NULL
+                 ORDER BY mm.created_at DESC LIMIT 1) AS thumb
          FROM pubkeys p LEFT JOIN manifests m ON m.pubkey = p.pubkey
          WHERE p.status = 'pending'
          GROUP BY p.pubkey, p.first_seen
@@ -731,23 +734,6 @@ pub async fn open_report_count(pool: &PgPool) -> Result<i64> {
     Ok(row.0)
 }
 
-pub async fn post_event_ids(
-    pool: &PgPool,
-    platform: &str,
-    creator_id: &str,
-    post_id: &str,
-) -> Result<Vec<String>> {
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT event_id FROM manifests WHERE platform = $1 AND creator_id = $2 AND post_id = $3",
-    )
-    .bind(platform)
-    .bind(creator_id)
-    .bind(post_id)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows.into_iter().map(|r| r.0).collect())
-}
-
 #[derive(sqlx::FromRow)]
 pub struct ReportGroup {
     pub platform: String,
@@ -766,6 +752,7 @@ pub struct PendingRow {
     pub files: i64,
     pub creator: Option<String>,
     pub sample: Option<String>,
+    pub thumb: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -965,7 +952,9 @@ WHERE m.pubkey IN (SELECT pubkey FROM pubkeys WHERE status = 'approved')
       SELECT 1 FROM takedowns t WHERE
           (t.target_type = 'e' AND t.target = m.event_id) OR
           (t.target_type = 'x' AND t.target = m.file_hash) OR
-          (t.target_type = 'p' AND t.target = m.pubkey)
+          (t.target_type = 'p' AND t.target = m.pubkey) OR
+          (t.target_type = 'post' AND t.target = m.platform || ':' || m.creator_id || ':' || m.post_id) OR
+          (t.target_type = 'creator' AND t.target = m.platform || ':' || m.creator_id)
   );
 ";
 
@@ -1287,9 +1276,6 @@ mod tests {
         assert_eq!(group.creator, manifest.creator);
         assert!(open_report_count(&pool).await.unwrap() >= 1);
 
-        let ids = post_event_ids(&pool, p, c, post).await.unwrap();
-        assert_eq!(ids, vec![event.id.to_hex()]);
-
         resolve_report(&pool, p, c, post).await.unwrap();
         assert!(open_reports(&pool, 100)
             .await
@@ -1302,6 +1288,60 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query("DELETE FROM manifests WHERE creator_id = $1")
+            .bind(&creator_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM pubkeys WHERE pubkey = $1")
+            .bind(keys.public_key().to_hex())
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn post_and_creator_takedowns_hide_via_view() {
+        use bakemono_core::Target;
+        let Ok(url) = std::env::var("BAKEMONO_TEST_DB") else {
+            eprintln!("skipping: BAKEMONO_TEST_DB not set");
+            return;
+        };
+        let pool = match connect(&url).await {
+            Ok(pool) => pool,
+            Err(e) => {
+                eprintln!("skipping: cannot reach test db: {e}");
+                return;
+            }
+        };
+        let keys = Keys::generate();
+        let creator_id = format!("ban-{}", std::process::id());
+        let manifest = sample(&creator_id);
+        let event = manifest.to_event_at(&keys, 1_000).unwrap();
+        upsert(&pool, &event, &manifest).await.unwrap();
+        approve_pubkey(&pool, &keys.public_key().to_hex())
+            .await
+            .unwrap();
+        let (p, c, post) = (
+            manifest.platform.as_str(),
+            creator_id.as_str(),
+            manifest.post_id.as_str(),
+        );
+        assert!(post_is_visible(&pool, p, c, post).await.unwrap());
+
+        for target in [Target::post(p, c, post), Target::creator(p, c)] {
+            let td = Takedown {
+                target,
+                reason: "moderator".into(),
+                applied_at: None,
+                explanation: String::new(),
+            };
+            record_takedown(&pool, &td, "local", None).await.unwrap();
+            assert!(!post_is_visible(&pool, p, c, post).await.unwrap());
+            remove_takedown(&pool, &td.d_tag()).await.unwrap();
+            assert!(post_is_visible(&pool, p, c, post).await.unwrap());
+        }
+
         sqlx::query("DELETE FROM manifests WHERE creator_id = $1")
             .bind(&creator_id)
             .execute(&pool)

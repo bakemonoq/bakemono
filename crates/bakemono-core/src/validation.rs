@@ -35,6 +35,7 @@ pub struct ReplaceableAddress {
 pub const MAX_PLATFORM: usize = 64;
 pub const MAX_CREATOR: usize = 256;
 pub const MAX_ID: usize = 128;
+pub const MAX_TARGET: usize = 512;
 pub const MAX_MIME: usize = 128;
 pub const MAX_MAGNET: usize = 2048;
 pub const MAX_FILENAME: usize = 512;
