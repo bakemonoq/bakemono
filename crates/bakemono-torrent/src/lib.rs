@@ -1,10 +1,13 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, Context, Result};
+use librqbit::api::TorrentIdOrHash;
 use librqbit::limits::LimitsConfig;
 use librqbit::{
     AddTorrent, AddTorrentOptions, CreateTorrentOptions, ManagedTorrent, Session, SessionOptions,
@@ -44,14 +47,17 @@ pub struct Gateway {
     session: Arc<Session>,
     // operator-pinned seeders tried directly, so a known seedbox works without waiting on tracker/DHT
     initial_peers: Vec<SocketAddr>,
+    cache: Cache,
 }
 
 impl Gateway {
     pub async fn new(
-        output_dir: PathBuf,
+        cache_dir: PathBuf,
         listen_port: Option<u16>,
         initial_peers: Vec<SocketAddr>,
+        budget_bytes: u64,
     ) -> Result<Self> {
+        let cache = Cache::load(cache_dir.clone(), budget_bytes)?;
         let opts = SessionOptions {
             persistence: None,
             // reuse of the stored DHT port collides when several sessions run on one host; take a fresh port
@@ -59,23 +65,30 @@ impl Gateway {
             listen_port_range: listen_port.map(|p| p..p + 1),
             ..Default::default()
         };
-        let session = Session::new_with_opts(output_dir, opts)
+        let session = Session::new_with_opts(cache_dir, opts)
             .await
             .context("starting torrent session")?;
         Ok(Self {
             session,
             initial_peers,
+            cache,
         })
     }
 
     pub async fn meta(&self, magnet: &str) -> Result<TorrentMeta> {
-        let handle = self.add(magnet, vec![0]).await?;
-        meta_from_handle(&handle)
+        let (handle, infohash) = self.add(magnet, vec![0]).await?;
+        let meta = meta_from_handle(&handle)?;
+        let size = meta.files.first().map(|f| f.size).unwrap_or(0);
+        self.cache.touch(&infohash, size, handle.id().into());
+        self.cache.evict(&self.session).await;
+        Ok(meta)
     }
 
     pub async fn open(&self, magnet: &str, file_index: usize) -> Result<OpenFile> {
-        let handle = self.add(magnet, vec![file_index]).await?;
+        let (handle, infohash) = self.add(magnet, vec![file_index]).await?;
         let (name, size) = file_entry(&handle, file_index)?;
+        self.cache.touch(&infohash, size, handle.id().into());
+        self.cache.evict(&self.session).await;
         let stream = handle
             .clone()
             .stream(file_index)
@@ -88,7 +101,17 @@ impl Gateway {
         })
     }
 
-    async fn add(&self, magnet: &str, only_files: Vec<usize>) -> Result<Arc<ManagedTorrent>> {
+    // each torrent downloads into cache_dir/<infohash>/ so files never collide by name and eviction is
+    // a single directory remove; returns the handle plus the infohash the cache keys on
+    async fn add(&self, magnet: &str, only_files: Vec<usize>) -> Result<(Arc<ManagedTorrent>, String)> {
+        let infohash =
+            infohash_from_magnet(magnet).ok_or_else(|| anyhow!("magnet carries no infohash"))?;
+        let output_folder = self
+            .cache
+            .dir
+            .join(&infohash)
+            .to_string_lossy()
+            .into_owned();
         let initial_peers =
             (!self.initial_peers.is_empty()).then(|| self.initial_peers.clone());
         let resp = self
@@ -98,6 +121,7 @@ impl Gateway {
                 Some(AddTorrentOptions {
                     only_files: Some(only_files),
                     overwrite: true,
+                    output_folder: Some(output_folder),
                     initial_peers,
                     ..Default::default()
                 }),
@@ -111,8 +135,161 @@ impl Gateway {
             .wait_until_initialized()
             .await
             .context("waiting for torrent metadata")?;
-        Ok(handle)
+        Ok((handle, infohash))
     }
+}
+
+// on-SSD file cache keyed by infohash, bounded by a size budget with LRU eviction ("download, display,
+// delete"). the librqbit session writes each torrent under cache_dir/<infohash>/, so evicting is a
+// session.delete plus a directory remove
+struct Cache {
+    dir: PathBuf,
+    budget: u64, // bytes; 0 disables eviction (unlimited)
+    state: StdMutex<CacheState>,
+}
+
+#[derive(Default)]
+struct CacheState {
+    total: u64,
+    entries: HashMap<String, Entry>,
+}
+
+struct Entry {
+    size: u64,
+    last: SystemTime,
+    // Some once the torrent is managed this run; None for dirs found on disk at startup
+    id: Option<TorrentIdOrHash>,
+}
+
+// don't evict something touched within this window, so an in-flight stream is never yanked
+const EVICT_GRACE: Duration = Duration::from_secs(120);
+
+impl Cache {
+    fn load(dir: PathBuf, budget: u64) -> Result<Self> {
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating cache dir {}", dir.display()))?;
+        let mut entries = HashMap::new();
+        let mut total = 0;
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                if !e.path().is_dir() {
+                    continue;
+                }
+                let infohash = e.file_name().to_string_lossy().into_owned();
+                let size = dir_size(&e.path());
+                let last = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                total += size;
+                entries.insert(infohash, Entry { size, last, id: None });
+            }
+        }
+        let cache = Cache {
+            dir,
+            budget,
+            state: StdMutex::new(CacheState { total, entries }),
+        };
+        // trim leftovers from previous runs down to budget before serving (nothing is in-flight yet)
+        cache.evict_cold();
+        Ok(cache)
+    }
+
+    fn touch(&self, infohash: &str, size: u64, id: TorrentIdOrHash) {
+        let mut st = self.state.lock().unwrap();
+        match st.entries.get_mut(infohash) {
+            Some(e) => {
+                e.last = SystemTime::now();
+                e.id = Some(id);
+            }
+            None => {
+                st.total += size;
+                st.entries.insert(
+                    infohash.to_string(),
+                    Entry {
+                        size,
+                        last: SystemTime::now(),
+                        id: Some(id),
+                    },
+                );
+            }
+        }
+    }
+
+    async fn evict(&self, session: &Session) {
+        if self.budget == 0 {
+            return;
+        }
+        loop {
+            let victim = {
+                let mut st = self.state.lock().unwrap();
+                if st.total <= self.budget {
+                    break;
+                }
+                let now = SystemTime::now();
+                let pick = st
+                    .entries
+                    .iter()
+                    .filter(|(_, e)| now.duration_since(e.last).map(|d| d > EVICT_GRACE).unwrap_or(true))
+                    .min_by_key(|(_, e)| e.last)
+                    .map(|(ih, _)| ih.clone());
+                match pick {
+                    Some(ih) => {
+                        let e = st.entries.remove(&ih).unwrap();
+                        st.total -= e.size;
+                        Some((ih, e.id))
+                    }
+                    None => None, // everything is within the grace window; try again later
+                }
+            };
+            match victim {
+                Some((infohash, id)) => {
+                    if let Some(id) = id {
+                        let _ = session.delete(id, true).await;
+                    }
+                    let _ = std::fs::remove_dir_all(self.dir.join(&infohash));
+                }
+                None => break,
+            }
+        }
+    }
+
+    // startup-only: evict oldest dirs over budget without a session (nothing is managed yet)
+    fn evict_cold(&self) {
+        if self.budget == 0 {
+            return;
+        }
+        let mut st = self.state.lock().unwrap();
+        while st.total > self.budget {
+            let Some(ih) = st
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.last)
+                .map(|(ih, _)| ih.clone())
+            else {
+                break;
+            };
+            let e = st.entries.remove(&ih).unwrap();
+            st.total -= e.size;
+            let _ = std::fs::remove_dir_all(self.dir.join(&ih));
+        }
+    }
+}
+
+fn dir_size(path: &Path) -> u64 {
+    let mut total = 0;
+    let Ok(rd) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            total += dir_size(&p);
+        } else if let Ok(m) = e.metadata() {
+            total += m.len();
+        }
+    }
+    total
 }
 
 fn meta_from_handle(handle: &Arc<ManagedTorrent>) -> Result<TorrentMeta> {
@@ -297,5 +474,30 @@ mod tests {
         );
         assert!(m.starts_with("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"));
         assert!(m.contains("&tr=udp%3A%2F%2Ftracker.example%3A1337%2Fannounce"));
+    }
+
+    #[test]
+    fn cache_evicts_cold_dirs_over_budget() {
+        let base = std::env::temp_dir().join(format!("bmcache-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for ih in ["aaaa", "bbbb", "cccc"] {
+            let d = base.join(ih);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("f.bin"), vec![0u8; 100]).unwrap();
+        }
+        // budget 150 with 3x100 on disk -> must trim down to a single dir
+        let cache = Cache::load(base.clone(), 150).unwrap();
+        {
+            let st = cache.state.lock().unwrap();
+            assert!(st.total <= 150, "total {} still over budget", st.total);
+            assert_eq!(st.entries.len(), 1, "should keep one dir under budget");
+        }
+        let dirs = std::fs::read_dir(&base)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .count();
+        assert_eq!(dirs, 1);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -21,7 +21,13 @@ async fn main() -> Result<()> {
 
     let pool = db::connect(&database_url).await?;
     let gateway = Arc::new(
-        bakemono_torrent::Gateway::new(gateway_dir(), gateway_port(), gateway_peers()).await?,
+        bakemono_torrent::Gateway::new(
+            gateway_dir(),
+            gateway_port(),
+            gateway_peers(),
+            gateway_budget(),
+        )
+        .await?,
     );
 
     let indexer_pool = pool.clone();
@@ -44,12 +50,21 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// a fresh per-process dir keeps every start cold (no warm pieces from a prior run); override to persist
+// persistent cache dir so downloads survive a restart (warm); in Docker point BAKEMONO_GATEWAY_DIR at a volume
 fn gateway_dir() -> std::path::PathBuf {
     if let Some(dir) = std::env::var("BAKEMONO_GATEWAY_DIR").ok().filter(|s| !s.is_empty()) {
         return dir.into();
     }
-    std::env::temp_dir().join(format!("bakemono-gw-{}", std::process::id()))
+    std::env::temp_dir().join("bakemono-gateway")
+}
+
+// BAKEMONO_CACHE_GB caps the on-disk cache; over budget, least-recently-used content is evicted. 0 = unlimited
+fn gateway_budget() -> u64 {
+    std::env::var("BAKEMONO_CACHE_GB")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(10)
+        .saturating_mul(1_000_000_000)
 }
 
 fn gateway_port() -> Option<u16> {

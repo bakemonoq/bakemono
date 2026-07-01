@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
         .split(',')
         .filter_map(|s| s.trim().parse().ok())
         .collect();
-    let gw = Gateway::new(dir, None, peers).await?;
+    let gw = Gateway::new(dir, None, peers, 0).await?;
 
     let meta = gw.meta(&magnet).await?;
     eprintln!("name:     {}", meta.name);
