@@ -1,8 +1,6 @@
-# BitTorrent / WebTorrent trackers announced to when seeding and previewing.
+# BitTorrent trackers announced to when seeding and fetched from at the gateway.
 # One tracker URL per line. Blank lines and lines starting with # are ignored.
-# wss:// trackers reach browser peers; udp:// trackers reach native clients.
 # To add a tracker: open a PR adding one URL on its own line.
-wss://tracker.bakemono.app
-wss://tracker.openwebtorrent.com
-wss://tracker.webtorrent.dev
 udp://tracker.opentrackr.org:1337/announce
+udp://tracker.openbittorrent.com:6969/announce
+udp://open.demonii.com:1337/announce

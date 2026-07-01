@@ -1,7 +1,6 @@
 // server lists live in /defaults/*.txt so non-rust contributors can PR new servers in one line
 const RELAYS: &str = include_str!("../../../defaults/relays.txt");
 const TRACKERS: &str = include_str!("../../../defaults/trackers.txt");
-const STUN: &str = include_str!("../../../defaults/stun.txt");
 
 pub fn default_relays() -> Vec<String> {
     parse(RELAYS)
@@ -9,10 +8,6 @@ pub fn default_relays() -> Vec<String> {
 
 pub fn default_trackers() -> Vec<String> {
     parse(TRACKERS)
-}
-
-pub fn default_stun() -> Vec<String> {
-    parse(STUN)
 }
 
 fn parse(raw: &str) -> Vec<String> {
@@ -37,6 +32,5 @@ mod tests {
     fn bundled_lists_are_non_empty() {
         assert!(!default_relays().is_empty());
         assert!(!default_trackers().is_empty());
-        assert!(!default_stun().is_empty());
     }
 }

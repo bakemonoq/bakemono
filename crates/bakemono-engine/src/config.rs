@@ -8,8 +8,6 @@ pub struct AppConfig {
     pub relays: Vec<String>,
     #[serde(default = "default_trackers")]
     pub trackers: Vec<String>,
-    #[serde(default = "default_stun")]
-    pub stun: Vec<String>,
     pub seed: bool,
     pub max_up_mbit: u32,
     // 0 = unlimited; download cap matters mainly for farm nodes fetching content
@@ -20,13 +18,9 @@ pub struct AppConfig {
     pub stop_daemon_on_exit: bool,
     // optional sidecar binary overrides the app hands the daemon; empty = bundled, then PATH default
     #[serde(default)]
-    pub node_bin: Option<String>,
-    #[serde(default)]
     pub ffmpeg_bin: Option<String>,
     #[serde(default)]
     pub gallery_dl_bin: Option<String>,
-    #[serde(default)]
-    pub webtorrent_script: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -34,15 +28,12 @@ impl Default for AppConfig {
         Self {
             relays: default_relays(),
             trackers: default_trackers(),
-            stun: default_stun(),
             seed: true,
             max_up_mbit: 20,
             max_down_mbit: 0,
             stop_daemon_on_exit: false,
-            node_bin: None,
             ffmpeg_bin: None,
             gallery_dl_bin: None,
-            webtorrent_script: None,
         }
     }
 }
@@ -56,10 +47,6 @@ fn default_relays() -> Vec<String> {
 
 fn default_trackers() -> Vec<String> {
     bakemono_core::default_trackers()
-}
-
-fn default_stun() -> Vec<String> {
-    bakemono_core::default_stun()
 }
 
 impl AppConfig {

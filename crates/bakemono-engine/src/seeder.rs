@@ -4,10 +4,10 @@ use std::sync::Arc;
 use anyhow::{bail, Result};
 use tokio::sync::Mutex;
 
-use bakemono_seeder::{SeedInfo, Seeder};
+use bakemono_torrent::{SeedInfo, Seeder};
 
-// one webtorrent sidecar for the whole daemon lifetime: started once, fed files as they arrive,
-// torn down only on shutdown so published magnets keep a live seeder behind them
+// one librqbit seed session for the daemon lifetime: started once, fed files as they arrive,
+// so published magnets keep a live seeder behind them
 #[derive(Clone, Default)]
 pub struct SeederHandle {
     inner: Arc<Mutex<Option<Seeder>>>,
@@ -18,28 +18,33 @@ impl SeederHandle {
         Self::default()
     }
 
-    pub async fn ensure_started(
-        &self,
-        trackers: &[String],
-        stun: &[String],
-        max_up_mbit: u32,
-        max_down_mbit: u32,
-    ) -> Result<()> {
+    pub async fn ensure_started(&self, trackers: &[String]) -> Result<()> {
         let mut guard = self.inner.lock().await;
         if guard.is_none() {
             // stage on the data volume so hardlinks to scraped files never fall back to copying
             let staging = super::data_dir().join("staging");
-            let env = swarm_env(trackers, stun, max_up_mbit, max_down_mbit);
-            let seeder = Seeder::from_env_with(&env, Some(&staging)).await?;
+            // wss trackers were WebRTC-only; classic BT announces to udp/http trackers plus DHT
+            let trackers: Vec<String> = trackers
+                .iter()
+                .filter(|t| !t.starts_with("wss://"))
+                .cloned()
+                .collect();
+            // seed on a fixed TCP port by default so a gateway can pin us; librqbit opens no listener
+            // without one, which leaves the seeder undialable
+            let port = std::env::var("BAKEMONO_SEED_PORT")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .or(Some(4250));
+            let seeder = Seeder::start(staging, trackers, port).await?;
             *guard = Some(seeder);
-            tracing::info!("webtorrent seeder started");
+            tracing::info!("seeder started");
         }
         Ok(())
     }
 
     pub async fn seed(&self, file: &Path) -> Result<SeedInfo> {
-        let mut guard = self.inner.lock().await;
-        match guard.as_mut() {
+        let guard = self.inner.lock().await;
+        match guard.as_ref() {
             Some(seeder) => seeder.seed(file).await,
             None => bail!("seeder not started"),
         }
@@ -50,9 +55,8 @@ impl SeederHandle {
     }
 
     pub async fn shutdown(&self) {
-        if let Some(seeder) = self.inner.lock().await.take() {
-            seeder.shutdown().await.ok();
-        }
+        // dropping the session ends seeding; there is no external process to reap
+        let _ = self.inner.lock().await.take();
     }
 
     pub async fn retain_staging(&self, live_sources: &[PathBuf]) {
@@ -60,27 +64,4 @@ impl SeederHandle {
             seeder.retain_staging(live_sources);
         }
     }
-}
-
-// config supplies the swarm settings, but a launch-time env var (used for testing) wins
-fn swarm_env(
-    trackers: &[String],
-    stun: &[String],
-    max_up_mbit: u32,
-    max_down_mbit: u32,
-) -> Vec<(String, String)> {
-    let mut env = Vec::new();
-    if std::env::var_os("BAKEMONO_TRACKERS").is_none() && !trackers.is_empty() {
-        env.push(("BAKEMONO_TRACKERS".to_string(), trackers.join(",")));
-    }
-    if std::env::var_os("BAKEMONO_STUN").is_none() && !stun.is_empty() {
-        env.push(("BAKEMONO_STUN".to_string(), stun.join(",")));
-    }
-    if std::env::var_os("BAKEMONO_MAX_UP").is_none() && max_up_mbit > 0 {
-        env.push(("BAKEMONO_MAX_UP".to_string(), max_up_mbit.to_string()));
-    }
-    if std::env::var_os("BAKEMONO_MAX_DOWN").is_none() && max_down_mbit > 0 {
-        env.push(("BAKEMONO_MAX_DOWN".to_string(), max_down_mbit.to_string()));
-    }
-    env
 }

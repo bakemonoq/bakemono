@@ -32,12 +32,8 @@
     ],
     "externalBin": [
       "binaries/bakemono-daemon",
-      "binaries/node",
       "binaries/gallery-dl",
       "binaries/ffmpeg"
-    ],
-    "resources": [
-      "sidecars/webtorrent"
     ],
     "createUpdaterArtifacts": true
   },

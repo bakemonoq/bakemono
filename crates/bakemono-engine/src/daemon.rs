@@ -83,9 +83,7 @@ impl<C: ContentSource> Daemon<C> {
         progress: ProgressFn<'_>,
     ) -> Result<Value> {
         let seeder = if self.config.seed {
-            self.ensure_seeder()
-                .await
-                .context("starting the webtorrent seeder")?;
+            self.ensure_seeder().await.context("starting the seeder")?;
             Some(&self.seeder)
         } else {
             None
@@ -120,14 +118,7 @@ impl<C: ContentSource> Daemon<C> {
     }
 
     async fn ensure_seeder(&self) -> Result<()> {
-        self.seeder
-            .ensure_started(
-                &self.config.trackers,
-                &self.config.stun,
-                self.config.max_up_mbit,
-                self.config.max_down_mbit,
-            )
-            .await
+        self.seeder.ensure_started(&self.config.trackers).await
     }
 
     fn begin(&self) -> Result<JobGuard<'_>> {

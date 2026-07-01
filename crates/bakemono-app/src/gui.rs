@@ -178,25 +178,19 @@ fn get_config(state: State<AppState>) -> AppConfig {
 fn save_settings(
     relays: Vec<String>,
     trackers: Vec<String>,
-    stun: Vec<String>,
     max_up_mbit: u32,
     max_down_mbit: u32,
-    node_bin: Option<String>,
     ffmpeg_bin: Option<String>,
     gallery_dl_bin: Option<String>,
-    webtorrent_script: Option<String>,
     state: State<AppState>,
 ) -> Result<AppConfig, String> {
     let mut guard = state.lock();
     guard.config.relays = relays;
     guard.config.trackers = trackers;
-    guard.config.stun = stun;
     guard.config.max_up_mbit = max_up_mbit;
     guard.config.max_down_mbit = max_down_mbit;
-    guard.config.node_bin = clean_path(node_bin);
     guard.config.ffmpeg_bin = clean_path(ffmpeg_bin);
     guard.config.gallery_dl_bin = clean_path(gallery_dl_bin);
-    guard.config.webtorrent_script = clean_path(webtorrent_script);
     guard.config.save().map_err(stringify)?;
     tracing::info!(relays = guard.config.relays.len(), "saved settings");
     Ok(guard.config.clone())
@@ -409,20 +403,17 @@ fn daemon_bin_name() -> &'static str {
     }
 }
 
-// release builds ship node, gallery-dl and the webtorrent script with the app; hand the daemon
-// their paths through the env seams the engine already reads. dev builds leave these unset and
-// fall back to PATH / the in-repo sidecar
+// release builds ship gallery-dl and ffmpeg with the app; hand the daemon their paths through the
+// env seams the engine already reads. dev builds leave these unset and fall back to PATH
 static BUNDLED: OnceLock<Bundled> = OnceLock::new();
 
 #[derive(Default)]
 struct Bundled {
-    node: Option<PathBuf>,
     gallery_dl: Option<PathBuf>,
-    webtorrent: Option<PathBuf>,
     ffmpeg: Option<PathBuf>,
 }
 
-fn resolve_bundled(app: &tauri::App) -> Bundled {
+fn resolve_bundled(_app: &tauri::App) -> Bundled {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf));
@@ -430,16 +421,8 @@ fn resolve_bundled(app: &tauri::App) -> Bundled {
         let path = exe_dir.as_ref()?.join(bin_name(name));
         path.exists().then_some(path)
     };
-    let webtorrent = app
-        .path()
-        .resource_dir()
-        .ok()
-        .map(|dir| dir.join("sidecars/webtorrent/seed.mjs"))
-        .filter(|p| p.exists());
     Bundled {
-        node: next_to_exe("node"),
         gallery_dl: next_to_exe("gallery-dl"),
-        webtorrent,
         ffmpeg: next_to_exe("ffmpeg"),
     }
 }
@@ -449,8 +432,6 @@ fn resolve_bundled(app: &tauri::App) -> Bundled {
 // falls back to PATH / the in-repo sidecar
 fn apply_sidecar_env(cmd: &mut std::process::Command, config: &AppConfig) {
     let bundled = BUNDLED.get();
-    set_sidecar(cmd, "BAKEMONO_NODE", config.node_bin.as_deref(), bundled.and_then(|b| b.node.as_deref()));
-    set_sidecar(cmd, "BAKEMONO_WEBTORRENT", config.webtorrent_script.as_deref(), bundled.and_then(|b| b.webtorrent.as_deref()));
     set_sidecar(cmd, "BAKEMONO_GALLERY_DL", config.gallery_dl_bin.as_deref(), bundled.and_then(|b| b.gallery_dl.as_deref()));
     set_sidecar(cmd, "BAKEMONO_FFMPEG", config.ffmpeg_bin.as_deref(), bundled.and_then(|b| b.ffmpeg.as_deref()));
 }
