@@ -874,21 +874,24 @@ async fn post_page(
     let page = render(
         &title,
         html! {
-            div.crumbs {
-                a href="/posts" { "Posts" }
-                @if let Some(c) = &creator {
-                    " / " a href=(format!("/c/{platform}/{creator_id}")) { (c) }
+            div.posthead {
+                (nav_btn(&platform, &creator_id,
+                    adjacent.as_ref().and_then(|a| a.prev_id.as_deref()),
+                    adjacent.as_ref().and_then(|a| a.prev_title.as_deref()), true))
+                div.postheadmid {
+                    h1.posttitle { (title) }
+                    div.postmeta {
+                        @if let Some(c) = &creator {
+                            "by " a.strong href=(format!("/c/{platform}/{creator_id}")) { (c) }
+                        }
+                        @if let Some(d) = &date { " - " (pretty_date(d)) }
+                        @if !files.is_empty() { " - " (files.len()) @if files.len() == 1 { " file" } @else { " files" } }
+                    }
                 }
+                (nav_btn(&platform, &creator_id,
+                    adjacent.as_ref().and_then(|a| a.next_id.as_deref()),
+                    adjacent.as_ref().and_then(|a| a.next_title.as_deref()), false))
             }
-            h1.pagetitle { (title) }
-            div.postmeta {
-                @if let Some(c) = &creator {
-                    "by " a.strong href=(format!("/c/{platform}/{creator_id}")) { (c) }
-                }
-                @if let Some(d) = &date { " - " (pretty_date(d)) }
-                @if !files.is_empty() { " - " (files.len()) @if files.len() == 1 { " file" } @else { " files" } }
-            }
-            (post_nav(&platform, &creator_id, adjacent.as_ref()))
             @if files.is_empty() { p.muted { "This post has no files, or they are hidden" } }
             (carousel(&files))
             @if !body.is_empty() { div.body { (PreEscaped(body)) } }
@@ -907,26 +910,25 @@ async fn post_page(
     resp
 }
 
-fn post_nav(platform: &str, creator_id: &str, adj: Option<&db::AdjacentRow>) -> Markup {
-    let Some(adj) = adj else {
-        return html! {};
-    };
-    let base = format!("/p/{platform}/{creator_id}");
+// a compact prev/next button flanking the post title; an absent neighbor keeps its slot so the title stays
+// centered, and the neighbor's title rides along as a hover tooltip
+fn nav_btn(
+    platform: &str,
+    creator_id: &str,
+    target: Option<&str>,
+    tip: Option<&str>,
+    is_prev: bool,
+) -> Markup {
+    let (icon, label) = if is_prev { (ICON_PREV, "Prev") } else { (ICON_NEXT, "Next") };
     html! {
-        @if adj.prev_id.is_some() || adj.next_id.is_some() {
-            div.postnav {
-                @if let Some(id) = &adj.prev_id {
-                    a href=(format!("{base}/{id}")) {
-                        (PreEscaped(ICON_PREV))
-                        span.ntitle { "Previous" @if let Some(t) = &adj.prev_title { ": " (t) } }
-                    }
-                }
-                @if let Some(id) = &adj.next_id {
-                    a.nnext href=(format!("{base}/{id}")) {
-                        span.ntitle { "Next" @if let Some(t) = &adj.next_title { ": " (t) } }
-                        (PreEscaped(ICON_NEXT))
-                    }
-                }
+        @match target {
+            Some(id) => a.pnav href=(format!("/p/{platform}/{creator_id}/{id}")) title=[tip] {
+                @if is_prev { (PreEscaped(icon)) span { (label) } }
+                @else { span { (label) } (PreEscaped(icon)) }
+            }
+            None => span.pnav.off {
+                @if is_prev { (PreEscaped(icon)) span { (label) } }
+                @else { span { (label) } (PreEscaped(icon)) }
             }
         }
     }
@@ -1559,8 +1561,8 @@ button,input,select { font:inherit }
 .brand:hover { text-decoration:none }
 .brandmascot { width:28px; height:28px; border-radius:7px; object-fit:cover }
 .searchgroup { flex:1; display:flex; align-items:center; justify-content:center; gap:.5rem }
-.topsearch { display:flex; gap:.4rem; width:min(100%,440px) }
-.topsearch input { flex:1; padding:.55rem .95rem; border-radius:999px; border:1px solid var(--surface1);
+.topsearch { display:flex; align-items:center; gap:.4rem; width:min(100%,440px) }
+.topsearch input { flex:1; height:40px; padding:0 .95rem; border-radius:999px; border:1px solid var(--surface1);
   background:var(--surface0); color:var(--text) }
 .topsearch input:focus { outline:none; border-color:var(--accent) }
 .searchbtn, .shuffle { flex:none; display:grid; place-items:center; width:40px; height:40px; border-radius:10px;
@@ -1632,17 +1634,19 @@ main { max-width:1240px; margin:0 auto; padding:1.4rem 1.1rem 3rem }
 .tagline { color:var(--subtext0); margin:.2rem 0 .6rem }
 .welcomebody { color:var(--subtext1) }
 
-.postmeta { color:var(--subtext0); margin:.1rem 0 1rem }
+.posthead { display:flex; align-items:center; gap:1rem; margin:.4rem 0 1rem }
+.postheadmid { flex:1; min-width:0; text-align:center }
+.posttitle { margin:0; font-size:1.4rem; overflow-wrap:anywhere }
+.postmeta { margin:.2rem 0 0; color:var(--subtext0) }
 .postmeta a { color:var(--subtext1); font-weight:600 }
-.postnav { display:flex; gap:.6rem; margin:.2rem 0 1.2rem }
-.postnav a { display:flex; align-items:center; gap:.4rem; max-width:48%; color:var(--subtext1); font-weight:600;
-  background:var(--surface0); border:1px solid var(--surface1); padding:.45rem .7rem; border-radius:10px }
-.postnav a:hover { border-color:var(--accent); text-decoration:none }
-.postnav .nnext { margin-left:auto; text-align:right }
-.postnav .ntitle { overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
-.carousel { position:relative; display:flex; align-items:center; justify-content:center; gap:.6rem; margin:1rem auto 1.4rem; max-width:920px }
-.cstage { flex:1; display:flex; align-items:center; justify-content:center; min-height:240px; background:var(--crust); border-radius:16px; overflow:hidden }
-.cmedia { max-width:100%; max-height:80vh; display:block; border-radius:16px }
+.pnav { flex:none; display:inline-flex; align-items:center; gap:.35rem; color:var(--subtext1); font-weight:600;
+  background:var(--surface0); border:1px solid var(--surface1); padding:.45rem .7rem; border-radius:10px; white-space:nowrap }
+.pnav:hover { border-color:var(--accent); text-decoration:none }
+.pnav.off { visibility:hidden }
+.carousel { position:relative; display:flex; align-items:center; justify-content:center; gap:.6rem; margin:.4rem auto 1.4rem; max-width:960px }
+.cstage { flex:1; display:flex; align-items:center; justify-content:center; height:min(70vh,760px); background:var(--crust); border-radius:16px; overflow:hidden }
+.cmedia { max-width:100%; max-height:100%; object-fit:contain; display:block }
+.cload { color:var(--subtext0); font-size:.9rem; letter-spacing:.04em }
 .cprev, .cnext { flex:none; width:44px; height:44px; border-radius:50%; border:1px solid var(--surface1); background:var(--surface0); color:var(--text); display:grid; place-items:center; cursor:pointer }
 .cprev:hover, .cnext:hover { background:var(--accent); color:var(--crust); border-color:var(--accent) }
 .ccount { position:absolute; bottom:12px; left:50%; transform:translateX(-50%); background:#000a; color:#fff; padding:.15rem .65rem; border-radius:999px; font-size:.75rem }
@@ -1684,32 +1688,37 @@ pre { white-space:pre-wrap; word-break:break-all; background:var(--mantle); bord
   .grid { grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:10px }
   .welcome { flex-direction:column; text-align:center }
   .mascot { width:120px }
-  .postnav a { max-width:100% }
+  .pnav span { display:none }
+  .posthead { gap:.5rem }
 }
 ";
 
 const CAROUSEL_JS: &str = "
-// full media loaded straight from the gateway, one item at a time; only the shown item is fetched
+// full media loaded straight from the gateway, one item at a time; only the shown item is fetched.
+// the stage holds a fixed size and shows a loading state until the media is ready, so navigating never
+// collapses the frame while bytes arrive over the swarm
 for (const el of document.querySelectorAll('.carousel')) {
   let items = []
   try { items = JSON.parse(el.dataset.items || '[]') } catch (e) {}
   const stage = el.querySelector('.cstage')
   const count = el.querySelector('.ccount')
-  let i = 0
+  let i = 0, token = 0
   const show = (n) => {
     i = (n + items.length) % items.length
     const it = items[i]
-    let node
-    if (it.v) { node = document.createElement('video'); node.controls = true; node.src = it.u }
-    else { node = new Image(); node.alt = ''; node.src = it.u }
-    node.className = 'cmedia'
-    node.onerror = () => {
-      const p = document.createElement('p'); p.className = 'muted'
-      p.textContent = 'unavailable - no seeders online right now'
-      stage.replaceChildren(p)
-    }
-    stage.replaceChildren(node)
     if (count) count.textContent = (i + 1) + ' / ' + items.length
+    const gen = ++token
+    const load = document.createElement('div'); load.className = 'cload'; load.textContent = 'Loading...'
+    stage.replaceChildren(load)
+    const done = (node) => { if (gen === token) { node.className = 'cmedia'; stage.replaceChildren(node) } }
+    const fail = () => { if (gen === token) load.textContent = 'unavailable - no seeders online right now' }
+    if (it.v) {
+      const v = document.createElement('video'); v.controls = true; v.preload = 'metadata'
+      v.onloadeddata = () => done(v); v.onerror = fail; v.src = it.u
+    } else {
+      const img = new Image(); img.alt = ''
+      img.onload = () => done(img); img.onerror = fail; img.src = it.u
+    }
   }
   el.querySelector('.cprev')?.addEventListener('click', () => show(i - 1))
   el.querySelector('.cnext')?.addEventListener('click', () => show(i + 1))
