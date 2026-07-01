@@ -302,7 +302,7 @@ fn media_block(f: &db::ManifestRow) -> Markup {
                 @if is_video {
                     video controls preload="metadata" src=(full) {}
                 } @else {
-                    img src=(full) loading="lazy" alt="";
+                    img src=(full) loading="lazy" alt="" onerror="bakemonoErr(this)";
                 }
             }
         }
@@ -856,24 +856,34 @@ a { color: #4488ff }
 ";
 
 const THUMB_JS: &str = "
+// the gateway 502s when it can't reach a seeder; show that instead of a broken-image icon
+function bakemonoErr(node) {
+  const box = node.closest('.media') || node
+  const msg = document.createElement('p'); msg.className = 'muted'
+  msg.textContent = 'unavailable - no seeders online right now'
+  box.classList.remove('loading'); box.replaceChildren(msg)
+}
 // the full file is fetched only on click, never prefetched, so a page of thumbnails stays cheap.
 // the thumbnail stays visible under a loading overlay until the full lands, then swaps in
 for (const el of document.querySelectorAll('.media')) {
   const full = el.dataset.full
   const isVideo = el.dataset.video === '1'
+  const thumb = el.querySelector('img.thumb')
+  if (thumb) thumb.addEventListener('error', () => bakemonoErr(el))
   el.title = 'click to load the full file'
   el.addEventListener('click', () => {
     if (el.dataset.open) return
     el.dataset.open = '1'
     if (isVideo) {
       const v = document.createElement('video'); v.controls = true; v.autoplay = true; v.src = full
+      v.onerror = () => bakemonoErr(el)
       el.replaceChildren(v)
       return
     }
     el.classList.add('loading')
     const img = new Image(); img.alt = ''
     img.onload = () => { el.classList.remove('loading'); el.replaceChildren(img) }
-    img.onerror = () => { el.classList.remove('loading'); el.dataset.open = '' }
+    img.onerror = () => { el.dataset.open = ''; bakemonoErr(el) }
     img.src = full
   })
 }

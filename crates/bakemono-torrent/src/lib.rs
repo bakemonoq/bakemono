@@ -48,6 +48,8 @@ pub struct Gateway {
     // operator-pinned seeders tried directly, so a known seedbox works without waiting on tracker/DHT
     initial_peers: Vec<SocketAddr>,
     cache: Cache,
+    // cap on resolving a cold torrent's metadata, so a request with no reachable peers fails instead of hanging
+    fetch_timeout: Duration,
 }
 
 impl Gateway {
@@ -68,10 +70,17 @@ impl Gateway {
         let session = Session::new_with_opts(cache_dir, opts)
             .await
             .context("starting torrent session")?;
+        let fetch_timeout = Duration::from_secs(
+            std::env::var("BAKEMONO_FETCH_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(20),
+        );
         Ok(Self {
             session,
             initial_peers,
             cache,
+            fetch_timeout,
         })
     }
 
@@ -144,29 +153,45 @@ impl Gateway {
         let infohash =
             infohash_from_magnet(magnet).ok_or_else(|| anyhow!("magnet carries no infohash"))?;
         let dir = self.cache.dir.join(&infohash);
-        let initial_peers =
-            (!self.initial_peers.is_empty()).then(|| self.initial_peers.clone());
-        let resp = self
-            .session
-            .add_torrent(
-                AddTorrent::from_url(magnet),
-                Some(AddTorrentOptions {
-                    only_files: Some(only_files),
-                    overwrite: true,
-                    output_folder: Some(dir.to_string_lossy().into_owned()),
-                    initial_peers,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .context("adding torrent to session")?;
-        let handle = resp
-            .into_handle()
-            .ok_or_else(|| anyhow!("torrent produced no handle"))?;
-        handle
-            .wait_until_initialized()
-            .await
-            .context("waiting for torrent metadata")?;
+        let opts = AddTorrentOptions {
+            only_files: Some(only_files),
+            overwrite: true,
+            output_folder: Some(dir.to_string_lossy().into_owned()),
+            initial_peers: (!self.initial_peers.is_empty()).then(|| self.initial_peers.clone()),
+            ..Default::default()
+        };
+        // both add_torrent and wait_until_initialized block on metadata from a peer for a cold torrent;
+        // bound the whole thing so a request with no reachable seeder fails instead of hanging forever
+        let added = tokio::time::timeout(self.fetch_timeout, async {
+            let resp = self
+                .session
+                .add_torrent(AddTorrent::from_url(magnet), Some(opts))
+                .await
+                .context("adding torrent to session")?;
+            let handle = resp
+                .into_handle()
+                .ok_or_else(|| anyhow!("torrent produced no handle"))?;
+            handle
+                .wait_until_initialized()
+                .await
+                .context("waiting for torrent metadata")?;
+            Ok::<_, anyhow::Error>(handle)
+        })
+        .await;
+        let handle = match added {
+            Ok(Ok(handle)) => handle,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                // drop the stuck torrent so it does not linger in the session
+                if let Ok(id) = TorrentIdOrHash::parse(&infohash) {
+                    let _ = self.session.delete(id, false).await;
+                }
+                return Err(anyhow!(
+                    "no seeders reachable for {infohash} (timed out after {}s)",
+                    self.fetch_timeout.as_secs()
+                ));
+            }
+        };
         // when the selected file finishes, drop a .done marker so later requests serve it from disk
         // with no peer (offline cache hit) and survive a board restart
         let h = handle.clone();
