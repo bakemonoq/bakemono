@@ -32,6 +32,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
 hex.workspace = true
+base64 = "0.22"
 tracing.workspace = true
 
 nostr-relay-builder = { workspace = true, optional = true }

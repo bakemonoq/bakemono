@@ -56,29 +56,18 @@ pub async fn upsert(pool: &PgPool, event: &Event, manifest: &Manifest) -> Result
         .bind(&manifest.posted_at)
         .bind(&manifest.tier)
         .bind(&manifest.content)
-        .bind(&manifest.thumb_x)
-        .bind(&manifest.thumb_magnet)
+        .bind(&manifest.thumb)
         .bind(bakemono_torrent::infohash_from_magnet(&manifest.magnet))
-        .bind(
-            manifest
-                .thumb_magnet
-                .as_deref()
-                .and_then(bakemono_torrent::infohash_from_magnet),
-        )
         .execute(pool)
         .await?;
     Ok(())
 }
 
 // the gateway only serves infohashes the board actually carries (and that pass moderation), so resolve
-// through visible_manifests; an unknown or hidden hash returns None and the route 404s. matches the
-// full-file infohash or a thumbnail infohash, returning the magnet for whichever it is
+// through visible_manifests; an unknown or hidden hash returns None and the route 404s
 pub async fn magnet_by_infohash(pool: &PgPool, infohash: &str) -> Result<Option<String>> {
     let magnet = sqlx::query_scalar(
-        "SELECT magnet FROM visible_manifests WHERE infohash = $1
-         UNION ALL
-         SELECT thumb_magnet FROM visible_manifests WHERE thumb_infohash = $1
-         LIMIT 1",
+        "SELECT magnet FROM visible_manifests WHERE infohash = $1 LIMIT 1",
     )
     .bind(infohash)
     .fetch_optional(pool)
@@ -433,10 +422,8 @@ pub struct ManifestRow {
     pub posted_at: Option<String>,
     pub tier: Option<String>,
     pub content: String,
-    pub thumb_x: Option<String>,
-    pub thumb_magnet: Option<String>,
+    pub thumb: Option<String>,
     pub infohash: Option<String>,
-    pub thumb_infohash: Option<String>,
 }
 
 const SCHEMA: &str = "
@@ -459,26 +446,24 @@ CREATE TABLE IF NOT EXISTS manifests (
     posted_at  TEXT,
     tier       TEXT,
     content    TEXT NOT NULL,
-    thumb_x      TEXT,
-    thumb_magnet TEXT,
-    infohash   TEXT,
-    thumb_infohash TEXT
+    thumb      TEXT,
+    infohash   TEXT
 );
--- add the preview columns to boards indexed before thumbnails existed
-ALTER TABLE manifests ADD COLUMN IF NOT EXISTS thumb_x TEXT;
-ALTER TABLE manifests ADD COLUMN IF NOT EXISTS thumb_magnet TEXT;
+-- drop the view first so the seeded-thumb columns it expanded via m.* can be dropped below
+DROP VIEW IF EXISTS visible_manifests;
+-- inline preview lives in the event now; retire the seeded-thumb columns
+ALTER TABLE manifests ADD COLUMN IF NOT EXISTS thumb TEXT;
+ALTER TABLE manifests DROP COLUMN IF EXISTS thumb_x;
+ALTER TABLE manifests DROP COLUMN IF EXISTS thumb_magnet;
+ALTER TABLE manifests DROP COLUMN IF EXISTS thumb_infohash;
 -- the gateway keys on the v1 btih; carry it as its own column so a lookup is an index hit, not a magnet scan
 ALTER TABLE manifests ADD COLUMN IF NOT EXISTS infohash TEXT;
-ALTER TABLE manifests ADD COLUMN IF NOT EXISTS thumb_infohash TEXT;
 UPDATE manifests SET infohash = lower(substring(magnet from 'xt=urn:btih:([0-9A-Fa-f]{40})'))
 WHERE infohash IS NULL AND magnet ~ 'xt=urn:btih:[0-9A-Fa-f]{40}';
-UPDATE manifests SET thumb_infohash = lower(substring(thumb_magnet from 'xt=urn:btih:([0-9A-Fa-f]{40})'))
-WHERE thumb_infohash IS NULL AND thumb_magnet ~ 'xt=urn:btih:[0-9A-Fa-f]{40}';
 CREATE INDEX IF NOT EXISTS manifests_creator ON manifests (platform, creator_id);
 CREATE INDEX IF NOT EXISTS manifests_post ON manifests (platform, creator_id, post_id);
 CREATE INDEX IF NOT EXISTS manifests_hash ON manifests (file_hash);
 CREATE INDEX IF NOT EXISTS manifests_infohash ON manifests (infohash);
-CREATE INDEX IF NOT EXISTS manifests_thumb_infohash ON manifests (thumb_infohash);
 CREATE INDEX IF NOT EXISTS manifests_recent ON manifests (created_at DESC);
 
 CREATE TABLE IF NOT EXISTS pubkeys (
@@ -520,8 +505,8 @@ const INSERT: &str = "
 INSERT INTO manifests (
     event_id, pubkey, created_at, d_tag, file_hash, size, mime, magnet,
     platform, creator, creator_id, post_id, file_index, filename, post_title, posted_at, tier, content,
-    thumb_x, thumb_magnet, infohash, thumb_infohash
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+    thumb, infohash
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
 ON CONFLICT (event_id) DO NOTHING
 ";
 

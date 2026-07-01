@@ -28,8 +28,6 @@ pub struct Manifest {
     pub tier: Option<String>,
     pub topics: Vec<String>,
     pub thumb: Option<String>,
-    pub thumb_x: Option<String>,
-    pub thumb_magnet: Option<String>,
     pub content: String,
 }
 
@@ -68,8 +66,6 @@ impl Manifest {
             tier: tags::first(event, tags::TIER),
             topics: tags::all(event, tags::TOPIC),
             thumb: tags::first(event, tags::THUMB),
-            thumb_x: tags::first(event, tags::THUMB_X),
-            thumb_magnet: tags::first(event, tags::THUMB_MAGNET),
             content: event.content.clone(),
         };
         manifest.validate()?;
@@ -93,7 +89,6 @@ impl Manifest {
         v::optional_field(tags::POSTED_AT, &self.posted_at, v::MAX_TIMESTAMP)?;
         v::optional_field(tags::TIER, &self.tier, v::MAX_TIER)?;
         v::optional_field(tags::THUMB, &self.thumb, v::MAX_THUMB)?;
-        self.validate_seeded_thumb()?;
         if self.topics.len() > v::MAX_TOPICS {
             return Err(Error::TooLarge { field: tags::TOPIC });
         }
@@ -102,22 +97,6 @@ impl Manifest {
         }
         v::within("content", &self.content, v::MAX_CONTENT)?;
         Ok(())
-    }
-
-    // the seeded preview is a hash+magnet pair: a board needs both to fetch and verify it, so reject
-    // a half-set pair instead of indexing a dangling reference
-    fn validate_seeded_thumb(&self) -> Result<()> {
-        use crate::validation as v;
-        match (&self.thumb_x, &self.thumb_magnet) {
-            (Some(hash), Some(magnet)) => {
-                v::hex_hash(tags::THUMB_X, hash)?;
-                v::magnet(magnet)?;
-                Ok(())
-            }
-            (None, None) => Ok(()),
-            (Some(_), None) => Err(Error::MissingTag(tags::THUMB_MAGNET)),
-            (None, Some(_)) => Err(Error::MissingTag(tags::THUMB_X)),
-        }
     }
 
     fn sign(&self, keys: &Keys, created_at: Option<u64>) -> Result<Event> {
@@ -148,8 +127,6 @@ impl Manifest {
         push_opt(&mut rows, tags::POSTED_AT, &self.posted_at);
         push_opt(&mut rows, tags::TIER, &self.tier);
         push_opt(&mut rows, tags::THUMB, &self.thumb);
-        push_opt(&mut rows, tags::THUMB_X, &self.thumb_x);
-        push_opt(&mut rows, tags::THUMB_MAGNET, &self.thumb_magnet);
         for topic in &self.topics {
             rows.push(vec![tags::TOPIC.to_string(), topic.clone()]);
         }

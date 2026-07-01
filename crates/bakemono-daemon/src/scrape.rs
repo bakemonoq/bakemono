@@ -54,8 +54,6 @@ pub fn manifest_from_files(media: &Path, sidecar: &Path) -> Result<Manifest> {
         tier: Some(tier_of(&meta)),
         topics: topics_of(&meta),
         thumb: None,
-        thumb_x: None,
-        thumb_magnet: None,
         content: string_at(&meta, &["content"]).unwrap_or_default(),
     })
 }
@@ -77,10 +75,11 @@ fn is_sidecar(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()) == Some("json")
 }
 
+// skip legacy seeded previews and any leftover inline-thumb temp file so neither is ingested as media
 fn is_thumb(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|n| n.ends_with(".thumb.jpg"))
+        .is_some_and(|n| n.ends_with(".thumb.jpg") || n.ends_with(".thumbtmp.webp"))
 }
 
 fn sidecar_path(media: &Path) -> PathBuf {

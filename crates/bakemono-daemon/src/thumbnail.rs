@@ -2,35 +2,43 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use tokio::process::Command;
 
-// fit inside a 400x400 box, keep aspect, even dims so mjpeg accepts the frame
-const SCALE: &str = "scale=400:400:force_original_aspect_ratio=decrease:force_divisible_by=2";
+use bakemono_core::validation::MAX_THUMB;
 
-pub fn thumb_path(media: &Path) -> PathBuf {
-    let mut name = media.to_path_buf().into_os_string();
-    name.push(".thumb.jpg");
-    PathBuf::from(name)
+// small enough to embed in the signed event and stay under a relay's size limit; a 320px webp
+// at this quality lands well under the 32KB thumb cap for typical images
+const SCALE: &str = "scale=320:320:force_original_aspect_ratio=decrease:force_divisible_by=2";
+const QUALITY: &str = "50";
+
+// best-effort downscaled preview for any image, gif, or video, encoded inline as a webp data URI.
+// callers treat None (too big to embed) and Err (no ffmpeg / decode failed) as "no thumbnail",
+// never a fatal scrape failure
+pub async fn generate_inline(media: &Path, mime: &str) -> Result<Option<String>> {
+    let out = tmp_path(media);
+    let made = if mime.starts_with("video/") {
+        // a 1s seek skips black intro frames; fall back to the first frame for sub-second clips
+        (run(media, &out, Some("1")).await.is_ok() && nonempty(&out))
+            || run(media, &out, Some("0")).await.is_ok()
+    } else {
+        run(media, &out, None).await.is_ok()
+    };
+    if !made || !nonempty(&out) {
+        let _ = std::fs::remove_file(&out);
+        bail!("ffmpeg produced no thumbnail for {}", media.display());
+    }
+    let bytes = std::fs::read(&out).with_context(|| format!("reading {}", out.display()));
+    let _ = std::fs::remove_file(&out);
+    let uri = format!("data:image/webp;base64,{}", STANDARD.encode(bytes?));
+    Ok((uri.len() <= MAX_THUMB).then_some(uri))
 }
 
-// best-effort downscaled poster frame for any image, gif, or video; the jpeg path on success.
-// callers treat an error as "no thumbnail", never a fatal scrape failure
-pub async fn generate(media: &Path, mime: &str) -> Result<PathBuf> {
-    let out = thumb_path(media);
-    if mime.starts_with("video/") {
-        // a 1s seek skips black intro frames; fall back to the first frame for sub-second clips
-        if run(media, &out, Some("1")).await.is_ok() && nonempty(&out) {
-            return Ok(out);
-        }
-        run(media, &out, Some("0")).await?;
-    } else {
-        run(media, &out, None).await?;
-    }
-    if nonempty(&out) {
-        Ok(out)
-    } else {
-        bail!("ffmpeg produced no thumbnail for {}", media.display())
-    }
+fn tmp_path(media: &Path) -> PathBuf {
+    let mut name = media.to_path_buf().into_os_string();
+    name.push(".thumbtmp.webp");
+    PathBuf::from(name)
 }
 
 async fn run(media: &Path, out: &Path, seek: Option<&str>) -> Result<()> {
@@ -50,8 +58,10 @@ async fn run(media: &Path, out: &Path, seek: Option<&str>) -> Result<()> {
         .arg("1")
         .arg("-vf")
         .arg(SCALE)
-        .arg("-q:v")
-        .arg("5")
+        .arg("-c:v")
+        .arg("libwebp")
+        .arg("-quality")
+        .arg(QUALITY)
         .arg(out)
         .status()
         .await
@@ -74,9 +84,9 @@ fn ffmpeg_bin() -> OsString {
 mod tests {
     use super::*;
 
-    // makes a real source image with ffmpeg, then thumbnails it; skips if ffmpeg is absent
+    // makes a real source image with ffmpeg, then thumbnails it inline; skips if ffmpeg is absent
     #[tokio::test]
-    async fn makes_a_jpeg_thumbnail_from_an_image() {
+    async fn makes_an_inline_webp_thumbnail_from_an_image() {
         let dir = std::env::temp_dir().join(format!("bakemono-thumb-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("src.png");
@@ -97,11 +107,12 @@ mod tests {
             }
         }
 
-        let thumb = generate(&src, "image/png").await.unwrap();
-        let bytes = std::fs::read(&thumb).unwrap();
+        let uri = generate_inline(&src, "image/png").await.unwrap();
         std::fs::remove_dir_all(&dir).ok();
 
-        assert!(!bytes.is_empty());
-        assert_eq!(&bytes[0..3], &[0xFF, 0xD8, 0xFF], "output is a jpeg");
+        let uri = uri.expect("thumbnail small enough to embed");
+        assert!(uri.starts_with("data:image/webp;base64,"));
+        assert!(uri.len() <= MAX_THUMB, "stays under the relay-safe cap");
+        assert!(!tmp_path(&src).exists(), "temp file cleaned up");
     }
 }

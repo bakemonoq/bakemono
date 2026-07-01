@@ -77,16 +77,11 @@ impl ContentSource for AppContentSource {
     }
 
     fn seedable(&self, content_dir: &Path) -> Vec<PathBuf> {
-        let mut files = Vec::new();
-        for (media, _sidecar) in gather_pairs(content_dir).unwrap_or_default() {
-            // re-seed each preview next to its file so published thumb magnets stay live after a restart
-            let thumb = crate::thumbnail::thumb_path(&media);
-            files.push(media);
-            if thumb.is_file() {
-                files.push(thumb);
-            }
-        }
-        files
+        gather_pairs(content_dir)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(media, _sidecar)| media)
+            .collect()
     }
 
     fn stats(&self, content_dir: &Path) -> Value {

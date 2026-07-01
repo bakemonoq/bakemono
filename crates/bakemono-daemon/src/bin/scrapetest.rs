@@ -1,8 +1,10 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use nostr_relay_builder::MockRelay;
 use nostr_sdk::prelude::*;
 use serde_json::{json, Value};
@@ -11,6 +13,7 @@ use bakemono_engine::identity::Identity;
 use bakemono_daemon::pipeline::{Progress, RunSummary};
 use bakemono_daemon::source::AppContentSource;
 use bakemono_core::protocol::KIND_MANIFEST;
+use bakemono_core::validation::MAX_THUMB;
 use bakemono_core::Manifest;
 use bakemono_engine::config::AppConfig;
 use bakemono_engine::daemon::Daemon;
@@ -74,7 +77,7 @@ async fn main() -> Result<()> {
     daemon.shutdown().await;
     let summary: RunSummary = serde_json::from_value(result?)?;
 
-    verify(&url, &summary, &content_dir, opts.seed).await?;
+    verify(&url, &summary, opts.seed).await?;
     println!(
         "\nPASS: {} event(s) published and verified on the relay",
         summary.event_ids.len()
@@ -123,7 +126,7 @@ async fn run_ipc_test(dir: PathBuf, config: AppConfig) -> Result<()> {
     let result = ipc::call(job, progress).await?;
     let summary: RunSummary = serde_json::from_value(result)?;
 
-    verify(&url, &summary, &dir, seed).await?;
+    verify(&url, &summary, seed).await?;
     let _ = ipc::call(json!({"cmd": "shutdown"}), |_| {}).await;
     let _ = server.await;
     let _ = std::fs::remove_dir_all(&tmp);
@@ -164,7 +167,7 @@ fn job_from_mode(mode: &Mode) -> (PathBuf, Value) {
     }
 }
 
-async fn verify(url: &str, summary: &RunSummary, content_dir: &Path, seed: bool) -> Result<()> {
+async fn verify(url: &str, summary: &RunSummary, seed: bool) -> Result<()> {
     let client = Client::new(Keys::generate());
     client.add_relay(url).await?;
     client.connect().await;
@@ -189,12 +192,12 @@ async fn verify(url: &str, summary: &RunSummary, content_dir: &Path, seed: bool)
             .with_context(|| format!("event {id_hex} did not parse back into a manifest"))?;
         manifests.push(manifest);
     }
-    verify_thumbnails(content_dir, &manifests, seed).await
+    verify_thumbnails(&manifests, seed).await
 }
 
-// end to end preview check: with seeding + ffmpeg on, every image/video manifest must reference a
-// seeded thumbnail whose on-disk bytes hash to the thumb_x the signed event carries
-async fn verify_thumbnails(content_dir: &Path, manifests: &[Manifest], seed: bool) -> Result<()> {
+// end to end preview check: with seeding + ffmpeg on, every image/video manifest must carry an
+// inline webp thumb data URI that base64-decodes and stays under the relay-safe cap
+async fn verify_thumbnails(manifests: &[Manifest], seed: bool) -> Result<()> {
     if !seed {
         println!("thumbnails: skipped (--no-seed)");
         return Ok(());
@@ -208,33 +211,24 @@ async fn verify_thumbnails(content_dir: &Path, manifests: &[Manifest], seed: boo
         if !(m.mime.starts_with("image/") || m.mime.starts_with("video/")) {
             continue;
         }
-        let thumb_x = m.thumb_x.as_deref().with_context(|| {
-            format!("{}: no thumb_x, but ffmpeg is present and mime is {}", m.d_tag(), m.mime)
+        let thumb = m.thumb.as_deref().with_context(|| {
+            format!("{}: no inline thumb, but ffmpeg is present and mime is {}", m.d_tag(), m.mime)
         })?;
-        let magnet = m
-            .thumb_magnet
-            .as_deref()
-            .with_context(|| format!("{}: thumb_x set but thumb_magnet missing", m.d_tag()))?;
-        if !magnet.starts_with("magnet:?") {
-            bail!("{}: thumb_magnet is not a magnet uri: {magnet}", m.d_tag());
-        }
-        let filename = m
-            .filename
-            .as_deref()
-            .with_context(|| format!("{}: manifest has no filename to locate its thumbnail", m.d_tag()))?;
-        let thumb = find_thumb(content_dir, filename).with_context(|| {
-            format!("thumbnail file {filename}.thumb.jpg not found under {}", content_dir.display())
-        })?;
-        let got = hash_hex(&std::fs::read(&thumb)?);
-        if got != thumb_x {
-            bail!("{filename}: thumbnail file hash {got} != signed thumb_x {thumb_x}");
+        let b64 = thumb
+            .strip_prefix("data:image/webp;base64,")
+            .with_context(|| format!("{}: thumb is not a webp data URI: {}", m.d_tag(), &thumb[..thumb.len().min(32)]))?;
+        STANDARD
+            .decode(b64)
+            .with_context(|| format!("{}: thumb base64 does not decode", m.d_tag()))?;
+        if thumb.len() > MAX_THUMB {
+            bail!("{}: inline thumb {} bytes exceeds the {MAX_THUMB} cap", m.d_tag(), thumb.len());
         }
         verified += 1;
     }
     if verified == 0 {
         println!("thumbnails: no image/video manifests in this run");
     } else {
-        println!("thumbnails: verified {verified} seeded preview(s); on-disk bytes match signed thumb_x");
+        println!("thumbnails: verified {verified} inline preview(s); each is a decodable relay-safe webp");
     }
     Ok(())
 }
@@ -249,30 +243,6 @@ async fn ffmpeg_available() -> bool {
         .await
         .map(|s| s.success())
         .unwrap_or(false)
-}
-
-fn find_thumb(dir: &Path, media_filename: &str) -> Option<PathBuf> {
-    let target = format!("{media_filename}.thumb.jpg");
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&d) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if entry.file_name().to_string_lossy() == target {
-                return Some(path);
-            }
-        }
-    }
-    None
-}
-
-fn hash_hex(bytes: &[u8]) -> String {
-    use sha2::Digest;
-    hex::encode(sha2::Sha256::digest(bytes))
 }
 
 fn render(p: &Progress) -> String {
@@ -292,7 +262,7 @@ fn render(p: &Progress) -> String {
             size,
         } => format!("[{index}/{total}] {file} {} ({size} bytes)", &hash[..16]),
         Progress::Seeded { file, magnet } => format!("seeded {file} -> {magnet}"),
-        Progress::Thumbnailed { file, magnet } => format!("thumb {file} -> {magnet}"),
+        Progress::Thumbnailed { file, bytes } => format!("thumb {file} ({bytes} bytes inline)"),
         Progress::Skipped { file, reason } => format!("skip {file}: {reason}"),
         Progress::Publishing { relays, count } => {
             format!("publishing {count} event(s) to {}", relays.join(", "))

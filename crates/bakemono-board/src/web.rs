@@ -282,9 +282,8 @@ async fn post_page(
     )
 }
 
-// browser fetches bytes straight from the gateway over HTTP; the immutable, content-addressed URL lets
-// the browser cache it forever. when a thumbnail exists, show it first (small, fast) and swap to the
-// full file on click; the full is prefetched in parallel so the swap is instant once it lands
+// the preview is embedded in the event as a webp data URI, so it renders with zero fetch and no seeder;
+// the full file is content-addressed and pulled from the gateway over HTTP only when the thumb is clicked
 fn media_block(f: &db::ManifestRow) -> Markup {
     let Some(infohash) = f.infohash.as_deref() else {
         return html! { p.muted { "unavailable: manifest carries no infohash" } };
@@ -292,10 +291,10 @@ fn media_block(f: &db::ManifestRow) -> Markup {
     let full = format!("/t/{infohash}/f/0");
     let is_video = f.mime.starts_with("video/");
     html! {
-        @match f.thumb_infohash.as_deref() {
-            Some(th) => {
+        @match f.thumb.as_deref() {
+            Some(thumb) => {
                 div.media data-full=(full) data-video=[is_video.then_some("1")] {
-                    img.thumb src=(format!("/t/{th}/f/0")) loading="lazy" alt="";
+                    img.thumb src=(thumb) loading="lazy" alt="";
                 }
             }
             None => {
@@ -864,12 +863,10 @@ function bakemonoErr(node) {
   box.classList.remove('loading'); box.replaceChildren(msg)
 }
 // the full file is fetched only on click, never prefetched, so a page of thumbnails stays cheap.
-// the thumbnail stays visible under a loading overlay until the full lands, then swaps in
+// the inline thumbnail stays visible under a loading overlay until the full lands, then swaps in
 for (const el of document.querySelectorAll('.media')) {
   const full = el.dataset.full
   const isVideo = el.dataset.video === '1'
-  const thumb = el.querySelector('img.thumb')
-  if (thumb) thumb.addEventListener('error', () => bakemonoErr(el))
   el.title = 'click to load the full file'
   el.addEventListener('click', () => {
     if (el.dataset.open) return

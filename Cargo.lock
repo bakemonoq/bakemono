@@ -371,6 +371,7 @@ dependencies = [
  "bakemono-core",
  "bakemono-engine",
  "bakemono-scraper",
+ "base64 0.22.1",
  "hex 0.4.3",
  "nostr-relay-builder",
  "nostr-sdk",

@@ -44,7 +44,7 @@ pub enum Progress {
     },
     Thumbnailed {
         file: String,
-        magnet: String,
+        bytes: usize,
     },
     Skipped {
         file: String,
@@ -166,11 +166,6 @@ pub async fn reseed(seeder: &SeederHandle, dir: &Path) -> usize {
             Ok(_) => count += 1,
             Err(e) => tracing::warn!("reseed failed for {}: {e:#}", media.display()),
         }
-        // keep the preview's magnet alive across restarts by re-seeding it alongside its file
-        let thumb = thumbnail::thumb_path(media);
-        if thumb.is_file() && seeder.seed(&thumb).await.is_ok() {
-            count += 1;
-        }
     }
     tracing::info!(count, dir = %dir.display(), "reseeded from disk");
     count
@@ -222,15 +217,18 @@ async fn build_seed_publish(
                 file: file_label(media),
                 magnet: manifest.magnet.clone(),
             });
-            match seed_thumbnail(media, &manifest.mime, seeder).await {
-                Ok((hash, magnet)) => {
+            match thumbnail::generate_inline(media, &manifest.mime).await {
+                Ok(Some(thumb)) => {
                     progress(Progress::Thumbnailed {
                         file: file_label(media),
-                        magnet: magnet.clone(),
+                        bytes: thumb.len(),
                     });
-                    manifest.thumb_x = Some(hash);
-                    manifest.thumb_magnet = Some(magnet);
+                    manifest.thumb = Some(thumb);
                 }
+                Ok(None) => tracing::warn!(
+                    "thumbnail skipped for {}: too large to embed",
+                    media.display()
+                ),
                 Err(e) => {
                     tracing::warn!("thumbnail skipped for {}: {e:#}", media.display());
                     progress(Progress::Skipped {
@@ -280,27 +278,6 @@ async fn build_seed_publish(
         event_ids,
         relays: ctx.relays.to_vec(),
     })
-}
-
-// make a downscaled frame, seed it, return (sha256, magnet) for the manifest. the caller treats an
-// error as a skipped preview (the file still ships), but surfaces the reason so a missing ffmpeg shows
-async fn seed_thumbnail(
-    media: &Path,
-    mime: &str,
-    seeder: &SeederHandle,
-) -> Result<(String, String)> {
-    let thumb = thumbnail::generate(media, mime)
-        .await
-        .context("generating thumbnail")?;
-    let bytes = std::fs::read(&thumb).with_context(|| format!("reading {}", thumb.display()))?;
-    let hash = hash_bytes(&bytes);
-    let info = seeder.seed(&thumb).await.context("seeding thumbnail")?;
-    Ok((hash, info.magnet))
-}
-
-fn hash_bytes(bytes: &[u8]) -> String {
-    use sha2::Digest;
-    hex::encode(sha2::Sha256::digest(bytes))
 }
 
 async fn publish(relays: &[String], keys: &Keys, manifests: &[Manifest]) -> Result<Vec<EventId>> {
