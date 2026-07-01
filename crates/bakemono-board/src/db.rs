@@ -255,51 +255,70 @@ pub async fn endangered(pool: &PgPool, limit: i64) -> Result<Vec<EndangeredRow>>
     Ok(rows)
 }
 
-// how a browse grid is ordered; the string comes from a fixed set, never user input, so it is safe to
-// splice into the query. "popular" leans on post_views, everything else needs no extra join
+// how a browse grid is ordered. the field enum and desc flag both come from a fixed set, never raw user
+// input, so the ORDER BY they build is safe to splice into the query
 #[derive(Clone, Copy, PartialEq)]
-pub enum Sort {
-    Recent,
-    Popular,
-    Random,
+pub enum SortField {
+    Views,
+    Created,
+    Name,
+    Service,
 }
 
-impl Sort {
+impl SortField {
     pub fn parse(raw: Option<&str>) -> Self {
         match raw {
-            Some("popular") => Sort::Popular,
-            Some("random") => Sort::Random,
-            _ => Sort::Recent,
+            Some("views") => SortField::Views,
+            Some("name") => SortField::Name,
+            Some("service") => SortField::Service,
+            _ => SortField::Created,
         }
     }
     pub fn as_str(self) -> &'static str {
         match self {
-            Sort::Recent => "recent",
-            Sort::Popular => "popular",
-            Sort::Random => "random",
+            SortField::Views => "views",
+            SortField::Created => "created",
+            SortField::Name => "name",
+            SortField::Service => "service",
         }
     }
-    fn post_order(self) -> &'static str {
+    fn post_order(self, desc: bool) -> String {
+        let d = if desc { "DESC" } else { "ASC" };
         match self {
-            Sort::Recent => "posted_at DESC NULLS LAST, created_at DESC",
-            Sort::Popular => "views DESC, posted_at DESC NULLS LAST, created_at DESC",
-            Sort::Random => "random()",
+            SortField::Views => format!("views {d}, posted_at DESC NULLS LAST, created_at DESC"),
+            SortField::Created => format!("posted_at {d} NULLS LAST, created_at {d}"),
+            SortField::Name => format!("lower(post_title) {d} NULLS LAST, created_at DESC"),
+            SortField::Service => format!("platform {d}, posted_at DESC NULLS LAST, created_at DESC"),
         }
     }
-    fn creator_order(self) -> &'static str {
+    fn creator_order(self, desc: bool) -> String {
+        let d = if desc { "DESC" } else { "ASC" };
         match self {
-            Sort::Recent => "last_at DESC",
-            Sort::Popular => "files DESC, posts DESC",
-            Sort::Random => "random()",
+            SortField::Views => format!("views {d}, last_at DESC"),
+            SortField::Created => format!("last_at {d}"),
+            SortField::Name => format!("lower(creator) {d}"),
+            SortField::Service => format!("platform {d}, lower(creator) ASC"),
         }
     }
 }
 
-// one card per post: the cover is the post's first file that carries an inline thumb, so a grid paints with
-// zero swarm fetch. an extra row is fetched so the caller can tell there is a next page without a count
+// the services present in the catalog, to populate the source filter
+pub async fn platforms(pool: &PgPool) -> Result<Vec<String>> {
+    let rows = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT platform FROM visible_manifests ORDER BY platform",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+// one card per post; source filters by platform ("" = all). an extra row is fetched so the caller can tell
+// there is a next page without a count
 pub async fn list_posts(
     pool: &PgPool,
-    sort: Sort,
+    source: &str,
+    sort: SortField,
+    desc: bool,
     q: &str,
     limit: i64,
     offset: i64,
@@ -308,56 +327,65 @@ pub async fn list_posts(
         "SELECT t.*, COALESCE(pv.views, 0) AS views FROM (
              SELECT DISTINCT ON (platform, creator_id, post_id)
                     platform, creator_id, post_id, creator, post_title, posted_at, created_at,
-                    mime, thumb, infohash,
+                    mime, thumb,
                     COUNT(*) OVER (PARTITION BY platform, creator_id, post_id) AS files
              FROM visible_manifests
              WHERE ($1 = '' OR post_title ILIKE '%' || $1 || '%' OR creator ILIKE '%' || $1 || '%')
+               AND ($4 = '' OR platform = $4)
              ORDER BY platform, creator_id, post_id, (thumb IS NULL), file_index
          ) t
          LEFT JOIN post_views pv USING (platform, creator_id, post_id)
          ORDER BY {} LIMIT $2 OFFSET $3",
-        sort.post_order()
+        sort.post_order(desc)
     );
     let rows = sqlx::query_as::<_, PostCard>(&sql)
         .bind(q)
         .bind(limit)
         .bind(offset)
+        .bind(source)
         .fetch_all(pool)
         .await?;
     Ok(rows)
 }
 
-// one card per creator, cover thumb pulled from their newest file that has one
+// one card per creator; views is the summed views over their posts so every sort field works on both tabs
 pub async fn list_creators(
     pool: &PgPool,
-    sort: Sort,
+    source: &str,
+    sort: SortField,
+    desc: bool,
     q: &str,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<CreatorCard>> {
     let sql = format!(
-        "SELECT c.platform, c.creator_id, c.creator, c.posts, c.files,
-                cov.thumb, cov.infohash, cov.mime
+        "SELECT c.platform, c.creator_id, c.creator, c.posts, c.files, COALESCE(v.views, 0) AS views,
+                cov.thumb, cov.mime
          FROM (
              SELECT platform, creator_id, MAX(creator) AS creator,
                     COUNT(DISTINCT post_id) AS posts, COUNT(DISTINCT file_hash) AS files,
                     MAX(created_at) AS last_at
              FROM visible_manifests
              WHERE ($1 = '' OR creator ILIKE '%' || $1 || '%')
+               AND ($4 = '' OR platform = $4)
              GROUP BY platform, creator_id
          ) c
+         LEFT JOIN (
+             SELECT platform, creator_id, SUM(views) AS views FROM post_views GROUP BY platform, creator_id
+         ) v USING (platform, creator_id)
          LEFT JOIN LATERAL (
-             SELECT thumb, infohash, mime FROM visible_manifests v
-             WHERE v.platform = c.platform AND v.creator_id = c.creator_id
+             SELECT thumb, mime FROM visible_manifests vm
+             WHERE vm.platform = c.platform AND vm.creator_id = c.creator_id
              ORDER BY (thumb IS NULL), created_at DESC LIMIT 1
          ) cov ON true
          ORDER BY {} LIMIT $2 OFFSET $3",
-        sort.creator_order()
+        sort.creator_order(desc)
     );
     let rows = sqlx::query_as::<_, CreatorCard>(&sql)
         .bind(q)
         .bind(limit)
         .bind(offset)
+        .bind(source)
         .fetch_all(pool)
         .await?;
     Ok(rows)
@@ -645,6 +673,7 @@ pub struct CreatorCard {
     pub creator: String,
     pub posts: i64,
     pub files: i64,
+    pub views: i64,
     pub thumb: Option<String>,
     pub mime: Option<String>,
 }

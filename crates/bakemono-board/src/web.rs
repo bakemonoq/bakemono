@@ -67,10 +67,10 @@ const PAGE: i64 = 60;
 
 async fn home(State(pool): State<PgPool>) -> Html<String> {
     // 12 keeps Recent to two rows on a wide screen
-    let posts = db::list_posts(&pool, db::Sort::Recent, "", 12, 0)
+    let posts = db::list_posts(&pool, "", db::SortField::Created, true, "", 12, 0)
         .await
         .unwrap_or_default();
-    let creators = db::list_creators(&pool, db::Sort::Popular, "", 12, 0)
+    let creators = db::list_creators(&pool, "", db::SortField::Views, true, "", 12, 0)
         .await
         .unwrap_or_default();
     let cfg = config::get();
@@ -96,20 +96,22 @@ async fn home(State(pool): State<PgPool>) -> Html<String> {
 }
 
 async fn posts_index(State(pool): State<PgPool>, Query(query): Query<BrowseQuery>) -> Html<String> {
-    let (q, sort, page) = query.parts();
-    let mut posts = db::list_posts(&pool, sort, &q, PAGE + 1, page * PAGE)
+    let (q, source, sort, desc, page) = query.parts();
+    let platforms = db::platforms(&pool).await.unwrap_or_default();
+    let mut posts = db::list_posts(&pool, &source, sort, desc, &q, PAGE + 1, page * PAGE)
         .await
         .unwrap_or_default();
-    let has_next = sort != db::Sort::Random && posts.len() as i64 > PAGE;
+    let has_next = posts.len() as i64 > PAGE;
     posts.truncate(PAGE as usize);
     render(
         "posts",
         html! {
             h1.pagetitle { "Posts" }
-            (toolbar("/posts", &q, sort, "search posts"))
+            (filter_bar("/posts", &q, &source, sort, desc, &platforms, None))
+            (pager("/posts", &q, &source, sort, desc, None, page, has_next, true))
             @if posts.is_empty() { p.muted { "No posts match" } }
             (posts_grid(&posts))
-            (pager("/posts", sort, &q, page, has_next))
+            (pager("/posts", &q, &source, sort, desc, None, page, has_next, false))
         },
     )
 }
@@ -118,20 +120,22 @@ async fn creators_index(
     State(pool): State<PgPool>,
     Query(query): Query<BrowseQuery>,
 ) -> Html<String> {
-    let (q, sort, page) = query.parts();
-    let mut creators = db::list_creators(&pool, sort, &q, PAGE + 1, page * PAGE)
+    let (q, source, sort, desc, page) = query.parts();
+    let platforms = db::platforms(&pool).await.unwrap_or_default();
+    let mut creators = db::list_creators(&pool, &source, sort, desc, &q, PAGE + 1, page * PAGE)
         .await
         .unwrap_or_default();
-    let has_next = sort != db::Sort::Random && creators.len() as i64 > PAGE;
+    let has_next = creators.len() as i64 > PAGE;
     creators.truncate(PAGE as usize);
     render(
         "creators",
         html! {
             h1.pagetitle { "Creators" }
-            (toolbar("/creators", &q, sort, "search creators"))
+            (filter_bar("/creators", &q, &source, sort, desc, &platforms, None))
+            (pager("/creators", &q, &source, sort, desc, None, page, has_next, true))
             @if creators.is_empty() { p.muted { "No creators match" } }
             (creators_grid(&creators))
-            (pager("/creators", sort, &q, page, has_next))
+            (pager("/creators", &q, &source, sort, desc, None, page, has_next, false))
         },
     )
 }
@@ -148,40 +152,41 @@ async fn random_redirect(State(pool): State<PgPool>) -> Redirect {
 // one query, two result sets: posts and creators live under their own tabs since either can be large
 async fn search_index(State(pool): State<PgPool>, Query(query): Query<SearchQuery>) -> Html<String> {
     let q = query.q.unwrap_or_default().trim().to_string();
+    let source = query.source.unwrap_or_default().trim().to_string();
+    let sort = db::SortField::parse(query.sort.as_deref());
+    let desc = query.dir.as_deref() != Some("asc");
     let creators_tab = query.tab.as_deref() == Some("creators");
     let page = query.page.unwrap_or(0).max(0);
+    let tab = if creators_tab { "creators" } else { "posts" };
+    let platforms = db::platforms(&pool).await.unwrap_or_default();
 
     let mut posts = Vec::new();
     let mut creators = Vec::new();
     let mut has_next = false;
     if !q.is_empty() && creators_tab {
-        creators = db::list_creators(&pool, db::Sort::Recent, &q, PAGE + 1, page * PAGE)
+        creators = db::list_creators(&pool, &source, sort, desc, &q, PAGE + 1, page * PAGE)
             .await
             .unwrap_or_default();
         has_next = creators.len() as i64 > PAGE;
         creators.truncate(PAGE as usize);
     } else if !q.is_empty() {
-        posts = db::list_posts(&pool, db::Sort::Recent, &q, PAGE + 1, page * PAGE)
+        posts = db::list_posts(&pool, &source, sort, desc, &q, PAGE + 1, page * PAGE)
             .await
             .unwrap_or_default();
         has_next = posts.len() as i64 > PAGE;
         posts.truncate(PAGE as usize);
     }
 
-    let tab = if creators_tab { "creators" } else { "posts" };
     render(
         "search",
         html! {
             h1.pagetitle { "Search" }
-            form.search method="get" action="/search" {
-                input type="search" name="q" value=(q) placeholder="search posts and creators" autofocus;
-                @if creators_tab { input type="hidden" name="tab" value="creators"; }
-                button { "go" }
-            }
             div.tabs {
-                a.tab.active[!creators_tab] href=(search_href(&q, "posts", 0)) { "Posts" }
-                a.tab.active[creators_tab] href=(search_href(&q, "creators", 0)) { "Creators" }
+                a.tab.active[!creators_tab] href=(browse_url("/search", &q, &source, sort, desc, Some("posts"), 0)) { "Posts" }
+                a.tab.active[creators_tab] href=(browse_url("/search", &q, &source, sort, desc, Some("creators"), 0)) { "Creators" }
             }
+            (filter_bar("/search", &q, &source, sort, desc, &platforms, Some(tab)))
+            @if !q.is_empty() { (pager("/search", &q, &source, sort, desc, Some(tab), page, has_next, true)) }
             @if q.is_empty() {
                 p.muted { "Type something to search posts and creators" }
             } @else if creators_tab {
@@ -191,7 +196,7 @@ async fn search_index(State(pool): State<PgPool>, Query(query): Query<SearchQuer
                 @if posts.is_empty() { p.muted { "No posts match \"" (q) "\"" } }
                 (posts_grid(&posts))
             }
-            (search_pager(&q, tab, page, has_next))
+            @if !q.is_empty() { (pager("/search", &q, &source, sort, desc, Some(tab), page, has_next, false)) }
         },
     )
 }
@@ -199,53 +204,30 @@ async fn search_index(State(pool): State<PgPool>, Query(query): Query<SearchQuer
 #[derive(serde::Deserialize)]
 struct SearchQuery {
     q: Option<String>,
+    source: Option<String>,
+    sort: Option<String>,
+    dir: Option<String>,
     tab: Option<String>,
     page: Option<i64>,
-}
-
-fn search_href(q: &str, tab: &str, page: i64) -> String {
-    let mut out = format!("/search?q={}", qs_encode(q));
-    if tab != "posts" {
-        out.push_str(&format!("&tab={tab}"));
-    }
-    if page > 0 {
-        out.push_str(&format!("&page={page}"));
-    }
-    out
-}
-
-fn search_pager(q: &str, tab: &str, page: i64, has_next: bool) -> Markup {
-    html! {
-        @if page > 0 || has_next {
-            div.pager {
-                @if page > 0 {
-                    a.btn.ghost href=(search_href(q, tab, page - 1)) { "prev" }
-                } @else {
-                    span.btn.ghost.off { "prev" }
-                }
-                span.muted { "page " (page + 1) }
-                @if has_next {
-                    a.btn.ghost href=(search_href(q, tab, page + 1)) { "next" }
-                } @else {
-                    span.btn.ghost.off { "next" }
-                }
-            }
-        }
-    }
 }
 
 #[derive(serde::Deserialize)]
 struct BrowseQuery {
     q: Option<String>,
+    source: Option<String>,
     sort: Option<String>,
+    dir: Option<String>,
     page: Option<i64>,
 }
 
 impl BrowseQuery {
-    fn parts(self) -> (String, db::Sort, i64) {
+    // (query, source, sort field, desc, page); desc unless dir=asc
+    fn parts(self) -> (String, String, db::SortField, bool, i64) {
         (
             self.q.unwrap_or_default().trim().to_string(),
-            db::Sort::parse(self.sort.as_deref()),
+            self.source.unwrap_or_default().trim().to_string(),
+            db::SortField::parse(self.sort.as_deref()),
+            self.dir.as_deref() != Some("asc"),
             self.page.unwrap_or(0).max(0),
         )
     }
@@ -295,8 +277,9 @@ fn creator_card(c: &db::CreatorCard) -> Markup {
             div.cardmeta {
                 div.cardtitle { (c.creator) }
                 div.cardsub {
-                    span.chip.platform { (c.platform) }
+                    span.chip.platform { (pretty_platform(&c.platform)) }
                     " " (c.posts) " posts - " (c.files) " files"
+                    @if c.views > 0 { " - " (c.views) " views" }
                 }
             }
         }
@@ -320,35 +303,71 @@ fn placeholder(mime: &str) -> Markup {
     html! { div.placeholder { (PreEscaped(ICON_IMAGE)) span { (label) } } }
 }
 
-fn toolbar(base: &str, q: &str, sort: db::Sort, placeholder: &str) -> Markup {
+// source filter + sort field + direction, applied over a search box; selects auto-submit, the direction
+// toggle is a plain link carrying the current filters so it works without waiting on the selects
+fn filter_bar(
+    base: &str,
+    q: &str,
+    source: &str,
+    sort: db::SortField,
+    desc: bool,
+    platforms: &[String],
+    tab: Option<&str>,
+) -> Markup {
     html! {
-        div.toolbar {
-            form.search method="get" action=(base) {
-                input type="search" name="q" value=(q) placeholder=(placeholder);
-                @if sort != db::Sort::Recent { input type="hidden" name="sort" value=(sort.as_str()); }
-                button { "go" }
+        form.filters method="get" action=(base) {
+            @if let Some(t) = tab { input type="hidden" name="tab" value=(t); }
+            input type="hidden" name="dir" value=(if desc { "desc" } else { "asc" });
+            div.searchfield {
+                span.sicon { (PreEscaped(ICON_SEARCH)) }
+                input type="search" name="q" value=(q) placeholder="Search";
             }
-            div.tabs {
-                @for (label, s) in [("Recent", db::Sort::Recent), ("Popular", db::Sort::Popular), ("Random", db::Sort::Random)] {
-                    a.tab.active[sort == s] href=(browse_href(base, s, q, 0)) { (label) }
+            span.filtersel {
+                select name="source" aria-label="Source" onchange="this.form.submit()" {
+                    option value="" selected[source.is_empty()] { "All sources" }
+                    @for p in platforms {
+                        option value=(p) selected[source == p.as_str()] { (pretty_platform(p)) }
+                    }
                 }
+            }
+            span.filtersel {
+                select name="sort" aria-label="Sort" onchange="this.form.submit()" {
+                    @for (val, label) in [("views", "Views"), ("created", "Created"), ("name", "Alphabetic"), ("service", "Service")] {
+                        option value=(val) selected[sort.as_str() == val] { (label) }
+                    }
+                }
+            }
+            a.dirtoggle href=(browse_url(base, q, source, sort, !desc, tab, 0))
+                title=(if desc { "Sorted descending" } else { "Sorted ascending" })
+                aria-label="Toggle sort direction" {
+                (PreEscaped(if desc { ICON_SORT_DESC } else { ICON_SORT_ASC }))
             }
         }
     }
 }
 
-fn pager(base: &str, sort: db::Sort, q: &str, page: i64, has_next: bool) -> Markup {
+fn pager(
+    base: &str,
+    q: &str,
+    source: &str,
+    sort: db::SortField,
+    desc: bool,
+    tab: Option<&str>,
+    page: i64,
+    has_next: bool,
+    top: bool,
+) -> Markup {
     html! {
         @if page > 0 || has_next {
-            div.pager {
+            div.pager.top[top] {
                 @if page > 0 {
-                    a.btn.ghost href=(browse_href(base, sort, q, page - 1)) { "prev" }
+                    a.btn.ghost href=(browse_url(base, q, source, sort, desc, tab, page - 1)) { "prev" }
                 } @else {
                     span.btn.ghost.off { "prev" }
                 }
                 span.muted { "page " (page + 1) }
                 @if has_next {
-                    a.btn.ghost href=(browse_href(base, sort, q, page + 1)) { "next" }
+                    a.btn.ghost href=(browse_url(base, q, source, sort, desc, tab, page + 1)) { "next" }
                 } @else {
                     span.btn.ghost.off { "next" }
                 }
@@ -357,15 +376,53 @@ fn pager(base: &str, sort: db::Sort, q: &str, page: i64, has_next: bool) -> Mark
     }
 }
 
-fn browse_href(base: &str, sort: db::Sort, q: &str, page: i64) -> String {
-    let mut out = format!("{base}?sort={}", sort.as_str());
+fn browse_url(
+    base: &str,
+    q: &str,
+    source: &str,
+    sort: db::SortField,
+    desc: bool,
+    tab: Option<&str>,
+    page: i64,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
     if !q.is_empty() {
-        out.push_str(&format!("&q={}", qs_encode(q)));
+        parts.push(format!("q={}", qs_encode(q)));
+    }
+    if !source.is_empty() {
+        parts.push(format!("source={}", qs_encode(source)));
+    }
+    parts.push(format!("sort={}", sort.as_str()));
+    if !desc {
+        parts.push("dir=asc".to_string());
+    }
+    if let Some(t) = tab {
+        if t != "posts" {
+            parts.push(format!("tab={t}"));
+        }
     }
     if page > 0 {
-        out.push_str(&format!("&page={page}"));
+        parts.push(format!("page={page}"));
     }
-    out
+    format!("{base}?{}", parts.join("&"))
+}
+
+// a service id rendered for humans; unknown ids are just capitalized
+fn pretty_platform(p: &str) -> String {
+    match p {
+        "patreon" => "Patreon".to_string(),
+        "fanbox" => "Pixiv Fanbox".to_string(),
+        "fantia" => "Fantia".to_string(),
+        "gumroad" => "Gumroad".to_string(),
+        "subscribestar" => "SubscribeStar".to_string(),
+        other => {
+            let mut chars = other.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        }
+    }
 }
 
 fn welcome(cfg: &config::BoardConfig) -> Markup {
@@ -1565,6 +1622,8 @@ const ICON_IMAGE: &str = "<svg viewBox='0 0 24 24' width='30' height='30' fill='
 const ICON_INFO: &str = "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='9'/><path d='M12 16v-4M12 8h.01'/></svg>";
 const ICON_KEEPERS: &str = "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z'/></svg>";
 const ICON_MAIL: &str = "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><rect x='3' y='5' width='18' height='14' rx='2'/><path d='M3 7l9 6 9-6'/></svg>";
+const ICON_SORT_DESC: &str = "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M12 5v14M6 13l6 6 6-6'/></svg>";
+const ICON_SORT_ASC: &str = "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M12 19V5M6 11l6-6 6 6'/></svg>";
 
 // brand marks for footer social links (self-hosted, no icon font); matched from the toml link label
 const ICON_TELEGRAM: &str = "<svg viewBox='0 0 24 24' fill='currentColor'><path d='M11.944 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0a12 12 0 0 0-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 0 1 .171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z'/></svg>";
@@ -1653,12 +1712,21 @@ main { max-width:1240px; margin:0 auto; padding:1.4rem 1.1rem 3rem }
   color:var(--subtext1); font-size:.72rem; font-weight:600 }
 .chip.platform { background:color-mix(in srgb, var(--accent) 22%, var(--surface1)); color:var(--text) }
 
-.toolbar { display:flex; flex-wrap:wrap; gap:.8rem; align-items:center; justify-content:space-between; margin-bottom:1.1rem }
-.toolbar .search { display:flex; gap:.4rem; flex:1; min-width:220px; max-width:420px; margin:0 }
-.toolbar .search input { flex:1; padding:.5rem .8rem; border-radius:10px; border:1px solid var(--surface1);
-  background:var(--surface0); color:var(--text) }
-.tabs { display:flex; gap:.4rem; background:var(--surface0); padding:.25rem; border-radius:12px }
-.tab { padding:.4rem .85rem; border-radius:9px; color:var(--subtext1); font-weight:600; font-size:.9rem }
+.filters { display:flex; flex-wrap:wrap; align-items:center; gap:.6rem; margin:0 0 1rem }
+.searchfield { position:relative; display:flex; align-items:center; flex:1; min-width:220px }
+.searchfield .sicon { position:absolute; left:.75rem; display:grid; place-items:center; color:var(--subtext0); pointer-events:none }
+.searchfield .sicon svg { width:17px; height:17px }
+.searchfield input { flex:1; height:40px; padding:0 .9rem 0 2.3rem; border-radius:10px; border:1px solid var(--surface1); background:var(--surface0); color:var(--text) }
+.searchfield input:focus { outline:none; border-color:var(--accent) }
+.filtersel { position:relative; display:inline-flex }
+.filtersel select { height:40px; padding:0 2.1rem 0 .85rem; border-radius:10px; border:1px solid var(--surface1); background:var(--surface0); color:var(--text); font-weight:600; appearance:none; -webkit-appearance:none; cursor:pointer }
+.filtersel select:focus { outline:none; border-color:var(--accent) }
+.filtersel::after { content:''; position:absolute; right:.9rem; top:50%; width:.5rem; height:.5rem; border-right:2px solid var(--subtext0); border-bottom:2px solid var(--subtext0); transform:translateY(-70%) rotate(45deg); pointer-events:none }
+.dirtoggle { flex:none; display:grid; place-items:center; width:40px; height:40px; border-radius:10px; background:var(--surface0); border:1px solid var(--surface1); color:var(--subtext1) }
+.dirtoggle:hover { background:var(--accent); color:var(--crust); border-color:var(--accent); text-decoration:none }
+.dirtoggle svg { width:18px; height:18px }
+.tabs { display:inline-flex; gap:.3rem; background:var(--surface0); padding:.25rem; border-radius:10px; margin-bottom:.9rem }
+.tab { padding:.4rem .9rem; border-radius:8px; color:var(--subtext1); font-weight:600; font-size:.9rem }
 .tab:hover { color:var(--text); text-decoration:none }
 .tab.active { background:var(--accent); color:var(--crust) }
 
@@ -1669,7 +1737,8 @@ main { max-width:1240px; margin:0 auto; padding:1.4rem 1.1rem 3rem }
 .btn.ghost.off { opacity:.4; pointer-events:none }
 .search button, .takedown button { padding:.5rem .8rem; border-radius:10px; background:var(--accent);
   color:var(--crust); font-weight:700; border:none; cursor:pointer }
-.pager { display:flex; gap:1rem; align-items:center; justify-content:center; margin:1.6rem 0 }
+.pager { display:flex; gap:1rem; align-items:center; justify-content:center; margin:1.1rem 0 }
+.pager.top { margin:.2rem 0 1.2rem }
 
 .welcome { display:flex; gap:1.4rem; align-items:center; background:var(--mantle); border:1px solid var(--surface0);
   border-radius:12px; padding:1.4rem 1.6rem; margin-bottom:1.6rem }
