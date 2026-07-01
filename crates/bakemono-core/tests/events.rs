@@ -15,6 +15,17 @@ fn manifest_round_trips_through_a_signed_event() {
 }
 
 #[test]
+fn pow_manifest_meets_difficulty_and_round_trips() {
+    let keys = Keys::generate();
+    let manifest = sample_manifest();
+    let event = manifest.to_event_pow(&keys, 8).unwrap();
+
+    assert!(event.verify().is_ok());
+    assert!(event.id.check_pow(8));
+    assert_eq!(Manifest::from_event(&event).unwrap(), manifest);
+}
+
+#[test]
 fn from_event_rejects_a_missing_required_tag() {
     let keys = Keys::generate();
     let event = EventBuilder::new(Kind::from(31063u16), "")

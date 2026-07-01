@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -75,6 +75,10 @@ async fn ingest_manifest(pool: &PgPool, event: &Event, limiter: &IngestLimiter) 
     if event.verify().is_err() {
         return;
     }
+    // NIP-13 floor: drop manifests that never paid the proof-of-work before any DB work
+    if !event.id.check_pow(pow_min()) {
+        return;
+    }
     // rate-limit on the authenticated pubkey so no single key (even an approved one) can flood the index
     if !limiter.allow(&event.pubkey.to_hex(), now_secs()) {
         return;
@@ -86,6 +90,16 @@ async fn ingest_manifest(pool: &PgPool, event: &Event, limiter: &IngestLimiter) 
     if let Err(e) = crate::db::upsert(pool, event, &manifest).await {
         eprintln!("ingest error for {}: {e:#}", event.id.to_hex());
     }
+}
+
+fn pow_min() -> u8 {
+    static MIN: OnceLock<u8> = OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("BAKEMONO_POW_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(bakemono_core::protocol::POW_DIFFICULTY)
+    })
 }
 
 // honor a takedown only from a trusted operator; the relay author filter is advisory, so re-check here

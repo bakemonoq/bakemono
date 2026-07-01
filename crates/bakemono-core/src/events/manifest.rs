@@ -40,11 +40,15 @@ impl Manifest {
     }
 
     pub fn to_event(&self, keys: &Keys) -> Result<Event> {
-        self.sign(keys, None)
+        self.sign(keys, None, 0)
     }
 
     pub fn to_event_at(&self, keys: &Keys, created_at: u64) -> Result<Event> {
-        self.sign(keys, Some(created_at))
+        self.sign(keys, Some(created_at), 0)
+    }
+
+    pub fn to_event_pow(&self, keys: &Keys, difficulty: u8) -> Result<Event> {
+        self.sign(keys, None, difficulty)
     }
 
     pub fn from_event(event: &Event) -> Result<Self> {
@@ -99,11 +103,14 @@ impl Manifest {
         Ok(())
     }
 
-    fn sign(&self, keys: &Keys, created_at: Option<u64>) -> Result<Event> {
+    fn sign(&self, keys: &Keys, created_at: Option<u64>, difficulty: u8) -> Result<Event> {
         let mut builder = EventBuilder::new(Kind::from(KIND_MANIFEST), self.content.as_str())
             .tags(self.build_tags()?);
         if let Some(ts) = created_at {
             builder = builder.custom_created_at(Timestamp::from(ts));
+        }
+        if difficulty > 0 {
+            builder = builder.pow(difficulty);
         }
         builder
             .sign_with_keys(keys)

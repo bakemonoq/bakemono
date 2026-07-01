@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-nostr.workspace = true
+nostr = { workspace = true, features = ["pow-multi-thread"] }
 thiserror.workspace = true
 
 [dev-dependencies]

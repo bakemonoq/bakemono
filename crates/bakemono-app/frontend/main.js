@@ -19,6 +19,7 @@ function render(p) {
     case 'seeded': return `seeded ${p.file}`
     case 'thumbnailed': return `thumbnail ${p.file}`
     case 'skipped': return `skip ${p.file}: ${p.reason}`
+    case 'pow': return `proof-of-work [${p.index}/${p.total}] difficulty ${p.difficulty}`
     case 'publishing': return `publishing ${p.count} event(s) to ${p.relays.join(', ')}`
     case 'published': return `published ${p.event_ids.length} event(s)`
     case 'cancelled': return 'cancelled'

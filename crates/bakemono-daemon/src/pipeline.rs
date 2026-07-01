@@ -50,6 +50,11 @@ pub enum Progress {
         file: String,
         reason: String,
     },
+    Pow {
+        index: usize,
+        total: usize,
+        difficulty: u8,
+    },
     Publishing {
         relays: Vec<String>,
         count: usize,
@@ -254,11 +259,25 @@ async fn build_seed_publish(
         bail!("no manifests built");
     }
 
+    let difficulty = pow_difficulty();
+    let events = mint_events(ctx.identity.keys(), &manifests, difficulty, ctx.cancel, progress).await?;
+    if events.len() < manifests.len() {
+        cancelled = true;
+    }
+    if events.is_empty() {
+        progress(Progress::Cancelled);
+        return Ok(RunSummary {
+            manifests: summaries,
+            event_ids: Vec::new(),
+            relays: ctx.relays.to_vec(),
+        });
+    }
+
     progress(Progress::Publishing {
         relays: ctx.relays.to_vec(),
-        count: manifests.len(),
+        count: events.len(),
     });
-    let ids = publish(ctx.relays, ctx.identity.keys(), &manifests).await?;
+    let ids = publish(ctx.relays, ctx.identity.keys(), &events).await?;
     let event_ids: Vec<String> = ids.iter().map(|id| id.to_hex()).collect();
     progress(Progress::Published {
         event_ids: event_ids.clone(),
@@ -280,16 +299,55 @@ async fn build_seed_publish(
     })
 }
 
-async fn publish(relays: &[String], keys: &Keys, manifests: &[Manifest]) -> Result<Vec<EventId>> {
+// grind NIP-13 proof-of-work per file off the async runtime, one event at a time so the activity
+// log can count down; a single grind can run a second or more at difficulty 22
+async fn mint_events(
+    keys: &Keys,
+    manifests: &[Manifest],
+    difficulty: u8,
+    cancel: &CancellationToken,
+    progress: ProgressFn<'_>,
+) -> Result<Vec<Event>> {
+    let total = manifests.len();
+    let mut events = Vec::with_capacity(total);
+    for (index, manifest) in manifests.iter().enumerate() {
+        if cancel.is_cancelled() {
+            tracing::info!("job cancelled before proof-of-work on file {}", index + 1);
+            break;
+        }
+        progress(Progress::Pow {
+            index: index + 1,
+            total,
+            difficulty,
+        });
+        let keys = keys.clone();
+        let manifest = manifest.clone();
+        let event = tokio::task::spawn_blocking(move || manifest.to_event_pow(&keys, difficulty))
+            .await
+            .context("proof-of-work worker panicked")?
+            .context("minting manifest event")?;
+        tracing::info!(index = index + 1, total, difficulty, id = %event.id, "minted event");
+        events.push(event);
+    }
+    Ok(events)
+}
+
+fn pow_difficulty() -> u8 {
+    std::env::var("BAKEMONO_POW_DIFFICULTY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(bakemono_core::protocol::POW_DIFFICULTY)
+}
+
+async fn publish(relays: &[String], keys: &Keys, events: &[Event]) -> Result<Vec<EventId>> {
     let client = Client::new(keys.clone());
     for relay in relays {
         client.add_relay(relay).await?;
     }
     client.connect().await;
-    let mut ids = Vec::with_capacity(manifests.len());
-    for manifest in manifests {
-        let event = manifest.to_event(keys)?;
-        client.send_event(&event).await?;
+    let mut ids = Vec::with_capacity(events.len());
+    for event in events {
+        client.send_event(event).await?;
         ids.push(event.id);
     }
     client.disconnect().await;
