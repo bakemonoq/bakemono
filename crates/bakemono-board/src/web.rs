@@ -1107,9 +1107,13 @@ fn cold_miss_guard(
     Some(resp)
 }
 
-// the real client behind our proxy: Cloudflare sets CF-Connecting-IP, a generic proxy sets
-// X-Forwarded-For; fall back to the socket peer for a direct connection
+// the real client behind our proxy: only when the socket peer is a trusted proxy (Cloudflare by default)
+// do we believe CF-Connecting-IP / X-Forwarded-For; a direct hit uses the peer, so an untrusted client
+// cannot forge the rate-limit key by setting the header itself
 fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
+    if !crate::trusted_proxy::is_trusted_proxy(peer.ip()) {
+        return peer.ip();
+    }
     if let Some(ip) = headers
         .get("cf-connecting-ip")
         .and_then(|v| v.to_str().ok())
@@ -1128,39 +1132,39 @@ fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
     peer.ip()
 }
 
-// only infohashes the board carries (and that pass moderation) are served, so the gateway is never an open
-// proxy. BAKEMONO_GATEWAY_OPEN lifts the catalog check for local testing of a cold load
-async fn resolve_magnet(state: &AppState, infohash: &str) -> Option<String> {
+// the gateway builds its own magnet from the catalog infohash plus operator-configured trackers and never
+// reuses a contributor's trackers, so a manifest cannot make the board announce to a host of its choosing
+// (blind SSRF). only infohashes the board carries and that pass moderation resolve, so it is never an open
+// proxy; BAKEMONO_GATEWAY_OPEN lifts the catalog check for local testing of a cold load
+async fn resolve_gateway(state: &AppState, infohash: &str, headers: &HeaderMap) -> Option<(String, bool)> {
     let infohash = infohash.trim().to_ascii_lowercase();
     if infohash.len() != 40 || !infohash.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    if let Ok(Some(magnet)) = db::magnet_by_infohash(&state.pool, &infohash).await {
-        return Some(magnet);
+    if public_infohash(state, &infohash).await {
+        return Some((clean_magnet(&infohash), false));
     }
-    if env_opt("BAKEMONO_GATEWAY_OPEN").is_some() {
-        let trackers: Vec<String> = bakemono_core::default_trackers()
-            .into_iter()
-            .filter(|t| !t.starts_with("wss://"))
-            .collect();
-        return Some(bakemono_torrent::synth_magnet(&infohash, &trackers));
+    // a moderator additionally resolves pending or taken-down content (flagged private so it is never
+    // cached) so the mod views can preview what the public cannot see
+    if is_mod(headers) && matches!(db::magnet_by_infohash_any(&state.pool, &infohash).await, Ok(Some(_))) {
+        return Some((clean_magnet(&infohash), true));
     }
     None
 }
 
-// visible content resolves for anyone; a moderator additionally resolves pending or taken-down content
-// (flagged private so it is never cached) so the mod views can preview what the public cannot see
-async fn resolve_gateway(state: &AppState, infohash: &str, headers: &HeaderMap) -> Option<(String, bool)> {
-    if let Some(magnet) = resolve_magnet(state, infohash).await {
-        return Some((magnet, false));
+async fn public_infohash(state: &AppState, infohash: &str) -> bool {
+    if matches!(db::magnet_by_infohash(&state.pool, infohash).await, Ok(Some(_))) {
+        return true;
     }
-    if is_mod(headers) {
-        let ih = infohash.trim().to_ascii_lowercase();
-        if let Ok(Some(magnet)) = db::magnet_by_infohash_any(&state.pool, &ih).await {
-            return Some((magnet, true));
-        }
-    }
-    None
+    env_opt("BAKEMONO_GATEWAY_OPEN").is_some()
+}
+
+fn clean_magnet(infohash: &str) -> String {
+    let trackers: Vec<String> = bakemono_core::default_trackers()
+        .into_iter()
+        .filter(|t| !t.starts_with("wss://"))
+        .collect();
+    bakemono_torrent::synth_magnet(infohash, &trackers)
 }
 
 fn private_if(mut resp: Response, private: bool) -> Response {

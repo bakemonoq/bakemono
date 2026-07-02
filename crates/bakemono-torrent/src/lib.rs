@@ -53,6 +53,8 @@ pub struct Gateway {
     cache: Arc<Cache>,
     // cap on resolving a cold torrent's metadata, so a request with no reachable peers fails instead of hanging
     fetch_timeout: Duration,
+    // refuse a selected file larger than this, so one oversized torrent cannot fill the disk past the budget
+    max_file_bytes: u64,
 }
 
 impl Gateway {
@@ -85,11 +87,19 @@ impl Gateway {
                 .and_then(|s| s.trim().parse().ok())
                 .unwrap_or(60),
         );
+        // default the per-file cap to the cache budget so a single file can never exceed the whole cache;
+        // BAKEMONO_MAX_FILE_GB tightens it, 0 (with an unlimited budget) disables the check
+        let max_file_bytes = std::env::var("BAKEMONO_MAX_FILE_GB")
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .map(|gb| (gb.max(0.0) * (1u64 << 30) as f64) as u64)
+            .unwrap_or(budget_bytes);
         let gateway = Self {
             session,
             initial_peers,
             cache,
             fetch_timeout,
+            max_file_bytes,
         };
         gateway.spawn_drop_idle(drop_idle_interval);
         Ok(gateway)
@@ -192,6 +202,7 @@ impl Gateway {
         let infohash =
             infohash_from_magnet(magnet).ok_or_else(|| anyhow!("magnet carries no infohash"))?;
         let dir = self.cache.dir.join(&infohash);
+        let selected = only_files.clone();
         let opts = AddTorrentOptions {
             only_files: Some(only_files),
             overwrite: true,
@@ -231,6 +242,26 @@ impl Gateway {
                 ));
             }
         };
+        // reject an oversized file once metadata is known, before streaming, so a single torrent cannot
+        // blow past the cache budget (eviction can't reclaim an in-flight download)
+        if self.max_file_bytes > 0 {
+            let bytes = handle.with_metadata(|m| {
+                selected
+                    .iter()
+                    .filter_map(|&i| m.file_infos.get(i))
+                    .map(|fi| fi.len)
+                    .sum::<u64>()
+            })?;
+            if bytes > self.max_file_bytes {
+                if let Ok(id) = TorrentIdOrHash::parse(&infohash) {
+                    let _ = self.session.delete(id, true).await;
+                }
+                return Err(anyhow!(
+                    "file too large: {bytes} bytes exceeds cap of {} bytes",
+                    self.max_file_bytes
+                ));
+            }
+        }
         // when the selected file finishes, drop a .done marker so later requests serve it from disk
         // with no peer (offline cache hit) and survive a board restart
         let h = handle.clone();

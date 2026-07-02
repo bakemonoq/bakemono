@@ -31,6 +31,11 @@ services:
       BAKEMONO_GATEWAY_PEERS: ${BAKEMONO_GATEWAY_PEERS:-}
       # on-disk cache cap in GB; over budget, least-recently-used content is evicted. 0 = unlimited
       BAKEMONO_CACHE_GB: ${BAKEMONO_CACHE_GB:-10}
+      # reject any single file larger than this many GB before streaming; defaults to the cache cap above
+      BAKEMONO_MAX_FILE_GB: ${BAKEMONO_MAX_FILE_GB:-}
+      # comma-separated CIDRs whose forwarding headers are trusted for the real client IP; unset/empty
+      # defaults to Cloudflare's ranges, the literal "none" trusts no proxy (use the socket peer)
+      BAKEMONO_TRUSTED_PROXIES: ${BAKEMONO_TRUSTED_PROXIES:-}
       # per-client cold-miss rate limit (a miss joins a swarm): token bucket size, 0 disables; refill per second
       BAKEMONO_COLD_MISS_BURST: ${BAKEMONO_COLD_MISS_BURST:-20}
       BAKEMONO_COLD_MISS_REFILL: ${BAKEMONO_COLD_MISS_REFILL:-1}

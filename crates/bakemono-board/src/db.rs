@@ -74,11 +74,25 @@ pub async fn upsert(pool: &PgPool, event: &Event, manifest: &Manifest) -> Result
     Ok(())
 }
 
-// the gateway only serves infohashes the board actually carries (and that pass moderation), so resolve
-// through visible_manifests; an unknown or hidden hash returns None and the route 404s
+// the gateway only serves infohashes the board carries and that pass moderation, so resolve through
+// visible_manifests; an unknown or hidden hash returns None and the route 404s. a takedown against any
+// manifest sharing this infohash suppresses the bytes for all of them, so dedup-by-content cannot keep
+// taken-down bytes reachable through a second manifest that still points at the same swarm
 pub async fn magnet_by_infohash(pool: &PgPool, infohash: &str) -> Result<Option<String>> {
     let magnet = sqlx::query_scalar(
-        "SELECT magnet FROM visible_manifests WHERE infohash = $1 LIMIT 1",
+        "SELECT vm.magnet FROM visible_manifests vm
+         WHERE vm.infohash = $1
+           AND NOT EXISTS (
+               SELECT 1 FROM manifests m JOIN takedowns t ON (
+                   (t.target_type = 'e' AND t.target = m.event_id) OR
+                   (t.target_type = 'x' AND t.target = m.file_hash) OR
+                   (t.target_type = 'p' AND t.target = m.pubkey) OR
+                   (t.target_type = 'post' AND t.target = m.platform || ':' || m.creator_id || ':' || m.post_id) OR
+                   (t.target_type = 'creator' AND t.target = m.platform || ':' || m.creator_id)
+               )
+               WHERE m.infohash = $1
+           )
+         LIMIT 1",
     )
     .bind(infohash)
     .fetch_optional(pool)
