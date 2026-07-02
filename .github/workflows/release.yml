@@ -11,7 +11,28 @@ permissions:
   contents: write
 
 jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.create.outputs.release_id }}
+    steps:
+      # sole owner of release creation, so concurrent build jobs never race to make duplicate drafts
+      - name: Ensure one draft release
+        id: create
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          if ! gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --draft \
+              --title "Bakemono $TAG" --notes "Desktop installers and server bundles."
+          fi
+          id=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json databaseId --jq .databaseId)
+          echo "release_id=$id" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
@@ -85,7 +106,7 @@ jobs:
           cp "$FFMPEG_BIN" "$APP/binaries/ffmpeg-$TARGET$EXE"
           chmod +x "$APP/binaries/ffmpeg-$TARGET$EXE" || true
 
-      - name: Build, bundle, sign updater, draft release
+      - name: Build, bundle, sign updater, upload to the shared draft
         id: tauri
         uses: tauri-apps/tauri-action@v0
         env:
@@ -94,9 +115,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: crates/bakemono-app
-          tagName: ${{ github.ref_name }}
-          releaseName: Bakemono ${{ github.ref_name }}
-          releaseDraft: true
+          releaseId: ${{ needs.create-release.outputs.release_id }}
           args: --target ${{ matrix.target }} ${{ matrix.extra_args }}
 
       # the board's /contribute page links to versionless asset names under releases/latest/download.
