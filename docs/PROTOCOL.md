@@ -169,7 +169,7 @@ Signed by an instance operator. Records that this instance has chosen to hide a 
 }
 ```
 
-Target can be by `e` (event id), `x` (file hash), or `p` (contributor pubkey). The `reason` tag is a free-form string with conventional values: `dmca-us`, `eu-court-order`, `csam`, `spam`, `wrong-content`, etc.
+Target is one of `e` (event id), `x` (file sha256), `i` (torrent infohash), `p` (contributor pubkey), `post` (`platform:creator_id:post_id`), or `creator` (`platform:creator_id`). An `i` takedown suppresses the bytes at the gateway for every manifest pointing at that swarm, so dedup-by-content cannot keep taken-down bytes reachable through a second manifest. The `reason` tag is a free-form string with conventional values: `dmca-us`, `eu-court-order`, `csam`, `spam`, `wrong-content`, etc
 
 ### How peer instances apply mod actions
 

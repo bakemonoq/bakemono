@@ -55,6 +55,8 @@ pub struct Gateway {
     fetch_timeout: Duration,
     // refuse a selected file larger than this, so one oversized torrent cannot fill the disk past the budget
     max_file_bytes: u64,
+    // ceiling on torrents managed at once, so a flood of distinct infohashes can't exhaust memory/sockets
+    max_torrents: usize,
 }
 
 impl Gateway {
@@ -94,12 +96,18 @@ impl Gateway {
             .and_then(|s| s.trim().parse::<f64>().ok())
             .map(|gb| (gb.max(0.0) * (1u64 << 30) as f64) as u64)
             .unwrap_or(budget_bytes);
+        // 0 disables the ceiling; default keeps concurrent swarm joins bounded on a busy board
+        let max_torrents = std::env::var("BAKEMONO_MAX_TORRENTS")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(64);
         let gateway = Self {
             session,
             initial_peers,
             cache,
             fetch_timeout,
             max_file_bytes,
+            max_torrents,
         };
         gateway.spawn_drop_idle(drop_idle_interval);
         Ok(gateway)
@@ -201,6 +209,19 @@ impl Gateway {
     async fn add(&self, magnet: &str, only_files: Vec<usize>) -> Result<(Arc<ManagedTorrent>, String)> {
         let infohash =
             infohash_from_magnet(magnet).ok_or_else(|| anyhow!("magnet carries no infohash"))?;
+        // admit a new infohash only under the ceiling; try to reclaim finished idle torrents first so a
+        // steady stream of requests keeps flowing, and never count an already-managed infohash against it
+        if self.max_torrents > 0 && !self.cache.is_managed(&infohash) {
+            if self.cache.managed_count() >= self.max_torrents {
+                self.cache.drop_idle(&self.session).await;
+            }
+            if self.cache.managed_count() >= self.max_torrents {
+                return Err(anyhow!(
+                    "gateway at capacity ({} concurrent fetches), retry shortly",
+                    self.max_torrents
+                ));
+            }
+        }
         let dir = self.cache.dir.join(&infohash);
         let selected = only_files.clone();
         let opts = AddTorrentOptions {
@@ -358,6 +379,21 @@ impl Cache {
                 );
             }
         }
+    }
+
+    // how many torrents librqbit is holding this run (id Some); a disk-only or dropped entry doesn't count
+    fn managed_count(&self) -> usize {
+        self.state.lock().unwrap().entries.values().filter(|e| e.id.is_some()).count()
+    }
+
+    fn is_managed(&self, infohash: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .entries
+            .get(infohash)
+            .map(|e| e.id.is_some())
+            .unwrap_or(false)
     }
 
     // the cached file for an infohash, but only if its download finished (a .done marker is present),

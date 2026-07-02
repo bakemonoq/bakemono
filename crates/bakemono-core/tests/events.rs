@@ -202,6 +202,40 @@ fn post_and_creator_targets_build_composite_d_tags() {
 }
 
 #[test]
+fn infohash_takedown_round_trips_and_normalizes() {
+    let keys = Keys::generate();
+    let infohash = "0123456789abcdef0123456789abcdef01234567";
+    let takedown = Takedown {
+        target: Target::Infohash(infohash.into()),
+        reason: "csam".into(),
+        applied_at: None,
+        explanation: String::new(),
+    };
+    let event = takedown.to_event(&keys).unwrap();
+    assert!(event.verify().is_ok());
+    assert_eq!(takedown.d_tag(), format!("takedown:i:{infohash}"));
+    assert_eq!(Takedown::from_event(&event).unwrap().target, Target::Infohash(infohash.into()));
+    // a v1 btih is 40 hex; parsing lowercases it so it matches the stored infohash
+    assert_eq!(
+        Target::from_parts("i", infohash.to_ascii_uppercase()),
+        Some(Target::Infohash(infohash.into()))
+    );
+}
+
+#[test]
+fn infohash_takedown_rejects_a_wrong_length_hash() {
+    let keys = Keys::generate();
+    let takedown = Takedown {
+        target: Target::Infohash("abc".into()),
+        reason: "csam".into(),
+        applied_at: None,
+        explanation: String::new(),
+    };
+    let event = takedown.to_event(&keys).unwrap();
+    assert!(Takedown::from_event(&event).is_err());
+}
+
+#[test]
 fn target_from_parts_rejects_unknown_kind() {
     assert_eq!(
         Target::from_parts("x", "hash".into()),

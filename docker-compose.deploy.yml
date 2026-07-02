@@ -33,6 +33,8 @@ services:
       BAKEMONO_CACHE_GB: ${BAKEMONO_CACHE_GB:-10}
       # reject any single file larger than this many GB before streaming; defaults to the cache cap above
       BAKEMONO_MAX_FILE_GB: ${BAKEMONO_MAX_FILE_GB:-}
+      # ceiling on torrents fetched at once, so a flood of distinct infohashes can't exhaust the box. 0 = off
+      BAKEMONO_MAX_TORRENTS: ${BAKEMONO_MAX_TORRENTS:-64}
       # comma-separated CIDRs whose forwarding headers are trusted for the real client IP; unset/empty
       # defaults to Cloudflare's ranges, the literal "none" trusts no proxy (use the socket peer)
       BAKEMONO_TRUSTED_PROXIES: ${BAKEMONO_TRUSTED_PROXIES:-}

@@ -1411,11 +1411,12 @@ fn takedown_section(state: &AppState, takedowns: &[db::TakedownRow], links: &[Op
             select name="target_type" {
                 option value="e" { "event id" }
                 option value="x" { "file hash" }
+                option value="i" { "infohash" }
                 option value="p" { "pubkey" }
                 option value="post" { "post" }
                 option value="creator" { "creator" }
             }
-            input type="text" name="target" placeholder="target value (hash, npub, or platform:creator_id[:post_id])" required;
+            input type="text" name="target" placeholder="target value (hash, infohash, npub, or platform:creator_id[:post_id])" required;
             input type="text" name="reason" placeholder="reason (dmca-us, csam, spam...)" required;
             input type="text" name="explanation" placeholder="note (optional)";
             button { "hide + publish" }

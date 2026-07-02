@@ -18,6 +18,7 @@ pub enum Target {
     Pubkey(String),
     Post(String),
     Creator(String),
+    Infohash(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +60,7 @@ impl Takedown {
         let (key, value) = self.target.parts();
         match self.target {
             Target::Post(_) | Target::Creator(_) => v::require_field(key, value, v::MAX_TARGET)?,
+            Target::Infohash(_) => v::infohash_hex(key, value)?,
             _ => v::hex_hash(key, value)?,
         }
         v::require_field(tags::REASON, &self.reason, v::MAX_REASON)?;
@@ -112,6 +114,7 @@ impl Target {
             Target::Pubkey(v) => (tags::PUBKEY_REF, v),
             Target::Post(v) => (tags::POST_REF, v),
             Target::Creator(v) => (tags::CREATOR_REF, v),
+            Target::Infohash(v) => (tags::INFOHASH_REF, v),
         }
     }
 
@@ -122,6 +125,7 @@ impl Target {
             tags::PUBKEY_REF => Some(Target::Pubkey(value)),
             tags::POST_REF => Some(Target::Post(value)),
             tags::CREATOR_REF => Some(Target::Creator(value)),
+            tags::INFOHASH_REF => Some(Target::Infohash(value.to_ascii_lowercase())),
             _ => None,
         }
     }
@@ -137,6 +141,8 @@ impl Target {
             Ok(Target::Post(v))
         } else if let Some(v) = tags::first(event, tags::CREATOR_REF) {
             Ok(Target::Creator(v))
+        } else if let Some(v) = tags::first(event, tags::INFOHASH_REF) {
+            Ok(Target::Infohash(v.to_ascii_lowercase()))
         } else {
             Err(Error::MissingTag(tags::EVENT_REF))
         }

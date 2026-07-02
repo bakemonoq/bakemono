@@ -50,6 +50,7 @@ pub const MAX_REASON: usize = 64;
 pub const MAX_EXPLANATION: usize = 8 * 1024;
 pub const MAX_FILE_SIZE: u64 = 1 << 40;
 const HASH_LEN: usize = 64;
+const INFOHASH_LEN: usize = 40;
 
 pub(crate) fn require_field(tag: &'static str, value: &str, max: usize) -> Result<()> {
     if value.is_empty() {
@@ -79,6 +80,22 @@ pub(crate) fn within(field: &'static str, value: &str, max: usize) -> Result<()>
 // every takedown target and the file `x` are 32-byte hashes, lowercase hex
 pub(crate) fn hex_hash(tag: &'static str, value: &str) -> Result<()> {
     let ok = value.len() == HASH_LEN
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::MalformedTag {
+            tag,
+            value: clip(value),
+        })
+    }
+}
+
+// a v1 btih infohash is 40 lowercase hex chars, distinct from the 64-hex file/event/pubkey hashes
+pub(crate) fn infohash_hex(tag: &'static str, value: &str) -> Result<()> {
+    let ok = value.len() == INFOHASH_LEN
         && value
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));

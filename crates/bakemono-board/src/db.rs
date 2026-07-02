@@ -87,6 +87,7 @@ pub async fn magnet_by_infohash(pool: &PgPool, infohash: &str) -> Result<Option<
                    (t.target_type = 'e' AND t.target = m.event_id) OR
                    (t.target_type = 'x' AND t.target = m.file_hash) OR
                    (t.target_type = 'p' AND t.target = m.pubkey) OR
+                   (t.target_type = 'i' AND t.target = m.infohash) OR
                    (t.target_type = 'post' AND t.target = m.platform || ':' || m.creator_id || ':' || m.post_id) OR
                    (t.target_type = 'creator' AND t.target = m.platform || ':' || m.creator_id)
                )
@@ -348,12 +349,13 @@ pub async fn post_takedown(
         "SELECT d_tag, reason FROM takedowns t WHERE
              (t.target_type = 'post' AND t.target = $1 || ':' || $2 || ':' || $3) OR
              (t.target_type = 'creator' AND t.target = $1 || ':' || $2) OR
-             (t.target_type IN ('e','x','p') AND EXISTS (
+             (t.target_type IN ('e','x','p','i') AND EXISTS (
                  SELECT 1 FROM manifests m
                  WHERE m.platform = $1 AND m.creator_id = $2 AND m.post_id = $3 AND (
                      (t.target_type = 'e' AND t.target = m.event_id) OR
                      (t.target_type = 'x' AND t.target = m.file_hash) OR
-                     (t.target_type = 'p' AND t.target = m.pubkey)
+                     (t.target_type = 'p' AND t.target = m.pubkey) OR
+                     (t.target_type = 'i' AND t.target = m.infohash)
                  )
              ))
          LIMIT 1",
@@ -376,6 +378,7 @@ pub async fn locate_takedown(
     let q = match target_type {
         "e" => "SELECT platform, creator_id, post_id FROM manifests WHERE event_id = $1 LIMIT 1",
         "x" => "SELECT platform, creator_id, post_id FROM manifests WHERE file_hash = $1 LIMIT 1",
+        "i" => "SELECT platform, creator_id, post_id FROM manifests WHERE infohash = $1 LIMIT 1",
         "post" => "SELECT platform, creator_id, post_id FROM manifests WHERE platform || ':' || creator_id || ':' || post_id = $1 LIMIT 1",
         "creator" => "SELECT platform, creator_id, post_id FROM manifests WHERE platform || ':' || creator_id = $1 ORDER BY created_at DESC LIMIT 1",
         _ => return Ok(None),
@@ -1195,6 +1198,7 @@ WHERE m.pubkey IN (SELECT pubkey FROM pubkeys WHERE status = 'approved')
           (t.target_type = 'e' AND t.target = m.event_id) OR
           (t.target_type = 'x' AND t.target = m.file_hash) OR
           (t.target_type = 'p' AND t.target = m.pubkey) OR
+          (t.target_type = 'i' AND t.target = m.infohash) OR
           (t.target_type = 'post' AND t.target = m.platform || ':' || m.creator_id || ':' || m.post_id) OR
           (t.target_type = 'creator' AND t.target = m.platform || ':' || m.creator_id)
   );
