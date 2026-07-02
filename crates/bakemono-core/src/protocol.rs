@@ -5,4 +5,4 @@ pub const KIND_TAKEDOWN: u16 = 31064;
 pub const PROTOCOL_VERSION: u16 = 1;
 
 // NIP-13 proof-of-work floor on kind 31063 manifests: the app mints it, the board rejects below it
-pub const POW_DIFFICULTY: u8 = 18;
+pub const POW_DIFFICULTY: u8 = 14;
