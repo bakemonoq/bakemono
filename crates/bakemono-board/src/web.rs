@@ -1780,7 +1780,6 @@ async fn mod_post_view(
         .and_then(|f| f.post_title.clone())
         .unwrap_or_else(|| post_id.clone());
     let creator = files.first().map(|f| f.creator.clone());
-    let refs: Vec<&db::ManifestRow> = files.iter().collect();
     let page = render(
         &title,
         html! {
@@ -1805,8 +1804,9 @@ async fn mod_post_view(
                 div.statusbar { "pending review - not yet public" }
                 (mod_bar_post(&platform, &creator_id, &post_id))
             }
-            @if refs.is_empty() { p.muted { "no files" } }
-            (file_list(&refs))
+            @if files.is_empty() { p.muted { "no files" } }
+            (carousel(&files))
+            script { (PreEscaped(CAROUSEL_JS)) }
         },
     );
     private_page(page)
