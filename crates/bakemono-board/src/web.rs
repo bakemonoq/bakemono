@@ -1218,56 +1218,87 @@ async fn mod_queue(State(state): State<AppState>, headers: HeaderMap) -> Respons
     let page = render(
         "mod queue",
         html! {
-            p { a href="/" { "< home" } }
-            h2 { "Mod queue" }
+            div.modhead {
+                h1.pagetitle { "Moderation" }
+                a.muted href="/" { "< back to board" }
+            }
+            div.stats {
+                a.stat.statlink href="#reports" {
+                    div.num.danger[report_count > 0] { (report_count) }
+                    div.label { "open reports" }
+                }
+                a.stat.statlink href="#queue" {
+                    div.num { (pending.len()) }
+                    div.label { "pending contributors" }
+                }
+                a.stat.statlink href="#queue" {
+                    div.num { (groups.len()) }
+                    div.label { "flood groups" }
+                }
+                a.stat.statlink href="#takedowns" {
+                    div.num { (takedowns.len()) }
+                    div.label { "takedowns" }
+                }
+            }
             (reports_section(&reports, report_count))
-            p.muted { "first-seen pubkeys wait here; approve to publish their files, reject to drop them" }
-            @if groups.is_empty() && pending.is_empty() { p.muted { "nothing awaiting review" } }
-            @if !groups.is_empty() {
-                h3 { "By creator" }
-                p.muted { "bulk-act on a flood: approve or reject every pending key that posted to a creator" }
-                ul.list {
-                    @for g in &groups {
-                        li {
-                            div { (g.creator.clone().unwrap_or_else(|| g.creator_id.clone())) " " span.muted { "(" (g.platform) ")" } }
-                            span.muted { (g.pubkeys) " pubkey(s) - " (g.files) " file(s)" }
-                            div {
-                                form method="post" action="/mod/approve-creator" class="modform" {
-                                    input type="hidden" name="platform" value=(g.platform);
-                                    input type="hidden" name="creator_id" value=(g.creator_id);
-                                    button { "approve all" }
+            section.block id="queue" {
+                div.blockhead { h2 { "Pending review" } }
+                p.muted { "first-seen contributors wait here; approve to publish their files, reject to drop them" }
+                @if groups.is_empty() && pending.is_empty() { p.muted { "nothing awaiting review" } }
+                @if !groups.is_empty() {
+                    h3 { "By creator" }
+                    p.muted { "bulk-act on a flood: approve or reject every pending key that posted to a creator" }
+                    ul.list.rows {
+                        @for g in &groups {
+                            li {
+                                div.rowmain {
+                                    div.rowtitle {
+                                        (g.creator.clone().unwrap_or_else(|| g.creator_id.clone()))
+                                        " " span.chip.platform { (pretty_platform(&g.platform)) }
+                                    }
+                                    div.rowmeta { span.muted { (g.pubkeys) " pubkey(s) - " (g.files) " file(s)" } }
                                 }
-                                form method="post" action="/mod/reject-creator" class="modform" {
-                                    input type="hidden" name="platform" value=(g.platform);
-                                    input type="hidden" name="creator_id" value=(g.creator_id);
-                                    button { "reject all" }
+                                div.rowactions {
+                                    form method="post" action="/mod/approve-creator" class="modform" {
+                                        input type="hidden" name="platform" value=(g.platform);
+                                        input type="hidden" name="creator_id" value=(g.creator_id);
+                                        button.ok { "approve all" }
+                                    }
+                                    form method="post" action="/mod/reject-creator" class="modform" {
+                                        input type="hidden" name="platform" value=(g.platform);
+                                        input type="hidden" name="creator_id" value=(g.creator_id);
+                                        button.danger { "reject all" }
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
-            @if !pending.is_empty() {
-                h3 { "By pubkey" }
-                p.muted { "newest first, capped at 100; clear the backlog or use the per-creator actions above" }
-                ul.list {
-                    @for p in &pending {
-                        li {
-                            @if let Some(t) = &p.thumb { img.pendthumb src=(t) alt="preview" title="hover to reveal"; }
-                            div { code { (npub(&p.pubkey)) } }
-                            span.muted {
-                                (p.files) " file(s)"
-                                @if let Some(c) = &p.creator { " - " (c) }
-                                @if let Some(s) = &p.sample { " - " (s) }
-                            }
-                            div {
-                                form method="post" action="/mod/approve" class="modform" {
-                                    input type="hidden" name="pubkey" value=(p.pubkey);
-                                    button { "approve" }
+                @if !pending.is_empty() {
+                    h3 { "By contributor" }
+                    p.muted { "newest first, capped at 100; hover a preview to reveal it" }
+                    ul.list.rows {
+                        @for p in &pending {
+                            li {
+                                @if let Some(t) = &p.thumb { img.pendthumb src=(t) alt="preview" title="hover to reveal"; }
+                                @else { div.pendthumb.empty { "?" } }
+                                div.rowmain {
+                                    div.rowtitle { code { (npub(&p.pubkey)) } }
+                                    div.rowmeta { span.muted {
+                                        (p.files) " file(s)"
+                                        @if let Some(c) = &p.creator { " - " (c) }
+                                        @if let Some(s) = &p.sample { " - " (s) }
+                                    } }
                                 }
-                                form method="post" action="/mod/reject" class="modform" {
-                                    input type="hidden" name="pubkey" value=(p.pubkey);
-                                    button { "reject" }
+                                div.rowactions {
+                                    form method="post" action="/mod/approve" class="modform" {
+                                        input type="hidden" name="pubkey" value=(p.pubkey);
+                                        button.ok { "approve" }
+                                    }
+                                    form method="post" action="/mod/reject" class="modform" {
+                                        input type="hidden" name="pubkey" value=(p.pubkey);
+                                        button.danger { "reject" }
+                                    }
                                 }
                             }
                         }
@@ -1286,7 +1317,8 @@ async fn mod_queue(State(state): State<AppState>, headers: HeaderMap) -> Respons
 
 fn takedown_section(state: &AppState, takedowns: &[db::TakedownRow]) -> Markup {
     html! {
-        h2 { "Takedowns" }
+      section.block id="takedowns" {
+        div.blockhead { h2 { "Takedowns" } }
         @match &state.signer {
             Some(keys) => p.muted { "publishing kind 31064 as " code { (npub(&keys.public_key().to_hex())) } }
             None => p.muted { "set BAKEMONO_INSTANCE_NSEC to publish takedowns to peers; hides apply locally either way" }
@@ -1296,32 +1328,37 @@ fn takedown_section(state: &AppState, takedowns: &[db::TakedownRow]) -> Markup {
                 option value="e" { "event id" }
                 option value="x" { "file hash" }
                 option value="p" { "pubkey" }
-                option value="post" { "post (platform:creator_id:post_id)" }
-                option value="creator" { "creator (platform:creator_id)" }
+                option value="post" { "post" }
+                option value="creator" { "creator" }
             }
-            input type="text" name="target" placeholder="target value (id / hash / npub or hex)" required;
+            input type="text" name="target" placeholder="target value (hash, npub, or platform:creator_id[:post_id])" required;
             input type="text" name="reason" placeholder="reason (dmca-us, csam, spam...)" required;
             input type="text" name="explanation" placeholder="note (optional)";
             button { "hide + publish" }
         }
         @if takedowns.is_empty() { p.muted { "no takedowns recorded" } }
-        ul.list {
+        ul.list.rows {
             @for t in takedowns {
                 li {
-                    div { code { (t.target_type) ":" (t.target) } }
-                    span.muted {
-                        (t.reason)
-                        @if !t.explanation.is_empty() { " - " (t.explanation) }
-                        " - via " (takedown_source(&t.source))
-                        @if !t.applied_at.is_empty() { " - " (pretty_date(&t.applied_at)) }
+                    div.rowmain {
+                        div.rowtitle { code { (t.target_type) ":" (t.target) } }
+                        div.rowmeta { span.muted {
+                            (t.reason)
+                            @if !t.explanation.is_empty() { " - " (t.explanation) }
+                            " - via " (takedown_source(&t.source))
+                            @if !t.applied_at.is_empty() { " - " (pretty_date(&t.applied_at)) }
+                        } }
                     }
-                    form method="post" action="/mod/untakedown" class="modform" {
-                        input type="hidden" name="d_tag" value=(t.d_tag);
-                        button { "undo" }
+                    div.rowactions {
+                        form method="post" action="/mod/untakedown" class="modform" {
+                            input type="hidden" name="d_tag" value=(t.d_tag);
+                            button { "undo" }
+                        }
                     }
                 }
             }
         }
+      }
     }
 }
 
@@ -1564,13 +1601,13 @@ fn mod_bar_post(platform: &str, creator_id: &str, post_id: &str) -> Markup {
                 input type="hidden" name="creator_id" value=(creator_id);
                 input type="hidden" name="post_id" value=(post_id);
                 input type="hidden" name="back" value=(back);
-                button { "hide post" }
+                button.danger { "hide post" }
             }
             form method="post" action="/mod/ban-creator" class="modform" {
                 input type="hidden" name="platform" value=(platform);
                 input type="hidden" name="creator_id" value=(creator_id);
                 input type="hidden" name="back" value=(back);
-                button { "ban author" }
+                button.danger { "ban author" }
             }
             a.btn.ghost href="/mod" { "mod queue" }
         }
@@ -1585,7 +1622,7 @@ fn mod_bar_creator(platform: &str, creator_id: &str) -> Markup {
                 input type="hidden" name="platform" value=(platform);
                 input type="hidden" name="creator_id" value=(creator_id);
                 input type="hidden" name="back" value="/creators";
-                button { "ban author" }
+                button.danger { "ban author" }
             }
             a.btn.ghost href="/mod" { "mod queue" }
         }
@@ -1611,41 +1648,45 @@ struct BanCreatorForm {
 
 fn reports_section(reports: &[db::ReportGroup], open_count: i64) -> Markup {
     html! {
-        h3 { "Reports" @if open_count > 0 { " (" (open_count) " open)" } }
+      section.block id="reports" {
+        div.blockhead {
+            h2 { "Reports" }
+            @if open_count > 0 { span.chip.danger { (open_count) " open" } }
+        }
         @if reports.is_empty() {
             p.muted { "no open reports" }
         } @else {
             p.muted { "user-flagged posts, most severe first; hide publishes a takedown, dismiss clears the flag" }
-            ul.list {
+            ul.list.rows {
                 @for r in reports {
-                    li class=(if r.has_csam { "report csam" } else { "report" }) {
-                        div {
-                            a href=(format!("/p/{}/{}/{}", r.platform, r.creator_id, r.post_id)) {
-                                (r.post_title.clone().unwrap_or_else(|| r.post_id.clone()))
+                    li.report.csam[r.has_csam] {
+                        div.rowmain {
+                            div.rowtitle {
+                                a href=(format!("/p/{}/{}/{}", r.platform, r.creator_id, r.post_id)) {
+                                    (r.post_title.clone().unwrap_or_else(|| r.post_id.clone()))
+                                }
+                                " " span.chip.platform { (pretty_platform(&r.platform)) }
+                                @if r.has_csam { " " span.chip.danger { "CSAM" } }
                             }
-                            " " span.muted {
-                                "(" (pretty_platform(&r.platform))
-                                @if !r.creator.is_empty() { " / " (r.creator) }
-                                ")"
-                            }
+                            div.rowmeta { span.muted {
+                                @if !r.creator.is_empty() { (r.creator) " - " }
+                                @if let Some(rs) = &r.reasons { (rs) " - " }
+                                (r.total) " report(s)"
+                            } }
                         }
-                        span.muted {
-                            @if let Some(rs) = &r.reasons { (rs) " - " }
-                            (r.total) " report(s)"
-                        }
-                        div {
+                        div.rowactions {
                             form method="post" action="/mod/ban-post" class="modform" {
                                 input type="hidden" name="platform" value=(r.platform);
                                 input type="hidden" name="creator_id" value=(r.creator_id);
                                 input type="hidden" name="post_id" value=(r.post_id);
                                 input type="hidden" name="back" value="/mod";
-                                button { "hide post" }
+                                button.danger { "hide post" }
                             }
                             form method="post" action="/mod/ban-creator" class="modform" {
                                 input type="hidden" name="platform" value=(r.platform);
                                 input type="hidden" name="creator_id" value=(r.creator_id);
                                 input type="hidden" name="back" value="/mod";
-                                button { "ban author" }
+                                button.danger { "ban author" }
                             }
                             form method="post" action="/mod/report-dismiss" class="modform" {
                                 input type="hidden" name="platform" value=(r.platform);
@@ -1658,6 +1699,7 @@ fn reports_section(reports: &[db::ReportGroup], open_count: i64) -> Markup {
                 }
             }
         }
+      }
     }
 }
 
@@ -2169,7 +2211,7 @@ const STYLE: &str = "
   --surface0:#313244; --surface1:#45475a; --surface2:#585b70;
   --overlay0:#6c7086; --overlay1:#7f849c;
   --text:#cdd6f4; --subtext1:#bac2de; --subtext0:#a6adc8;
-  --mauve:#cba6f7; --red:#f38ba8;
+  --mauve:#cba6f7; --red:#f38ba8; --green:#a6e3a1;
   --accent:var(--mauve);
   color-scheme: dark;
 }
@@ -2208,7 +2250,8 @@ button,input,select { font:inherit }
 
 main { max-width:1240px; margin:0 auto; padding:1.4rem 1.1rem 3rem }
 .pagetitle { font-size:1.6rem; margin:.2rem 0 1rem }
-.block { margin:1.8rem 0 }
+.modhead { display:flex; align-items:baseline; justify-content:space-between; gap:1rem; flex-wrap:wrap }
+.block { margin:1.8rem 0; scroll-margin-top:72px }
 .blockhead { display:flex; align-items:baseline; justify-content:space-between; margin-bottom:.8rem }
 .blockhead h2 { margin:0; font-size:1.25rem }
 .more { font-size:.85rem; font-weight:600 }
@@ -2241,6 +2284,7 @@ main { max-width:1240px; margin:0 auto; padding:1.4rem 1.1rem 3rem }
 .chip { display:inline-block; padding:.12rem .5rem; border-radius:8px; background:var(--surface1);
   color:var(--subtext1); font-size:.72rem; font-weight:600 }
 .chip.platform { background:color-mix(in srgb, var(--accent) 22%, var(--surface1)); color:var(--text) }
+.chip.danger { background:color-mix(in srgb, var(--red) 26%, var(--surface1)); color:var(--text); font-weight:700 }
 
 .filters { display:flex; flex-wrap:wrap; align-items:center; gap:.6rem; margin:0 0 1rem }
 .searchfield { position:relative; display:flex; align-items:center; flex:1; min-width:220px }
@@ -2319,9 +2363,9 @@ main { max-width:1240px; margin:0 auto; padding:1.4rem 1.1rem 3rem }
 .hp { position:absolute; left:-9999px; width:1px; height:1px; opacity:0 }
 li.report.csam { border-left:3px solid var(--red); padding-left:.6rem }
 .modbar { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; max-width:720px; margin:1rem auto 0; padding:.5rem .7rem; border:1px solid var(--surface1); border-radius:10px; background:var(--mantle) }
-.modbar button { padding:.3rem .65rem; border-radius:8px; border:none; background:var(--red); color:var(--crust); cursor:pointer; font-weight:600 }
-.pendthumb { width:56px; height:56px; object-fit:cover; border-radius:8px; float:left; margin-right:.6rem; filter:blur(11px); transition:filter .08s; cursor:pointer }
+.pendthumb { width:56px; height:56px; flex:none; object-fit:cover; border-radius:8px; filter:blur(11px); transition:filter .08s; cursor:pointer }
 .pendthumb:hover { filter:none }
+.pendthumb.empty { display:grid; place-items:center; background:var(--surface0); color:var(--overlay0); filter:none; font-weight:700 }
 .body img { max-width:100%; border-radius:10px }
 
 .foot { border-top:1px solid var(--surface0); margin-top:2.5rem; padding:2rem 1.1rem }
@@ -2345,7 +2389,10 @@ li.report.csam { border-left:3px solid var(--red); padding-left:.6rem }
 .list li { padding:.5rem 0; border-bottom:1px solid var(--surface0) }
 .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(8rem,1fr)); gap:.75rem; margin:1rem 0 1.5rem }
 .stat { border:1px solid var(--surface0); background:var(--mantle); border-radius:10px; padding:1rem }
+.stat.statlink { color:var(--text); text-decoration:none; transition:border-color .1s }
+.stat.statlink:hover { border-color:var(--accent); text-decoration:none }
 .stat .num { font-size:1.7rem; font-weight:800 }
+.stat .num.danger { color:var(--red) }
 .stat .label { color:var(--subtext0); font-size:.85em }
 .steps { list-style:none; counter-reset:step; padding:0 }
 .step { counter-increment:step; border:1px solid var(--surface0); background:var(--mantle); border-radius:10px; padding:1.1rem 1.3rem; margin:1rem 0 }
@@ -2353,7 +2400,16 @@ li.report.csam { border-left:3px solid var(--red); padding-left:.6rem }
 .step h3::before { content:counter(step) '. '; color:var(--accent); font-weight:800 }
 .step img { max-width:100%; border-radius:8px; margin-top:.6rem }
 .downloads { display:flex; flex-wrap:wrap; gap:.5rem; margin:.75rem 0 }
-.modform { display:inline; margin:.4rem .4rem 0 0 }
+.modform { display:inline-block; margin:0 }
+.modform button { padding:.4rem .8rem; border-radius:8px; border:1px solid var(--surface1); background:var(--surface0); color:var(--text); cursor:pointer; font-weight:600; font-size:.85rem }
+.modform button:hover { filter:brightness(1.12) }
+.modform button.ok { background:var(--green); color:var(--crust); border-color:transparent }
+.modform button.danger { background:var(--red); color:var(--crust); border-color:transparent }
+.rows li { display:flex; align-items:center; gap:.9rem; flex-wrap:wrap; padding:.7rem 0 }
+.rowmain { flex:1 1 15rem; min-width:0 }
+.rowtitle { font-weight:600; overflow-wrap:anywhere }
+.rowmeta { font-size:.9rem; margin-top:.1rem }
+.rowactions { display:flex; gap:.4rem; flex-wrap:wrap; align-items:center; margin-left:auto }
 .takedown { display:flex; flex-wrap:wrap; gap:.4rem; margin:.6rem 0 1rem }
 .takedown input, .takedown select { flex:1 1 12rem; padding:.5rem .7rem; border-radius:9px; border:1px solid var(--surface1); background:var(--surface0); color:var(--text) }
 code { background:var(--surface0); padding:.1rem .35rem; border-radius:5px; word-break:break-all; font-size:.85em }
