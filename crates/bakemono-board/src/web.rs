@@ -66,6 +66,8 @@ pub fn router(state: AppState) -> Router {
         .route("/mod/report-dismiss", post(mod_report_dismiss))
         .route("/mod/ban-post", post(mod_ban_post))
         .route("/mod/ban-creator", post(mod_ban_creator))
+        .route("/mod/pubkey/{pubkey}", get(mod_pubkey_view))
+        .route("/mod/post/{platform}/{creator_id}/{post_id}", get(mod_post_view))
         .route("/t/{infohash}/meta", get(gateway_meta))
         .route("/t/{infohash}/f/{file_index}", get(gateway_file))
         .with_state(state)
@@ -1046,14 +1048,16 @@ async fn gateway_meta(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    let Some(magnet) = resolve_magnet(&state, &infohash).await else {
+    let Some((magnet, private)) = resolve_gateway(&state, &infohash, &headers).await else {
         return (StatusCode::NOT_FOUND, "unknown infohash").into_response();
     };
-    if let Some(resp) = cold_miss_guard(&state, &infohash, &headers, peer) {
-        return resp;
+    if !private {
+        if let Some(resp) = cold_miss_guard(&state, &infohash, &headers, peer) {
+            return resp;
+        }
     }
     match state.gateway.meta(&magnet).await {
-        Ok(meta) => Json(meta).into_response(),
+        Ok(meta) => private_if(Json(meta).into_response(), private),
         Err(e) => (StatusCode::BAD_GATEWAY, format!("swarm error: {e:#}")).into_response(),
     }
 }
@@ -1064,14 +1068,16 @@ async fn gateway_file(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    let Some(magnet) = resolve_magnet(&state, &infohash).await else {
+    let Some((magnet, private)) = resolve_gateway(&state, &infohash, &headers).await else {
         return (StatusCode::NOT_FOUND, "unknown infohash").into_response();
     };
-    if let Some(resp) = cold_miss_guard(&state, &infohash, &headers, peer) {
-        return resp;
+    if !private {
+        if let Some(resp) = cold_miss_guard(&state, &infohash, &headers, peer) {
+            return resp;
+        }
     }
     match state.gateway.open(&magnet, file_index).await {
-        Ok(file) => stream_file(file, &headers).await,
+        Ok(file) => private_if(stream_file(file, &headers).await, private),
         Err(e) => (StatusCode::BAD_GATEWAY, format!("swarm error: {e:#}")).into_response(),
     }
 }
@@ -1137,6 +1143,31 @@ async fn resolve_magnet(state: &AppState, infohash: &str) -> Option<String> {
         return Some(bakemono_torrent::synth_magnet(&infohash, &trackers));
     }
     None
+}
+
+// visible content resolves for anyone; a moderator additionally resolves pending or taken-down content
+// (flagged private so it is never cached) so the mod views can preview what the public cannot see
+async fn resolve_gateway(state: &AppState, infohash: &str, headers: &HeaderMap) -> Option<(String, bool)> {
+    if let Some(magnet) = resolve_magnet(state, infohash).await {
+        return Some((magnet, false));
+    }
+    if is_mod(headers) {
+        let ih = infohash.trim().to_ascii_lowercase();
+        if let Ok(Some(magnet)) = db::magnet_by_infohash_any(&state.pool, &ih).await {
+            return Some((magnet, true));
+        }
+    }
+    None
+}
+
+fn private_if(mut resp: Response, private: bool) -> Response {
+    if private {
+        resp.headers_mut().insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("private, no-store"),
+        );
+    }
+    resp
 }
 
 async fn stream_file(mut file: bakemono_torrent::OpenFile, headers: &HeaderMap) -> Response {
@@ -1215,6 +1246,19 @@ async fn mod_queue(State(state): State<AppState>, headers: HeaderMap) -> Respons
     let takedowns = db::takedowns(&state.pool).await.unwrap_or_default();
     let reports = db::open_reports(&state.pool, 100).await.unwrap_or_default();
     let report_count = db::open_report_count(&state.pool).await.unwrap_or(0);
+    let mut td_links: Vec<Option<String>> = Vec::with_capacity(takedowns.len());
+    for t in &takedowns {
+        let link = if t.target_type == "p" {
+            Some(format!("/mod/pubkey/{}", t.target))
+        } else {
+            db::locate_takedown(&state.pool, &t.target_type, &t.target)
+                .await
+                .ok()
+                .flatten()
+                .map(|(p, c, post)| format!("/mod/post/{p}/{c}/{post}"))
+        };
+        td_links.push(link);
+    }
     let page = render(
         "mod queue",
         html! {
@@ -1280,8 +1324,6 @@ async fn mod_queue(State(state): State<AppState>, headers: HeaderMap) -> Respons
                     ul.list.rows {
                         @for p in &pending {
                             li {
-                                @if let Some(t) = &p.thumb { img.pendthumb src=(t) alt="preview" title="hover to reveal"; }
-                                @else { div.pendthumb.empty { "?" } }
                                 div.rowmain {
                                     div.rowtitle { code { (npub(&p.pubkey)) } }
                                     div.rowmeta { span.muted {
@@ -1291,6 +1333,7 @@ async fn mod_queue(State(state): State<AppState>, headers: HeaderMap) -> Respons
                                     } }
                                 }
                                 div.rowactions {
+                                    a.viewlink href=(format!("/mod/pubkey/{}", p.pubkey)) { "view files" }
                                     form method="post" action="/mod/approve" class="modform" {
                                         input type="hidden" name="pubkey" value=(p.pubkey);
                                         button.ok { "approve" }
@@ -1305,7 +1348,7 @@ async fn mod_queue(State(state): State<AppState>, headers: HeaderMap) -> Respons
                     }
                 }
             }
-            (takedown_section(&state, &takedowns))
+            (takedown_section(&state, &takedowns, &td_links))
         },
     );
     let mut resp = page.into_response();
@@ -1315,7 +1358,7 @@ async fn mod_queue(State(state): State<AppState>, headers: HeaderMap) -> Respons
     resp
 }
 
-fn takedown_section(state: &AppState, takedowns: &[db::TakedownRow]) -> Markup {
+fn takedown_section(state: &AppState, takedowns: &[db::TakedownRow], links: &[Option<String>]) -> Markup {
     html! {
       section.block id="takedowns" {
         div.blockhead { h2 { "Takedowns" } }
@@ -1338,10 +1381,15 @@ fn takedown_section(state: &AppState, takedowns: &[db::TakedownRow]) -> Markup {
         }
         @if takedowns.is_empty() { p.muted { "no takedowns recorded" } }
         ul.list.rows {
-            @for t in takedowns {
+            @for (t, link) in takedowns.iter().zip(links) {
                 li {
                     div.rowmain {
-                        div.rowtitle { code { (t.target_type) ":" (t.target) } }
+                        div.rowtitle {
+                            @match link {
+                                Some(href) => a href=(href) { code { (t.target_type) ":" (t.target) } }
+                                None => code { (t.target_type) ":" (t.target) }
+                            }
+                        }
                         div.rowmeta { span.muted {
                             (t.reason)
                             @if !t.explanation.is_empty() { " - " (t.explanation) }
@@ -1629,6 +1677,172 @@ fn mod_bar_creator(platform: &str, creator_id: &str) -> Markup {
     }
 }
 
+// mod-only: everything a contributor uploaded, grouped by post, so a mod can open the files and review
+// before approving; nothing here is public until the pubkey is approved
+async fn mod_pubkey_view(
+    State(state): State<AppState>,
+    Path(pubkey): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(denied) = require_mod(&headers) {
+        return denied;
+    }
+    let status = db::pubkey_status(&state.pool, &pubkey)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "unknown".into());
+    let files = db::pubkey_files(&state.pool, &pubkey).await.unwrap_or_default();
+    let page = render(
+        "contributor",
+        html! {
+            p { a href="/mod" { "< mod queue" } }
+            h2 { "Contributor" }
+            p { code { (npub(&pubkey)) } " " span.chip { (status) } }
+            @if status == "pending" {
+                div.modbar {
+                    span.muted { "not yet public - review the files, then:" }
+                    form method="post" action="/mod/approve" class="modform" {
+                        input type="hidden" name="pubkey" value=(pubkey);
+                        button.ok { "approve contributor" }
+                    }
+                    form method="post" action="/mod/reject" class="modform" {
+                        input type="hidden" name="pubkey" value=(pubkey);
+                        button.danger { "reject contributor" }
+                    }
+                }
+            }
+            @if files.is_empty() { p.muted { "no files" } }
+            (post_groups(&files))
+        },
+    );
+    private_page(page)
+}
+
+// mod-only: one post's files at any status, with a banner and one-click ban or unban
+async fn mod_post_view(
+    State(state): State<AppState>,
+    Path((platform, creator_id, post_id)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(denied) = require_mod(&headers) {
+        return denied;
+    }
+    let files = db::post_files_any(&state.pool, &platform, &creator_id, &post_id)
+        .await
+        .unwrap_or_default();
+    let visible = db::post_is_visible(&state.pool, &platform, &creator_id, &post_id)
+        .await
+        .unwrap_or(false);
+    let takedown = db::post_takedown(&state.pool, &platform, &creator_id, &post_id)
+        .await
+        .ok()
+        .flatten();
+    let title = files
+        .first()
+        .and_then(|f| f.post_title.clone())
+        .unwrap_or_else(|| post_id.clone());
+    let creator = files.first().map(|f| f.creator.clone());
+    let refs: Vec<&db::ManifestRow> = files.iter().collect();
+    let page = render(
+        &title,
+        html! {
+            p { a href="/mod" { "< mod queue" } }
+            h2 { (title) }
+            p.muted {
+                @if let Some(c) = &creator { "by " a href=(format!("/c/{platform}/{creator_id}")) { (c) } " - " }
+                span.chip.platform { (pretty_platform(&platform)) }
+            }
+            @if visible {
+                div.statusbar.ok { "public - this post is live" }
+                (mod_bar_post(&platform, &creator_id, &post_id))
+            } @else if let Some((d_tag, reason)) = &takedown {
+                div.statusbar.danger {
+                    span { "hidden by takedown: " (reason) }
+                    form method="post" action="/mod/untakedown" class="modform" {
+                        input type="hidden" name="d_tag" value=(d_tag);
+                        button.ok { "unban" }
+                    }
+                }
+            } @else {
+                div.statusbar { "pending review - not yet public" }
+                (mod_bar_post(&platform, &creator_id, &post_id))
+            }
+            @if refs.is_empty() { p.muted { "no files" } }
+            (file_list(&refs))
+        },
+    );
+    private_page(page)
+}
+
+// a contributor's files split into their posts, each header linking to that post's mod view
+fn post_groups(files: &[db::ManifestRow]) -> Markup {
+    let mut groups: Vec<(&str, &str, &str, &str, Vec<&db::ManifestRow>)> = Vec::new();
+    for f in files {
+        match groups.last_mut() {
+            Some(g) if g.0 == f.platform.as_str() && g.1 == f.creator_id.as_str() && g.2 == f.post_id.as_str() => {
+                g.4.push(f)
+            }
+            _ => groups.push((
+                f.platform.as_str(),
+                f.creator_id.as_str(),
+                f.post_id.as_str(),
+                f.post_title.as_deref().unwrap_or(f.post_id.as_str()),
+                vec![f],
+            )),
+        }
+    }
+    html! {
+        @for (platform, creator_id, post_id, title, rows) in &groups {
+            div.postgroup {
+                h3 { a href=(format!("/mod/post/{platform}/{creator_id}/{post_id}")) { (title) } }
+                (file_list(rows))
+            }
+        }
+    }
+}
+
+// files as openable links, never inline images, so a moderator opens each item deliberately
+fn file_list(files: &[&db::ManifestRow]) -> Markup {
+    html! {
+        ul.filelist {
+            @for f in files {
+                li {
+                    @match &f.infohash {
+                        Some(ih) => a.filelink href=(format!("/t/{ih}/f/0")) target="_blank" rel="noopener" {
+                            (f.filename.clone().unwrap_or_else(|| format!("file {}", f.file_index)))
+                        }
+                        None => span { (f.filename.clone().unwrap_or_else(|| format!("file {}", f.file_index))) }
+                    }
+                    span.muted { " - " (f.mime) " - " (human_size(f.size)) }
+                }
+            }
+        }
+    }
+}
+
+fn human_size(bytes: i64) -> String {
+    let b = bytes as f64;
+    if b >= 1e9 {
+        format!("{:.1} GB", b / 1e9)
+    } else if b >= 1e6 {
+        format!("{:.1} MB", b / 1e6)
+    } else if b >= 1e3 {
+        format!("{:.0} KB", b / 1e3)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn private_page(page: Html<String>) -> Response {
+    let mut resp = page.into_response();
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("private, no-store"),
+    );
+    resp
+}
+
 #[derive(serde::Deserialize)]
 struct BanPostForm {
     platform: String,
@@ -1662,7 +1876,7 @@ fn reports_section(reports: &[db::ReportGroup], open_count: i64) -> Markup {
                     li.report.csam[r.has_csam] {
                         div.rowmain {
                             div.rowtitle {
-                                a href=(format!("/p/{}/{}/{}", r.platform, r.creator_id, r.post_id)) {
+                                a href=(format!("/mod/post/{}/{}/{}", r.platform, r.creator_id, r.post_id)) {
                                     (r.post_title.clone().unwrap_or_else(|| r.post_id.clone()))
                                 }
                                 " " span.chip.platform { (pretty_platform(&r.platform)) }
@@ -2363,9 +2577,16 @@ main { max-width:1240px; margin:0 auto; padding:1.4rem 1.1rem 3rem }
 .hp { position:absolute; left:-9999px; width:1px; height:1px; opacity:0 }
 li.report.csam { border-left:3px solid var(--red); padding-left:.6rem }
 .modbar { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; max-width:720px; margin:1rem auto 0; padding:.5rem .7rem; border:1px solid var(--surface1); border-radius:10px; background:var(--mantle) }
-.pendthumb { width:56px; height:56px; flex:none; object-fit:cover; border-radius:8px; filter:blur(11px); transition:filter .08s; cursor:pointer }
-.pendthumb:hover { filter:none }
-.pendthumb.empty { display:grid; place-items:center; background:var(--surface0); color:var(--overlay0); filter:none; font-weight:700 }
+.viewlink { display:inline-block; padding:.4rem .8rem; border-radius:8px; border:1px solid var(--surface1); background:var(--surface0); color:var(--text); font-weight:600; font-size:.85rem }
+.viewlink:hover { border-color:var(--accent); text-decoration:none }
+.filelist { list-style:none; padding:0; margin:.5rem 0 }
+.filelist li { padding:.4rem 0; border-bottom:1px solid var(--surface0) }
+.filelink { font-weight:600 }
+.postgroup { margin:1.1rem 0 }
+.postgroup h3 { margin:.2rem 0; font-size:1.05rem }
+.statusbar { display:flex; align-items:center; gap:.8rem; flex-wrap:wrap; padding:.6rem .9rem; border-radius:10px; margin:1rem 0; background:var(--surface0); border:1px solid var(--surface1); font-weight:600 }
+.statusbar.ok { background:color-mix(in srgb, var(--green) 16%, var(--mantle)); border-color:transparent }
+.statusbar.danger { background:color-mix(in srgb, var(--red) 16%, var(--mantle)); border-color:transparent }
 .body img { max-width:100%; border-radius:10px }
 
 .foot { border-top:1px solid var(--surface0); margin-top:2.5rem; padding:2rem 1.1rem }

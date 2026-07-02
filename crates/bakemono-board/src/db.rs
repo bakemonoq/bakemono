@@ -75,7 +75,7 @@ pub async fn magnet_by_infohash(pool: &PgPool, infohash: &str) -> Result<Option<
     Ok(magnet)
 }
 
-async fn pubkey_status(pool: &PgPool, pubkey: &str) -> Result<Option<String>> {
+pub async fn pubkey_status(pool: &PgPool, pubkey: &str) -> Result<Option<String>> {
     let status = sqlx::query_scalar("SELECT status FROM pubkeys WHERE pubkey = $1")
         .bind(pubkey)
         .fetch_optional(pool)
@@ -151,6 +151,99 @@ pub async fn post_files(
     .fetch_all(pool)
     .await?;
     Ok(rows)
+}
+
+// mod-only: the same lookup as magnet_by_infohash but over all manifests, so a moderator can preview
+// pending or taken-down content the public view hides
+pub async fn magnet_by_infohash_any(pool: &PgPool, infohash: &str) -> Result<Option<String>> {
+    let magnet = sqlx::query_scalar("SELECT magnet FROM manifests WHERE infohash = $1 LIMIT 1")
+        .bind(infohash)
+        .fetch_optional(pool)
+        .await?;
+    Ok(magnet)
+}
+
+// mod-only: every file a post carries regardless of moderation status, deduped by hash
+pub async fn post_files_any(
+    pool: &PgPool,
+    platform: &str,
+    creator_id: &str,
+    post_id: &str,
+) -> Result<Vec<ManifestRow>> {
+    let rows = sqlx::query_as::<_, ManifestRow>(
+        "SELECT * FROM (
+             SELECT DISTINCT ON (file_hash) * FROM manifests
+             WHERE platform = $1 AND creator_id = $2 AND post_id = $3
+             ORDER BY file_hash, created_at DESC
+         ) t ORDER BY file_index",
+    )
+    .bind(platform)
+    .bind(creator_id)
+    .bind(post_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+// mod-only: every file a contributor uploaded, deduped by hash, ordered so posts stay contiguous
+pub async fn pubkey_files(pool: &PgPool, pubkey: &str) -> Result<Vec<ManifestRow>> {
+    let rows = sqlx::query_as::<_, ManifestRow>(
+        "SELECT * FROM (
+             SELECT DISTINCT ON (file_hash) * FROM manifests WHERE pubkey = $1
+             ORDER BY file_hash, created_at DESC
+         ) t ORDER BY platform, creator_id, post_id, file_index",
+    )
+    .bind(pubkey)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+// the takedown hiding a post (if any), for the mod view's status banner and one-click unban
+pub async fn post_takedown(
+    pool: &PgPool,
+    platform: &str,
+    creator_id: &str,
+    post_id: &str,
+) -> Result<Option<(String, String)>> {
+    let row = sqlx::query_as(
+        "SELECT d_tag, reason FROM takedowns t WHERE
+             (t.target_type = 'post' AND t.target = $1 || ':' || $2 || ':' || $3) OR
+             (t.target_type = 'creator' AND t.target = $1 || ':' || $2) OR
+             (t.target_type IN ('e','x','p') AND EXISTS (
+                 SELECT 1 FROM manifests m
+                 WHERE m.platform = $1 AND m.creator_id = $2 AND m.post_id = $3 AND (
+                     (t.target_type = 'e' AND t.target = m.event_id) OR
+                     (t.target_type = 'x' AND t.target = m.file_hash) OR
+                     (t.target_type = 'p' AND t.target = m.pubkey)
+                 )
+             ))
+         LIMIT 1",
+    )
+    .bind(platform)
+    .bind(creator_id)
+    .bind(post_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+// resolve a takedown target to a concrete post so the takedown list links straight to the hidden
+// content; pubkey targets return None (the caller links to the contributor view instead)
+pub async fn locate_takedown(
+    pool: &PgPool,
+    target_type: &str,
+    target: &str,
+) -> Result<Option<(String, String, String)>> {
+    let q = match target_type {
+        "e" => "SELECT platform, creator_id, post_id FROM manifests WHERE event_id = $1 LIMIT 1",
+        "x" => "SELECT platform, creator_id, post_id FROM manifests WHERE file_hash = $1 LIMIT 1",
+        "post" => "SELECT platform, creator_id, post_id FROM manifests WHERE platform || ':' || creator_id || ':' || post_id = $1 LIMIT 1",
+        "creator" => "SELECT platform, creator_id, post_id FROM manifests WHERE platform || ':' || creator_id = $1 ORDER BY created_at DESC LIMIT 1",
+        _ => return Ok(None),
+    };
+    let row = sqlx::query_as(q).bind(target).fetch_optional(pool).await?;
+    Ok(row)
 }
 
 // optional narrowing of the seed feed so a keeper can subscribe to just one creator/post/contributor
@@ -477,10 +570,7 @@ pub async fn bump_views(pool: &PgPool, platform: &str, creator_id: &str, post_id
 pub async fn pending_pubkeys(pool: &PgPool, limit: i64) -> Result<Vec<PendingRow>> {
     let rows = sqlx::query_as::<_, PendingRow>(
         "SELECT p.pubkey, COUNT(m.event_id) AS files,
-                MAX(m.creator) AS creator, MAX(m.post_title) AS sample,
-                (SELECT thumb FROM manifests mm
-                 WHERE mm.pubkey = p.pubkey AND mm.thumb IS NOT NULL
-                 ORDER BY mm.created_at DESC LIMIT 1) AS thumb
+                MAX(m.creator) AS creator, MAX(m.post_title) AS sample
          FROM pubkeys p LEFT JOIN manifests m ON m.pubkey = p.pubkey
          WHERE p.status = 'pending'
          GROUP BY p.pubkey, p.first_seen
@@ -752,7 +842,6 @@ pub struct PendingRow {
     pub files: i64,
     pub creator: Option<String>,
     pub sample: Option<String>,
-    pub thumb: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1341,6 +1430,71 @@ mod tests {
             remove_takedown(&pool, &td.d_tag()).await.unwrap();
             assert!(post_is_visible(&pool, p, c, post).await.unwrap());
         }
+
+        sqlx::query("DELETE FROM manifests WHERE creator_id = $1")
+            .bind(&creator_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM pubkeys WHERE pubkey = $1")
+            .bind(keys.public_key().to_hex())
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn mod_views_reach_hidden_and_banned_content() {
+        use bakemono_core::Target;
+        let Ok(url) = std::env::var("BAKEMONO_TEST_DB") else {
+            eprintln!("skipping: BAKEMONO_TEST_DB not set");
+            return;
+        };
+        let pool = match connect(&url).await {
+            Ok(pool) => pool,
+            Err(e) => {
+                eprintln!("skipping: cannot reach test db: {e}");
+                return;
+            }
+        };
+        let keys = Keys::generate();
+        let creator_id = format!("mv-{}", std::process::id());
+        let manifest = sample(&creator_id);
+        let event = manifest.to_event_at(&keys, 1_000).unwrap();
+        upsert(&pool, &event, &manifest).await.unwrap();
+        let (p, c, post) = (
+            manifest.platform.as_str(),
+            creator_id.as_str(),
+            manifest.post_id.as_str(),
+        );
+
+        // the pubkey is pending, so the post is hidden from the public view but reachable by mod queries
+        assert!(!post_is_visible(&pool, p, c, post).await.unwrap());
+        assert_eq!(post_files_any(&pool, p, c, post).await.unwrap().len(), 1);
+        assert_eq!(
+            pubkey_files(&pool, &keys.public_key().to_hex()).await.unwrap().len(),
+            1
+        );
+
+        // ban the post; post_takedown and locate_takedown must resolve it for the mod view
+        let td = Takedown {
+            target: Target::post(p, c, post),
+            reason: "dmca".into(),
+            applied_at: None,
+            explanation: String::new(),
+        };
+        record_takedown(&pool, &td, "local", None).await.unwrap();
+        let (d_tag, reason) = post_takedown(&pool, p, c, post)
+            .await
+            .unwrap()
+            .expect("takedown found");
+        assert_eq!(reason, "dmca");
+        assert_eq!(d_tag, td.d_tag());
+        let located = locate_takedown(&pool, "post", &format!("{p}:{c}:{post}"))
+            .await
+            .unwrap()
+            .expect("located");
+        assert_eq!((located.0.as_str(), located.1.as_str(), located.2.as_str()), (p, c, post));
 
         sqlx::query("DELETE FROM manifests WHERE creator_id = $1")
             .bind(&creator_id)
