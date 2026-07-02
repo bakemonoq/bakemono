@@ -30,6 +30,17 @@ pub async fn upsert(pool: &PgPool, event: &Event, manifest: &Manifest) -> Result
             }
         }
     }
+    // author gate: a first-seen creator waits for review too, so an approved contributor cannot
+    // introduce a brand-new author straight to the public feed
+    match author_status(pool, &manifest.platform, &manifest.creator_id).await?.as_deref() {
+        Some("rejected") => return Ok(()),
+        Some(_) => {}
+        None => {
+            if !try_enqueue_author(pool, &manifest.platform, &manifest.creator_id, MAX_PENDING).await? {
+                return Ok(());
+            }
+        }
+    }
     // NIP-33: a newer event with the same (pubkey, d) replaces the older one
     sqlx::query("DELETE FROM manifests WHERE pubkey = $1 AND d_tag = $2 AND created_at < $3")
         .bind(event.pubkey.to_hex())
@@ -115,6 +126,119 @@ pub async fn gc_pending(pool: &PgPool, ttl_secs: i64) -> Result<u64> {
     .execute(pool)
     .await?;
     Ok(res.rows_affected())
+}
+
+pub async fn author_status(pool: &PgPool, platform: &str, creator_id: &str) -> Result<Option<String>> {
+    let status = sqlx::query_scalar("SELECT status FROM authors WHERE platform = $1 AND creator_id = $2")
+        .bind(platform)
+        .bind(creator_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(status)
+}
+
+// enqueue a never-seen author as pending only while the queue has room, mirroring the pubkey gate
+pub(crate) async fn try_enqueue_author(
+    pool: &PgPool,
+    platform: &str,
+    creator_id: &str,
+    cap: i64,
+) -> Result<bool> {
+    let res = sqlx::query(
+        "INSERT INTO authors (platform, creator_id, status, first_seen)
+         SELECT $1, $2, 'pending', EXTRACT(EPOCH FROM now())::bigint
+         WHERE (SELECT COUNT(*) FROM authors WHERE status = 'pending') < $3
+         ON CONFLICT (platform, creator_id) DO NOTHING",
+    )
+    .bind(platform)
+    .bind(creator_id)
+    .bind(cap)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+// drop pending authors never reviewed within the ttl, with their manifests, so an author flood self-heals
+pub async fn gc_authors(pool: &PgPool, ttl_secs: i64) -> Result<u64> {
+    let res = sqlx::query(
+        "WITH stale AS (
+             DELETE FROM authors
+             WHERE status = 'pending'
+               AND first_seen < EXTRACT(EPOCH FROM now())::bigint - $1
+             RETURNING platform, creator_id
+         )
+         DELETE FROM manifests m USING stale s
+         WHERE m.platform = s.platform AND m.creator_id = s.creator_id",
+    )
+    .bind(ttl_secs)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+pub async fn pending_authors(pool: &PgPool, limit: i64) -> Result<Vec<PendingAuthor>> {
+    let rows = sqlx::query_as::<_, PendingAuthor>(
+        "SELECT a.platform, a.creator_id, MAX(m.creator) AS creator,
+                COUNT(DISTINCT m.post_id) AS posts, COUNT(m.event_id) AS files
+         FROM authors a LEFT JOIN manifests m
+           ON m.platform = a.platform AND m.creator_id = a.creator_id
+         WHERE a.status = 'pending'
+         GROUP BY a.platform, a.creator_id, a.first_seen
+         ORDER BY a.first_seen DESC
+         LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+pub async fn approve_author(pool: &PgPool, platform: &str, creator_id: &str) -> Result<()> {
+    sqlx::query("UPDATE authors SET status = 'approved' WHERE platform = $1 AND creator_id = $2")
+        .bind(platform)
+        .bind(creator_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+// reject an author and drop all its indexed content from every contributor
+pub async fn reject_author(pool: &PgPool, platform: &str, creator_id: &str) -> Result<()> {
+    sqlx::query("UPDATE authors SET status = 'rejected' WHERE platform = $1 AND creator_id = $2")
+        .bind(platform)
+        .bind(creator_id)
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM manifests WHERE platform = $1 AND creator_id = $2")
+        .bind(platform)
+        .bind(creator_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+// mod-only: every file an author carries at any status, ordered so posts stay contiguous
+pub async fn author_files(pool: &PgPool, platform: &str, creator_id: &str) -> Result<Vec<ManifestRow>> {
+    let rows = sqlx::query_as::<_, ManifestRow>(
+        "SELECT * FROM (
+             SELECT DISTINCT ON (file_hash) * FROM manifests WHERE platform = $1 AND creator_id = $2
+             ORDER BY file_hash, created_at DESC
+         ) t ORDER BY post_id, file_index",
+    )
+    .bind(platform)
+    .bind(creator_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+#[derive(sqlx::FromRow)]
+pub struct PendingAuthor {
+    pub platform: String,
+    pub creator_id: String,
+    pub creator: Option<String>,
+    pub posts: i64,
+    pub files: i64,
 }
 
 pub async fn stats(pool: &PgPool) -> Result<Stats> {
@@ -990,6 +1114,19 @@ INSERT INTO pubkeys (pubkey, status, first_seen)
 SELECT pubkey, 'pending', MIN(created_at) FROM manifests GROUP BY pubkey
 ON CONFLICT (pubkey) DO NOTHING;
 
+CREATE TABLE IF NOT EXISTS authors (
+    platform   TEXT NOT NULL,
+    creator_id TEXT NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'pending',
+    first_seen BIGINT NOT NULL,
+    PRIMARY KEY (platform, creator_id)
+);
+CREATE INDEX IF NOT EXISTS authors_status ON authors (status);
+-- grandfather authors already indexed as approved so nothing currently public disappears (one-time, idempotent)
+INSERT INTO authors (platform, creator_id, status, first_seen)
+SELECT platform, creator_id, 'approved', MIN(created_at) FROM manifests GROUP BY platform, creator_id
+ON CONFLICT (platform, creator_id) DO NOTHING;
+
 CREATE TABLE IF NOT EXISTS torrent_health (
     infohash   TEXT PRIMARY KEY,
     seeders    INTEGER NOT NULL,
@@ -1037,6 +1174,8 @@ CREATE INDEX IF NOT EXISTS reports_status ON reports (status);
 CREATE OR REPLACE VIEW visible_manifests AS
 SELECT m.* FROM manifests m
 WHERE m.pubkey IN (SELECT pubkey FROM pubkeys WHERE status = 'approved')
+  AND EXISTS (SELECT 1 FROM authors a
+              WHERE a.platform = m.platform AND a.creator_id = m.creator_id AND a.status = 'approved')
   AND NOT EXISTS (
       SELECT 1 FROM takedowns t WHERE
           (t.target_type = 'e' AND t.target = m.event_id) OR
@@ -1098,6 +1237,7 @@ mod tests {
         approve_pubkey(&pool, &keys.public_key().to_hex())
             .await
             .unwrap();
+        approve_author(&pool, "patreon", &creator_id).await.unwrap();
         let files = post_files(&pool, &manifest.platform, &creator_id, &manifest.post_id)
             .await
             .unwrap();
@@ -1151,6 +1291,7 @@ mod tests {
         approve_pubkey(&pool, &kb.public_key().to_hex())
             .await
             .unwrap();
+        approve_author(&pool, "patreon", &creator_id).await.unwrap();
 
         let files = post_files(&pool, &manifest.platform, &creator_id, &manifest.post_id)
             .await
@@ -1188,6 +1329,7 @@ mod tests {
         approve_pubkey(&pool, &keys.public_key().to_hex())
             .await
             .unwrap();
+        approve_author(&pool, "patreon", &creator_id).await.unwrap();
         assert_eq!(
             post_files(&pool, &manifest.platform, &creator_id, &manifest.post_id)
                 .await
@@ -1339,6 +1481,7 @@ mod tests {
         approve_pubkey(&pool, &keys.public_key().to_hex())
             .await
             .unwrap();
+        approve_author(&pool, "patreon", &creator_id).await.unwrap();
 
         let (p, c, post) = (
             manifest.platform.as_str(),
@@ -1411,6 +1554,7 @@ mod tests {
         approve_pubkey(&pool, &keys.public_key().to_hex())
             .await
             .unwrap();
+        approve_author(&pool, "patreon", &creator_id).await.unwrap();
         let (p, c, post) = (
             manifest.platform.as_str(),
             creator_id.as_str(),
@@ -1497,6 +1641,58 @@ mod tests {
         assert_eq!((located.0.as_str(), located.1.as_str(), located.2.as_str()), (p, c, post));
 
         sqlx::query("DELETE FROM manifests WHERE creator_id = $1")
+            .bind(&creator_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM pubkeys WHERE pubkey = $1")
+            .bind(keys.public_key().to_hex())
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn author_gate_holds_content_until_approved() {
+        let Ok(url) = std::env::var("BAKEMONO_TEST_DB") else {
+            eprintln!("skipping: BAKEMONO_TEST_DB not set");
+            return;
+        };
+        let pool = match connect(&url).await {
+            Ok(pool) => pool,
+            Err(e) => {
+                eprintln!("skipping: cannot reach test db: {e}");
+                return;
+            }
+        };
+        let keys = Keys::generate();
+        let creator_id = format!("ag-{}", std::process::id());
+        let manifest = sample(&creator_id);
+        let event = manifest.to_event_at(&keys, 1_000).unwrap();
+        upsert(&pool, &event, &manifest).await.unwrap();
+        approve_pubkey(&pool, &keys.public_key().to_hex())
+            .await
+            .unwrap();
+        let (p, c, post) = (
+            manifest.platform.as_str(),
+            creator_id.as_str(),
+            manifest.post_id.as_str(),
+        );
+
+        // contributor approved, but a first-seen author is still pending -> not public
+        assert_eq!(author_status(&pool, p, c).await.unwrap().as_deref(), Some("pending"));
+        assert!(!post_is_visible(&pool, p, c, post).await.unwrap());
+
+        // approve the author -> public
+        approve_author(&pool, p, c).await.unwrap();
+        assert!(post_is_visible(&pool, p, c, post).await.unwrap());
+
+        // reject the author -> its content is dropped from the index
+        reject_author(&pool, p, c).await.unwrap();
+        assert_eq!(post_files_any(&pool, p, c, post).await.unwrap().len(), 0);
+        assert_eq!(author_status(&pool, p, c).await.unwrap().as_deref(), Some("rejected"));
+
+        sqlx::query("DELETE FROM authors WHERE creator_id = $1")
             .bind(&creator_id)
             .execute(&pool)
             .await

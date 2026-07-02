@@ -68,6 +68,9 @@ pub fn router(state: AppState) -> Router {
         .route("/mod/ban-creator", post(mod_ban_creator))
         .route("/mod/pubkey/{pubkey}", get(mod_pubkey_view))
         .route("/mod/post/{platform}/{creator_id}/{post_id}", get(mod_post_view))
+        .route("/mod/author/{platform}/{creator_id}", get(mod_author_view))
+        .route("/mod/approve-author", post(mod_approve_author))
+        .route("/mod/reject-author", post(mod_reject_author))
         .route("/t/{infohash}/meta", get(gateway_meta))
         .route("/t/{infohash}/f/{file_index}", get(gateway_file))
         .with_state(state)
@@ -1246,6 +1249,7 @@ async fn mod_queue(State(state): State<AppState>, headers: HeaderMap) -> Respons
     let takedowns = db::takedowns(&state.pool).await.unwrap_or_default();
     let reports = db::open_reports(&state.pool, 100).await.unwrap_or_default();
     let report_count = db::open_report_count(&state.pool).await.unwrap_or(0);
+    let authors = db::pending_authors(&state.pool, 100).await.unwrap_or_default();
     let mut td_links: Vec<Option<String>> = Vec::with_capacity(takedowns.len());
     for t in &takedowns {
         let link = if t.target_type == "p" {
@@ -1272,6 +1276,10 @@ async fn mod_queue(State(state): State<AppState>, headers: HeaderMap) -> Respons
                     div.label { "open reports" }
                 }
                 a.stat.statlink href="#queue" {
+                    div.num.danger[!authors.is_empty()] { (authors.len()) }
+                    div.label { "pending authors" }
+                }
+                a.stat.statlink href="#queue" {
                     div.num { (pending.len()) }
                     div.label { "pending contributors" }
                 }
@@ -1287,8 +1295,37 @@ async fn mod_queue(State(state): State<AppState>, headers: HeaderMap) -> Respons
             (reports_section(&reports, report_count))
             section.block id="queue" {
                 div.blockhead { h2 { "Pending review" } }
-                p.muted { "first-seen contributors wait here; approve to publish their files, reject to drop them" }
-                @if groups.is_empty() && pending.is_empty() { p.muted { "nothing awaiting review" } }
+                @if authors.is_empty() && groups.is_empty() && pending.is_empty() { p.muted { "nothing awaiting review" } }
+                @if !authors.is_empty() {
+                    h3 { "Pending authors" }
+                    p.muted { "first-seen creators; approve to let their posts publish, reject to drop all their content" }
+                    ul.list.rows {
+                        @for a in &authors {
+                            li {
+                                div.rowmain {
+                                    div.rowtitle {
+                                        (a.creator.clone().unwrap_or_else(|| a.creator_id.clone()))
+                                        " " span.chip.platform { (pretty_platform(&a.platform)) }
+                                    }
+                                    div.rowmeta { span.muted { (a.posts) " post(s) - " (a.files) " file(s)" } }
+                                }
+                                div.rowactions {
+                                    a.viewlink href=(format!("/mod/author/{}/{}", a.platform, a.creator_id)) { "view files" }
+                                    form method="post" action="/mod/approve-author" class="modform" {
+                                        input type="hidden" name="platform" value=(a.platform);
+                                        input type="hidden" name="creator_id" value=(a.creator_id);
+                                        button.ok { "approve" }
+                                    }
+                                    form method="post" action="/mod/reject-author" class="modform" {
+                                        input type="hidden" name="platform" value=(a.platform);
+                                        input type="hidden" name="creator_id" value=(a.creator_id);
+                                        button.danger { "reject" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 @if !groups.is_empty() {
                     h3 { "By creator" }
                     p.muted { "bulk-act on a flood: approve or reject every pending key that posted to a creator" }
@@ -1773,6 +1810,80 @@ async fn mod_post_view(
         },
     );
     private_page(page)
+}
+
+// mod-only: an author's files grouped by post, so a mod can review a first-seen creator before its
+// content is allowed to publish
+async fn mod_author_view(
+    State(state): State<AppState>,
+    Path((platform, creator_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(denied) = require_mod(&headers) {
+        return denied;
+    }
+    let status = db::author_status(&state.pool, &platform, &creator_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "unknown".into());
+    let files = db::author_files(&state.pool, &platform, &creator_id)
+        .await
+        .unwrap_or_default();
+    let name = files
+        .first()
+        .map(|f| f.creator.clone())
+        .unwrap_or_else(|| creator_id.clone());
+    let page = render(
+        &name,
+        html! {
+            p { a href="/mod" { "< mod queue" } }
+            h2 { (name) " " span.chip.platform { (pretty_platform(&platform)) } }
+            p { "author status: " span.chip { (status) } }
+            @if status == "pending" {
+                div.modbar {
+                    span.muted { "not yet public - review the files, then:" }
+                    form method="post" action="/mod/approve-author" class="modform" {
+                        input type="hidden" name="platform" value=(platform);
+                        input type="hidden" name="creator_id" value=(creator_id);
+                        button.ok { "approve author" }
+                    }
+                    form method="post" action="/mod/reject-author" class="modform" {
+                        input type="hidden" name="platform" value=(platform);
+                        input type="hidden" name="creator_id" value=(creator_id);
+                        button.danger { "reject author" }
+                    }
+                }
+            }
+            @if files.is_empty() { p.muted { "no files" } }
+            (post_groups(&files))
+        },
+    );
+    private_page(page)
+}
+
+async fn mod_approve_author(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Form(form): Form<CreatorForm>,
+) -> Response {
+    if let Err(denied) = require_mod(&headers) {
+        return denied;
+    }
+    let _ = db::approve_author(&pool, &form.platform, &form.creator_id).await;
+    Redirect::to("/mod").into_response()
+}
+
+async fn mod_reject_author(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Form(form): Form<CreatorForm>,
+) -> Response {
+    if let Err(denied) = require_mod(&headers) {
+        return denied;
+    }
+    let _ = db::reject_author(&pool, &form.platform, &form.creator_id).await;
+    Redirect::to("/mod").into_response()
 }
 
 // a contributor's files split into their posts, each header linking to that post's mod view

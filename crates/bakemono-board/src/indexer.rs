@@ -67,6 +67,11 @@ fn spawn_pending_gc(pool: PgPool) {
                 Ok(_) => {}
                 Err(e) => eprintln!("pending gc error: {e:#}"),
             }
+            match crate::db::gc_authors(&pool, crate::db::PENDING_TTL_SECS).await {
+                Ok(n) if n > 0 => println!("gc: dropped {n} manifest(s) from stale pending author(s)"),
+                Ok(_) => {}
+                Err(e) => eprintln!("author gc error: {e:#}"),
+            }
         }
     });
 }
@@ -275,6 +280,7 @@ mod tests {
             crate::db::approve_pubkey(&pool, &contributor.public_key().to_hex())
                 .await
                 .ok();
+            crate::db::approve_author(&pool, "patreon", &creator_id).await.ok();
             visible(&pool, &creator_id).await == 1
         })
         .await;
