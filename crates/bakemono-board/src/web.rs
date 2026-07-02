@@ -935,7 +935,7 @@ async fn post_page(
     let title = first
         .and_then(|f| f.post_title.clone())
         .unwrap_or_else(|| post_id.clone());
-    let body = first.map(|f| f.content.clone()).unwrap_or_default();
+    let body = first.map(|f| crate::sanitize::body(&f.content)).unwrap_or_default();
     let creator = first.map(|f| f.creator.clone());
     let date = first.and_then(|f| f.posted_at.clone());
     let adjacent = db::adjacent_posts(&pool, &platform, &creator_id, &post_id)
@@ -973,7 +973,7 @@ async fn post_page(
             }
             @if files.is_empty() { p.muted { "This post has no files, or they are hidden" } }
             (carousel(&files))
-            @if !body.is_empty() { div.body { (body) } }
+            @if !body.is_empty() { div.body { (PreEscaped(&body)) } }
             @if is_mod(&headers) { (mod_bar_post(&platform, &creator_id, &post_id)) }
             (report_box(&platform, &creator_id, &post_id, query.reported.is_some()))
             script { (PreEscaped(CAROUSEL_JS)) }

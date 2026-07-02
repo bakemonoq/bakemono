@@ -25,6 +25,7 @@ base64 = "0.22"
 sha2 = "0.10"
 hmac = "0.12"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+ammonia = "4.1.3"
 
 [dev-dependencies]
 nostr-relay-builder.workspace = true

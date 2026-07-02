@@ -4,6 +4,7 @@ mod health;
 mod indexer;
 mod instance;
 mod ratelimit;
+mod sanitize;
 mod trusted_proxy;
 mod web;
 
