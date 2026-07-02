@@ -155,7 +155,9 @@ pub async fn serve<C: ContentSource>(daemon: Arc<Daemon<C>>) -> Result<()> {
         }
     }
     let _ = std::fs::remove_file(&path);
-    daemon.shutdown().await;
+    // bound the graceful shutdown: librqbit's session teardown can hang, and the daemon force-exits
+    // after this returns anyway
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), daemon.shutdown()).await;
     Ok(())
 }
 

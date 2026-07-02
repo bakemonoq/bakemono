@@ -38,5 +38,10 @@ async fn main() -> Result<()> {
         }
     });
 
-    ipc::serve(daemon).await
+    if let Err(e) = ipc::serve(daemon).await {
+        tracing::error!("ipc serve exited: {e:#}");
+    }
+    // dropping the tokio runtime can hang on librqbit's session teardown, leaving the daemon alive
+    // and holding its BT/DHT ports; exit hard once serving stops so it actually dies and frees them
+    std::process::exit(0);
 }
