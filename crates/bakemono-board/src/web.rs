@@ -56,10 +56,9 @@ pub fn router(state: AppState) -> Router {
         .route("/c/{platform}/{creator_id}", get(creator_page))
         .route("/p/{platform}/{creator_id}/{post_id}", get(post_page))
         .route("/mod", get(mod_queue))
-        .route("/mod/approve", post(mod_approve))
-        .route("/mod/reject", post(mod_reject))
-        .route("/mod/approve-creator", post(mod_approve_creator))
-        .route("/mod/reject-creator", post(mod_reject_creator))
+        .route("/mod/queue-approve", post(mod_queue_approve))
+        .route("/mod/queue-reject", post(mod_queue_reject))
+        .route("/mod/ban-contributor", post(mod_ban_contributor))
         .route("/mod/takedown", post(mod_takedown))
         .route("/mod/untakedown", post(mod_untakedown))
         .route("/report", post(submit_report))
@@ -69,8 +68,6 @@ pub fn router(state: AppState) -> Router {
         .route("/mod/pubkey/{pubkey}", get(mod_pubkey_view))
         .route("/mod/post/{platform}/{creator_id}/{post_id}", get(mod_post_view))
         .route("/mod/author/{platform}/{creator_id}", get(mod_author_view))
-        .route("/mod/approve-author", post(mod_approve_author))
-        .route("/mod/reject-author", post(mod_reject_author))
         .route("/t/{infohash}/meta", get(gateway_meta))
         .route("/t/{infohash}/f/{file_index}", get(gateway_file))
         .with_state(state)
@@ -1248,12 +1245,12 @@ async fn mod_queue(State(state): State<AppState>, headers: HeaderMap) -> Respons
     if let Err(denied) = require_mod(&headers) {
         return denied;
     }
-    let groups = db::pending_groups(&state.pool, 50).await.unwrap_or_default();
-    let pending = db::pending_pubkeys(&state.pool, 100).await.unwrap_or_default();
+    let queue = db::pending_queue(&state.pool, 2_000).await.unwrap_or_default();
+    let pending_posts = db::pending_post_count(&state.pool).await.unwrap_or(0);
     let takedowns = db::takedowns(&state.pool).await.unwrap_or_default();
     let reports = db::open_reports(&state.pool, 100).await.unwrap_or_default();
     let report_count = db::open_report_count(&state.pool).await.unwrap_or(0);
-    let authors = db::pending_authors(&state.pool, 100).await.unwrap_or_default();
+    let blocks = group_queue(&queue);
     let mut td_links: Vec<Option<String>> = Vec::with_capacity(takedowns.len());
     for t in &takedowns {
         let link = if t.target_type == "p" {
@@ -1280,16 +1277,12 @@ async fn mod_queue(State(state): State<AppState>, headers: HeaderMap) -> Respons
                     div.label { "open reports" }
                 }
                 a.stat.statlink href="#queue" {
-                    div.num.danger[!authors.is_empty()] { (authors.len()) }
-                    div.label { "pending authors" }
+                    div.num.danger[pending_posts > 0] { (pending_posts) }
+                    div.label { "pending posts" }
                 }
                 a.stat.statlink href="#queue" {
-                    div.num { (pending.len()) }
-                    div.label { "pending contributors" }
-                }
-                a.stat.statlink href="#queue" {
-                    div.num { (groups.len()) }
-                    div.label { "flood groups" }
+                    div.num { (blocks.len()) }
+                    div.label { "contributors in queue" }
                 }
                 a.stat.statlink href="#takedowns" {
                     div.num { (takedowns.len()) }
@@ -1298,90 +1291,50 @@ async fn mod_queue(State(state): State<AppState>, headers: HeaderMap) -> Respons
             }
             (reports_section(&reports, report_count))
             section.block id="queue" {
-                div.blockhead { h2 { "Pending review" } }
-                @if authors.is_empty() && groups.is_empty() && pending.is_empty() { p.muted { "nothing awaiting review" } }
-                @if !authors.is_empty() {
-                    h3 { "Pending authors" }
-                    p.muted { "first-seen creators; approve to let their posts publish, reject to drop all their content" }
-                    ul.list.rows {
-                        @for a in &authors {
-                            li {
-                                div.rowmain {
-                                    div.rowtitle {
-                                        (a.creator.clone().unwrap_or_else(|| a.creator_id.clone()))
-                                        " " span.chip.platform { (pretty_platform(&a.platform)) }
-                                    }
-                                    div.rowmeta { span.muted { (a.posts) " post(s) - " (a.files) " file(s)" } }
-                                }
-                                div.rowactions {
-                                    a.viewlink href=(format!("/mod/author/{}/{}", a.platform, a.creator_id)) { "view files" }
-                                    form method="post" action="/mod/approve-author" class="modform" {
-                                        input type="hidden" name="platform" value=(a.platform);
-                                        input type="hidden" name="creator_id" value=(a.creator_id);
-                                        button.ok { "approve" }
-                                    }
-                                    form method="post" action="/mod/reject-author" class="modform" {
-                                        input type="hidden" name="platform" value=(a.platform);
-                                        input type="hidden" name="creator_id" value=(a.creator_id);
-                                        button.danger { "reject" }
-                                    }
-                                }
+                div.blockhead {
+                    h2 { "Pending review" }
+                    @if pending_posts > 0 { span.chip { (pending_posts) " posts" } }
+                }
+                p.muted { "every new post waits here; approve one post, a whole author, or an entire contributor at once" }
+                @if blocks.is_empty() { p.muted { "nothing awaiting review" } }
+                @for c in &blocks {
+                    div.qblock {
+                        div.qhead {
+                            div { code { (npub(c.pubkey)) } " " span.muted { (block_posts(c)) " post(s)" } }
+                            div.rowactions {
+                                (queue_form("/mod/queue-approve", c.pubkey, "", "", "", "approve all", false))
+                                (queue_form("/mod/queue-reject", c.pubkey, "", "", "", "reject all", true))
+                                (queue_form("/mod/ban-contributor", c.pubkey, "", "", "", "ban", true))
                             }
                         }
-                    }
-                }
-                @if !groups.is_empty() {
-                    h3 { "By creator" }
-                    p.muted { "bulk-act on a flood: approve or reject every pending key that posted to a creator" }
-                    ul.list.rows {
-                        @for g in &groups {
-                            li {
-                                div.rowmain {
-                                    div.rowtitle {
-                                        (g.creator.clone().unwrap_or_else(|| g.creator_id.clone()))
-                                        " " span.chip.platform { (pretty_platform(&g.platform)) }
+                        @for a in &c.authors {
+                            div.qauthor {
+                                div.qauthorhead {
+                                    div {
+                                        a.strong href=(format!("/mod/author/{}/{}", a.platform, a.creator_id)) { (a.creator) }
+                                        " " span.chip.platform { (pretty_platform(a.platform)) }
                                     }
-                                    div.rowmeta { span.muted { (g.pubkeys) " pubkey(s) - " (g.files) " file(s)" } }
-                                }
-                                div.rowactions {
-                                    form method="post" action="/mod/approve-creator" class="modform" {
-                                        input type="hidden" name="platform" value=(g.platform);
-                                        input type="hidden" name="creator_id" value=(g.creator_id);
-                                        button.ok { "approve all" }
-                                    }
-                                    form method="post" action="/mod/reject-creator" class="modform" {
-                                        input type="hidden" name="platform" value=(g.platform);
-                                        input type="hidden" name="creator_id" value=(g.creator_id);
-                                        button.danger { "reject all" }
+                                    div.rowactions {
+                                        (queue_form("/mod/queue-approve", c.pubkey, a.platform, a.creator_id, "", "approve all", false))
+                                        (queue_form("/mod/queue-reject", c.pubkey, a.platform, a.creator_id, "", "reject all", true))
                                     }
                                 }
-                            }
-                        }
-                    }
-                }
-                @if !pending.is_empty() {
-                    h3 { "By contributor" }
-                    p.muted { "newest first, capped at 100; hover a preview to reveal it" }
-                    ul.list.rows {
-                        @for p in &pending {
-                            li {
-                                div.rowmain {
-                                    div.rowtitle { code { (npub(&p.pubkey)) } }
-                                    div.rowmeta { span.muted {
-                                        (p.files) " file(s)"
-                                        @if let Some(c) = &p.creator { " - " (c) }
-                                        @if let Some(s) = &p.sample { " - " (s) }
-                                    } }
-                                }
-                                div.rowactions {
-                                    a.viewlink href=(format!("/mod/pubkey/{}", p.pubkey)) { "view files" }
-                                    form method="post" action="/mod/approve" class="modform" {
-                                        input type="hidden" name="pubkey" value=(p.pubkey);
-                                        button.ok { "approve" }
-                                    }
-                                    form method="post" action="/mod/reject" class="modform" {
-                                        input type="hidden" name="pubkey" value=(p.pubkey);
-                                        button.danger { "reject" }
+                                ul.list.rows {
+                                    @for post in &a.posts {
+                                        li {
+                                            div.rowmain {
+                                                div.rowtitle {
+                                                    a href=(format!("/mod/post/{}/{}/{}", a.platform, a.creator_id, post.post_id)) {
+                                                        (post.post_title.clone().unwrap_or_else(|| post.post_id.clone()))
+                                                    }
+                                                }
+                                                div.rowmeta { span.muted { (post.files) " file(s)" } }
+                                            }
+                                            div.rowactions {
+                                                (queue_form("/mod/queue-approve", c.pubkey, a.platform, a.creator_id, &post.post_id, "approve", false))
+                                                (queue_form("/mod/queue-reject", c.pubkey, a.platform, a.creator_id, &post.post_id, "reject", true))
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1452,52 +1405,113 @@ fn takedown_section(state: &AppState, takedowns: &[db::TakedownRow], links: &[Op
     }
 }
 
-async fn mod_approve(
+#[derive(serde::Deserialize)]
+struct QueueScope {
+    #[serde(default)]
+    pubkey: String,
+    #[serde(default)]
+    platform: String,
+    #[serde(default)]
+    creator_id: String,
+    #[serde(default)]
+    post_id: String,
+}
+
+async fn mod_queue_approve(
     State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Form(form): Form<QueueScope>,
+) -> Response {
+    if let Err(denied) = require_mod(&headers) {
+        return denied;
+    }
+    let _ = db::approve_pending(&pool, &form.pubkey, &form.platform, &form.creator_id, &form.post_id).await;
+    Redirect::to("/mod").into_response()
+}
+
+async fn mod_queue_reject(
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Form(form): Form<QueueScope>,
+) -> Response {
+    if let Err(denied) = require_mod(&headers) {
+        return denied;
+    }
+    let _ = db::reject_pending(&pool, &form.pubkey, &form.platform, &form.creator_id, &form.post_id).await;
+    Redirect::to("/mod").into_response()
+}
+
+// ban a contributor: publish a kind 31064 pubkey takedown (so their future uploads auto-drop at ingest)
+// and clear their current queue
+async fn mod_ban_contributor(
+    State(state): State<AppState>,
     headers: HeaderMap,
     Form(form): Form<ModForm>,
 ) -> Response {
     if let Err(denied) = require_mod(&headers) {
         return denied;
     }
-    let _ = db::approve_pubkey(&pool, &form.pubkey).await;
+    apply_ban(&state, Target::Pubkey(form.pubkey.clone())).await;
+    let _ = db::reject_pending(&state.pool, &form.pubkey, "", "", "").await;
     Redirect::to("/mod").into_response()
 }
 
-async fn mod_reject(
-    State(pool): State<PgPool>,
-    headers: HeaderMap,
-    Form(form): Form<ModForm>,
-) -> Response {
-    if let Err(denied) = require_mod(&headers) {
-        return denied;
-    }
-    let _ = db::reject_pubkey(&pool, &form.pubkey).await;
-    Redirect::to("/mod").into_response()
+// group the flat pending queue into contributor -> author -> posts, preserving the query order
+struct QContributor<'a> {
+    pubkey: &'a str,
+    authors: Vec<QAuthor<'a>>,
 }
-
-async fn mod_approve_creator(
-    State(pool): State<PgPool>,
-    headers: HeaderMap,
-    Form(form): Form<CreatorForm>,
-) -> Response {
-    if let Err(denied) = require_mod(&headers) {
-        return denied;
-    }
-    let _ = db::approve_creator(&pool, &form.platform, &form.creator_id).await;
-    Redirect::to("/mod").into_response()
+struct QAuthor<'a> {
+    platform: &'a str,
+    creator_id: &'a str,
+    creator: &'a str,
+    posts: Vec<&'a db::QueueRow>,
 }
-
-async fn mod_reject_creator(
-    State(pool): State<PgPool>,
-    headers: HeaderMap,
-    Form(form): Form<CreatorForm>,
-) -> Response {
-    if let Err(denied) = require_mod(&headers) {
-        return denied;
+fn group_queue(queue: &[db::QueueRow]) -> Vec<QContributor<'_>> {
+    let mut blocks: Vec<QContributor> = Vec::new();
+    for r in queue {
+        if blocks.last().map(|c| c.pubkey != r.pubkey).unwrap_or(true) {
+            blocks.push(QContributor { pubkey: &r.pubkey, authors: Vec::new() });
+        }
+        let contrib = blocks.last_mut().unwrap();
+        if contrib
+            .authors
+            .last()
+            .map(|a| a.platform != r.platform || a.creator_id != r.creator_id)
+            .unwrap_or(true)
+        {
+            contrib.authors.push(QAuthor {
+                platform: &r.platform,
+                creator_id: &r.creator_id,
+                creator: r.creator.as_deref().unwrap_or(&r.creator_id),
+                posts: Vec::new(),
+            });
+        }
+        contrib.authors.last_mut().unwrap().posts.push(r);
     }
-    let _ = db::reject_creator(&pool, &form.platform, &form.creator_id).await;
-    Redirect::to("/mod").into_response()
+    blocks
+}
+fn block_posts(c: &QContributor) -> usize {
+    c.authors.iter().map(|a| a.posts.len()).sum()
+}
+fn queue_form(
+    action: &str,
+    pubkey: &str,
+    platform: &str,
+    creator_id: &str,
+    post_id: &str,
+    label: &str,
+    danger: bool,
+) -> Markup {
+    html! {
+        form method="post" action=(action) class="modform" {
+            input type="hidden" name="pubkey" value=(pubkey);
+            input type="hidden" name="platform" value=(platform);
+            input type="hidden" name="creator_id" value=(creator_id);
+            input type="hidden" name="post_id" value=(post_id);
+            button class=(if danger { "danger" } else { "ok" }) { (label) }
+        }
+    }
 }
 
 // record the hide locally first so it takes effect even if relays are unreachable, then sign and fan
@@ -1729,30 +1743,18 @@ async fn mod_pubkey_view(
     if let Err(denied) = require_mod(&headers) {
         return denied;
     }
-    let status = db::pubkey_status(&state.pool, &pubkey)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "unknown".into());
     let files = db::pubkey_files(&state.pool, &pubkey).await.unwrap_or_default();
     let page = render(
         "contributor",
         html! {
             p { a href="/mod" { "< mod queue" } }
             h2 { "Contributor" }
-            p { code { (npub(&pubkey)) } " " span.chip { (status) } }
-            @if status == "pending" {
-                div.modbar {
-                    span.muted { "not yet public - review the files, then:" }
-                    form method="post" action="/mod/approve" class="modform" {
-                        input type="hidden" name="pubkey" value=(pubkey);
-                        button.ok { "approve contributor" }
-                    }
-                    form method="post" action="/mod/reject" class="modform" {
-                        input type="hidden" name="pubkey" value=(pubkey);
-                        button.danger { "reject contributor" }
-                    }
-                }
+            p { code { (npub(&pubkey)) } }
+            div.modbar {
+                span.muted { "review the posts, then:" }
+                (queue_form("/mod/queue-approve", &pubkey, "", "", "", "approve all pending", false))
+                (queue_form("/mod/queue-reject", &pubkey, "", "", "", "reject all pending", true))
+                (queue_form("/mod/ban-contributor", &pubkey, "", "", "", "ban contributor", true))
             }
             @if files.is_empty() { p.muted { "no files" } }
             (post_groups(&files))
@@ -1827,11 +1829,6 @@ async fn mod_author_view(
     if let Err(denied) = require_mod(&headers) {
         return denied;
     }
-    let status = db::author_status(&state.pool, &platform, &creator_id)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "unknown".into());
     let files = db::author_files(&state.pool, &platform, &creator_id)
         .await
         .unwrap_or_default();
@@ -1844,51 +1841,16 @@ async fn mod_author_view(
         html! {
             p { a href="/mod" { "< mod queue" } }
             h2 { (name) " " span.chip.platform { (pretty_platform(&platform)) } }
-            p { "author status: " span.chip { (status) } }
-            @if status == "pending" {
-                div.modbar {
-                    span.muted { "not yet public - review the files, then:" }
-                    form method="post" action="/mod/approve-author" class="modform" {
-                        input type="hidden" name="platform" value=(platform);
-                        input type="hidden" name="creator_id" value=(creator_id);
-                        button.ok { "approve author" }
-                    }
-                    form method="post" action="/mod/reject-author" class="modform" {
-                        input type="hidden" name="platform" value=(platform);
-                        input type="hidden" name="creator_id" value=(creator_id);
-                        button.danger { "reject author" }
-                    }
-                }
+            div.modbar {
+                span.muted { "approve or drop this author's queued posts from every contributor:" }
+                (queue_form("/mod/queue-approve", "", &platform, &creator_id, "", "approve all pending", false))
+                (queue_form("/mod/queue-reject", "", &platform, &creator_id, "", "reject all pending", true))
             }
             @if files.is_empty() { p.muted { "no files" } }
             (post_groups(&files))
         },
     );
     private_page(page)
-}
-
-async fn mod_approve_author(
-    State(pool): State<PgPool>,
-    headers: HeaderMap,
-    Form(form): Form<CreatorForm>,
-) -> Response {
-    if let Err(denied) = require_mod(&headers) {
-        return denied;
-    }
-    let _ = db::approve_author(&pool, &form.platform, &form.creator_id).await;
-    Redirect::to("/mod").into_response()
-}
-
-async fn mod_reject_author(
-    State(pool): State<PgPool>,
-    headers: HeaderMap,
-    Form(form): Form<CreatorForm>,
-) -> Response {
-    if let Err(denied) = require_mod(&headers) {
-        return denied;
-    }
-    let _ = db::reject_author(&pool, &form.platform, &form.creator_id).await;
-    Redirect::to("/mod").into_response()
 }
 
 // a contributor's files split into their posts, each header linking to that post's mod view
@@ -2217,12 +2179,6 @@ struct ReportedQuery {
 #[derive(serde::Deserialize)]
 struct ModForm {
     pubkey: String,
-}
-
-#[derive(serde::Deserialize)]
-struct CreatorForm {
-    platform: String,
-    creator_id: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -2692,6 +2648,11 @@ main { max-width:1240px; margin:0 auto; padding:1.4rem 1.1rem 3rem }
 .reported { max-width:720px; margin:1.2rem auto 0; color:#a6e3a1; font-size:.9rem }
 .hp { position:absolute; left:-9999px; width:1px; height:1px; opacity:0 }
 li.report.csam { border-left:3px solid var(--red); padding-left:.6rem }
+.qblock { border:1px solid var(--surface1); border-radius:12px; padding:.7rem 1rem; margin:1rem 0; background:var(--mantle) }
+.qhead { display:flex; align-items:center; justify-content:space-between; gap:.75rem; flex-wrap:wrap; padding-bottom:.5rem; border-bottom:1px solid var(--surface0) }
+.qauthor { margin-top:.7rem }
+.qauthorhead { display:flex; align-items:center; justify-content:space-between; gap:.75rem; flex-wrap:wrap; margin-bottom:.2rem }
+.qauthor .rows li { padding-left:.6rem }
 .modbar { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; max-width:720px; margin:1rem auto 0; padding:.5rem .7rem; border:1px solid var(--surface1); border-radius:10px; background:var(--mantle) }
 .viewlink { display:inline-block; padding:.4rem .8rem; border-radius:8px; border:1px solid var(--surface1); background:var(--surface0); color:var(--text); font-weight:600; font-size:.85rem }
 .viewlink:hover { border-color:var(--accent); text-decoration:none }

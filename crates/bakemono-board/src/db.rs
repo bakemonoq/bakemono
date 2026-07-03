@@ -11,46 +11,49 @@ pub async fn connect(url: &str) -> Result<PgPool> {
 }
 
 // cap on pubkeys awaiting review; fresh keys past it are shed until the queue drains or gc frees room
-const MAX_PENDING: i64 = 5_000;
-// pending pubkeys left unreviewed this long are garbage-collected along with their hidden manifests
+// bound the review backlog: net-new pending manifests past this are shed. a legit bulk upload of many
+// files still fits; this only stops a runaway flood
+const MAX_PENDING: i64 = 50_000;
+// pending manifests left unreviewed this long are garbage-collected
 pub const PENDING_TTL_SECS: i64 = 14 * 24 * 3_600;
 
+// every post's manifests land in the review queue as pending; there is no per-contributor or
+// per-author trust, so nothing goes public until a moderator approves that specific post
 pub async fn upsert(pool: &PgPool, event: &Event, manifest: &Manifest) -> Result<()> {
     let created_at = event.created_at.as_secs() as i64;
     let pubkey = event.pubkey.to_hex();
-    match pubkey_status(pool, &pubkey).await?.as_deref() {
-        // already rejected: drop instead of storing it hidden
-        Some("rejected") => return Ok(()),
-        // a known pending or approved pubkey: fall through and store
-        Some(_) => {}
-        // never seen: enqueue for review only while the queue has room, else shed the flood
-        None => {
-            if !try_enqueue_pubkey(pool, &pubkey, MAX_PENDING).await? {
-                return Ok(());
-            }
+    let event_id = event.id.to_hex();
+    // a takedown on the contributor / author / post / file drops the manifest at ingest, so a banned
+    // spammer cannot keep re-flooding the queue
+    if is_banned(pool, &event_id, &pubkey, manifest).await? {
+        return Ok(());
+    }
+    // NIP-33: a newer event with the same (pubkey, d) replaces the older one. an edit is a new post,
+    // so it re-enters the queue as pending; only net-new manifests are shed when the backlog is full
+    let replaces: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM manifests WHERE pubkey = $1 AND d_tag = $2)")
+            .bind(&pubkey)
+            .bind(manifest.d_tag())
+            .fetch_one(pool)
+            .await?;
+    if !replaces {
+        let pending: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM manifests WHERE status = 'pending'")
+                .fetch_one(pool)
+                .await?;
+        if pending >= MAX_PENDING {
+            return Ok(());
         }
     }
-    // author gate: a first-seen creator waits for review too, so an approved contributor cannot
-    // introduce a brand-new author straight to the public feed
-    match author_status(pool, &manifest.platform, &manifest.creator_id).await?.as_deref() {
-        Some("rejected") => return Ok(()),
-        Some(_) => {}
-        None => {
-            if !try_enqueue_author(pool, &manifest.platform, &manifest.creator_id, MAX_PENDING).await? {
-                return Ok(());
-            }
-        }
-    }
-    // NIP-33: a newer event with the same (pubkey, d) replaces the older one
     sqlx::query("DELETE FROM manifests WHERE pubkey = $1 AND d_tag = $2 AND created_at < $3")
-        .bind(event.pubkey.to_hex())
+        .bind(&pubkey)
         .bind(manifest.d_tag())
         .bind(created_at)
         .execute(pool)
         .await?;
     sqlx::query(INSERT)
-        .bind(event.id.to_hex())
-        .bind(event.pubkey.to_hex())
+        .bind(&event_id)
+        .bind(&pubkey)
         .bind(created_at)
         .bind(manifest.d_tag())
         .bind(&manifest.file_hash)
@@ -101,105 +104,37 @@ pub async fn magnet_by_infohash(pool: &PgPool, infohash: &str) -> Result<Option<
     Ok(magnet)
 }
 
-pub async fn pubkey_status(pool: &PgPool, pubkey: &str) -> Result<Option<String>> {
-    let status = sqlx::query_scalar("SELECT status FROM pubkeys WHERE pubkey = $1")
-        .bind(pubkey)
-        .fetch_optional(pool)
-        .await?;
-    Ok(status)
-}
-
-// enqueue a never-seen pubkey as pending only while the queue is under the cap; the bool says whether
-// it was enqueued, so a flood of fresh keys past the cap is shed rather than filling the queue
-pub(crate) async fn try_enqueue_pubkey(pool: &PgPool, pubkey: &str, cap: i64) -> Result<bool> {
-    let res = sqlx::query(
-        "INSERT INTO pubkeys (pubkey, status, first_seen)
-         SELECT $1, 'pending', EXTRACT(EPOCH FROM now())::bigint
-         WHERE (SELECT COUNT(*) FROM pubkeys WHERE status = 'pending') < $2
-         ON CONFLICT (pubkey) DO NOTHING",
+// true if a takedown already bans this manifest's event, file, contributor, infohash, post, or author
+async fn is_banned(pool: &PgPool, event_id: &str, pubkey: &str, manifest: &Manifest) -> Result<bool> {
+    let banned: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM takedowns t WHERE
+             (t.target_type = 'e' AND t.target = $1) OR
+             (t.target_type = 'x' AND t.target = $2) OR
+             (t.target_type = 'p' AND t.target = $3) OR
+             (t.target_type = 'i' AND t.target = $7) OR
+             (t.target_type = 'post' AND t.target = $4 || ':' || $5 || ':' || $6) OR
+             (t.target_type = 'creator' AND t.target = $4 || ':' || $5))",
     )
+    .bind(event_id)
+    .bind(&manifest.file_hash)
     .bind(pubkey)
-    .bind(cap)
-    .execute(pool)
+    .bind(&manifest.platform)
+    .bind(&manifest.creator_id)
+    .bind(&manifest.post_id)
+    .bind(bakemono_torrent::infohash_from_magnet(&manifest.magnet))
+    .fetch_one(pool)
     .await?;
-    Ok(res.rows_affected() == 1)
+    Ok(banned)
 }
 
-// drop pending pubkeys never reviewed within the ttl, with their hidden manifests, so an unreviewed
-// flood self-heals instead of growing the index forever; returns the number of manifests removed
-pub async fn gc_pending(pool: &PgPool, ttl_secs: i64) -> Result<u64> {
-    let res = sqlx::query(
-        "WITH stale AS (
-             DELETE FROM pubkeys
-             WHERE status = 'pending'
-               AND first_seen < EXTRACT(EPOCH FROM now())::bigint - $1
-             RETURNING pubkey
-         )
-         DELETE FROM manifests WHERE pubkey IN (SELECT pubkey FROM stale)",
-    )
-    .bind(ttl_secs)
-    .execute(pool)
-    .await?;
-    Ok(res.rows_affected())
-}
-
-pub async fn author_status(pool: &PgPool, platform: &str, creator_id: &str) -> Result<Option<String>> {
-    let status = sqlx::query_scalar("SELECT status FROM authors WHERE platform = $1 AND creator_id = $2")
-        .bind(platform)
-        .bind(creator_id)
-        .fetch_optional(pool)
-        .await?;
-    Ok(status)
-}
-
-// enqueue a never-seen author as pending only while the queue has room, mirroring the pubkey gate
-pub(crate) async fn try_enqueue_author(
-    pool: &PgPool,
-    platform: &str,
-    creator_id: &str,
-    cap: i64,
-) -> Result<bool> {
-    let res = sqlx::query(
-        "INSERT INTO authors (platform, creator_id, status, first_seen)
-         SELECT $1, $2, 'pending', EXTRACT(EPOCH FROM now())::bigint
-         WHERE (SELECT COUNT(*) FROM authors WHERE status = 'pending') < $3
-         ON CONFLICT (platform, creator_id) DO NOTHING",
-    )
-    .bind(platform)
-    .bind(creator_id)
-    .bind(cap)
-    .execute(pool)
-    .await?;
-    Ok(res.rows_affected() == 1)
-}
-
-// drop pending authors never reviewed within the ttl, with their manifests, so an author flood self-heals
-pub async fn gc_authors(pool: &PgPool, ttl_secs: i64) -> Result<u64> {
-    let res = sqlx::query(
-        "WITH stale AS (
-             DELETE FROM authors
-             WHERE status = 'pending'
-               AND first_seen < EXTRACT(EPOCH FROM now())::bigint - $1
-             RETURNING platform, creator_id
-         )
-         DELETE FROM manifests m USING stale s
-         WHERE m.platform = s.platform AND m.creator_id = s.creator_id",
-    )
-    .bind(ttl_secs)
-    .execute(pool)
-    .await?;
-    Ok(res.rows_affected())
-}
-
-pub async fn pending_authors(pool: &PgPool, limit: i64) -> Result<Vec<PendingAuthor>> {
-    let rows = sqlx::query_as::<_, PendingAuthor>(
-        "SELECT a.platform, a.creator_id, MAX(m.creator) AS creator,
-                COUNT(DISTINCT m.post_id) AS posts, COUNT(m.event_id) AS files
-         FROM authors a LEFT JOIN manifests m
-           ON m.platform = a.platform AND m.creator_id = a.creator_id
-         WHERE a.status = 'pending'
-         GROUP BY a.platform, a.creator_id, a.first_seen
-         ORDER BY a.first_seen DESC
+// the review queue: one row per pending post, ordered so the ui can group contributor -> author -> post
+pub async fn pending_queue(pool: &PgPool, limit: i64) -> Result<Vec<QueueRow>> {
+    let rows = sqlx::query_as::<_, QueueRow>(
+        "SELECT pubkey, platform, creator_id, MAX(creator) AS creator,
+                post_id, MAX(post_title) AS post_title, COUNT(DISTINCT file_hash) AS files
+         FROM manifests WHERE status = 'pending'
+         GROUP BY pubkey, platform, creator_id, post_id
+         ORDER BY pubkey, platform, creator_id, MIN(created_at) DESC
          LIMIT $1",
     )
     .bind(limit)
@@ -208,28 +143,97 @@ pub async fn pending_authors(pool: &PgPool, limit: i64) -> Result<Vec<PendingAut
     Ok(rows)
 }
 
-pub async fn approve_author(pool: &PgPool, platform: &str, creator_id: &str) -> Result<()> {
-    sqlx::query("UPDATE authors SET status = 'approved' WHERE platform = $1 AND creator_id = $2")
-        .bind(platform)
-        .bind(creator_id)
-        .execute(pool)
-        .await?;
-    Ok(())
+pub async fn pending_post_count(pool: &PgPool) -> Result<i64> {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM (
+             SELECT 1 FROM manifests WHERE status = 'pending'
+             GROUP BY pubkey, platform, creator_id, post_id
+         ) t",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
 }
 
-// reject an author and drop all its indexed content from every contributor
-pub async fn reject_author(pool: &PgPool, platform: &str, creator_id: &str) -> Result<()> {
-    sqlx::query("UPDATE authors SET status = 'rejected' WHERE platform = $1 AND creator_id = $2")
-        .bind(platform)
-        .bind(creator_id)
-        .execute(pool)
-        .await?;
-    sqlx::query("DELETE FROM manifests WHERE platform = $1 AND creator_id = $2")
-        .bind(platform)
-        .bind(creator_id)
-        .execute(pool)
-        .await?;
-    Ok(())
+// approve pending posts within a scope; an empty field widens it (whole contributor / +author / +post).
+// an all-empty scope is a no-op so a stray form can never approve the entire queue
+pub async fn approve_pending(
+    pool: &PgPool,
+    pubkey: &str,
+    platform: &str,
+    creator_id: &str,
+    post_id: &str,
+) -> Result<u64> {
+    if pubkey.is_empty() && creator_id.is_empty() {
+        return Ok(0);
+    }
+    let res = sqlx::query(
+        "UPDATE manifests SET status = 'approved'
+         WHERE status = 'pending'
+           AND ($1 = '' OR pubkey = $1)
+           AND ($2 = '' OR platform = $2)
+           AND ($3 = '' OR creator_id = $3)
+           AND ($4 = '' OR post_id = $4)",
+    )
+    .bind(pubkey)
+    .bind(platform)
+    .bind(creator_id)
+    .bind(post_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+// drop pending posts within the same scope; rejecting only deletes the queued manifests (the
+// contributor may re-publish), so ban via a pubkey takedown to stop a persistent spammer
+pub async fn reject_pending(
+    pool: &PgPool,
+    pubkey: &str,
+    platform: &str,
+    creator_id: &str,
+    post_id: &str,
+) -> Result<u64> {
+    if pubkey.is_empty() && creator_id.is_empty() {
+        return Ok(0);
+    }
+    let res = sqlx::query(
+        "DELETE FROM manifests
+         WHERE status = 'pending'
+           AND ($1 = '' OR pubkey = $1)
+           AND ($2 = '' OR platform = $2)
+           AND ($3 = '' OR creator_id = $3)
+           AND ($4 = '' OR post_id = $4)",
+    )
+    .bind(pubkey)
+    .bind(platform)
+    .bind(creator_id)
+    .bind(post_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+// drop pending manifests left unreviewed past the ttl so an abandoned flood self-heals
+pub async fn gc_pending(pool: &PgPool, ttl_secs: i64) -> Result<u64> {
+    let res = sqlx::query(
+        "DELETE FROM manifests WHERE status = 'pending'
+           AND created_at < EXTRACT(EPOCH FROM now())::bigint - $1",
+    )
+    .bind(ttl_secs)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+#[derive(sqlx::FromRow)]
+pub struct QueueRow {
+    pub pubkey: String,
+    pub platform: String,
+    pub creator_id: String,
+    pub creator: Option<String>,
+    pub post_id: String,
+    pub post_title: Option<String>,
+    pub files: i64,
 }
 
 // mod-only: every file an author carries at any status, ordered so posts stay contiguous
@@ -245,15 +249,6 @@ pub async fn author_files(pool: &PgPool, platform: &str, creator_id: &str) -> Re
     .fetch_all(pool)
     .await?;
     Ok(rows)
-}
-
-#[derive(sqlx::FromRow)]
-pub struct PendingAuthor {
-    pub platform: String,
-    pub creator_id: String,
-    pub creator: Option<String>,
-    pub posts: i64,
-    pub files: i64,
 }
 
 pub async fn stats(pool: &PgPool) -> Result<Stats> {
@@ -708,94 +703,6 @@ pub async fn bump_views(pool: &PgPool, platform: &str, creator_id: &str, post_id
     Ok(())
 }
 
-pub async fn pending_pubkeys(pool: &PgPool, limit: i64) -> Result<Vec<PendingRow>> {
-    let rows = sqlx::query_as::<_, PendingRow>(
-        "SELECT p.pubkey, COUNT(m.event_id) AS files,
-                MAX(m.creator) AS creator, MAX(m.post_title) AS sample
-         FROM pubkeys p LEFT JOIN manifests m ON m.pubkey = p.pubkey
-         WHERE p.status = 'pending'
-         GROUP BY p.pubkey, p.first_seen
-         ORDER BY p.first_seen DESC
-         LIMIT $1",
-    )
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows)
-}
-
-// pending keys collapsed by the creator they target, so a flood aimed at one creator reviews as a
-// handful of rows the operator can bulk-approve or bulk-reject instead of thousands of single keys
-pub async fn pending_groups(pool: &PgPool, limit: i64) -> Result<Vec<PendingGroup>> {
-    let rows = sqlx::query_as::<_, PendingGroup>(
-        "SELECT m.platform, m.creator_id, MAX(m.creator) AS creator,
-                COUNT(DISTINCT m.pubkey) AS pubkeys, COUNT(m.event_id) AS files
-         FROM pubkeys p JOIN manifests m ON m.pubkey = p.pubkey
-         WHERE p.status = 'pending'
-         GROUP BY m.platform, m.creator_id
-         ORDER BY COUNT(DISTINCT m.pubkey) DESC, COUNT(m.event_id) DESC
-         LIMIT $1",
-    )
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows)
-}
-
-pub async fn approve_pubkey(pool: &PgPool, pubkey: &str) -> Result<()> {
-    sqlx::query("UPDATE pubkeys SET status = 'approved' WHERE pubkey = $1")
-        .bind(pubkey)
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
-pub async fn reject_pubkey(pool: &PgPool, pubkey: &str) -> Result<()> {
-    sqlx::query("UPDATE pubkeys SET status = 'rejected' WHERE pubkey = $1")
-        .bind(pubkey)
-        .execute(pool)
-        .await?;
-    sqlx::query("DELETE FROM manifests WHERE pubkey = $1")
-        .bind(pubkey)
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
-// approve every still-pending pubkey that posted to this creator (approved keys are left untouched)
-pub async fn approve_creator(pool: &PgPool, platform: &str, creator_id: &str) -> Result<u64> {
-    let res = sqlx::query(
-        "UPDATE pubkeys SET status = 'approved'
-         WHERE status = 'pending' AND pubkey IN (
-             SELECT DISTINCT pubkey FROM manifests WHERE platform = $1 AND creator_id = $2
-         )",
-    )
-    .bind(platform)
-    .bind(creator_id)
-    .execute(pool)
-    .await?;
-    Ok(res.rows_affected())
-}
-
-// reject the still-pending keys that targeted this creator and drop their manifests in one pass
-pub async fn reject_creator(pool: &PgPool, platform: &str, creator_id: &str) -> Result<u64> {
-    let res = sqlx::query(
-        "WITH targeted AS (
-             SELECT DISTINCT pubkey FROM manifests WHERE platform = $1 AND creator_id = $2
-         ), rejected AS (
-             UPDATE pubkeys SET status = 'rejected'
-             WHERE status = 'pending' AND pubkey IN (SELECT pubkey FROM targeted)
-             RETURNING pubkey
-         )
-         DELETE FROM manifests WHERE pubkey IN (SELECT pubkey FROM rejected)",
-    )
-    .bind(platform)
-    .bind(creator_id)
-    .execute(pool)
-    .await?;
-    Ok(res.rows_affected())
-}
-
 // hide a target locally; the d_tag is the NIP-33 replaceable id so a fresh decision on the same
 // target overwrites the old one. source is "local" or the signer pubkey of a honored peer takedown
 pub async fn record_takedown(
@@ -977,23 +884,6 @@ pub struct ReportGroup {
     pub post_title: Option<String>,
 }
 
-#[derive(sqlx::FromRow)]
-pub struct PendingRow {
-    pub pubkey: String,
-    pub files: i64,
-    pub creator: Option<String>,
-    pub sample: Option<String>,
-}
-
-#[derive(sqlx::FromRow)]
-pub struct PendingGroup {
-    pub platform: String,
-    pub creator_id: String,
-    pub creator: Option<String>,
-    pub pubkeys: i64,
-    pub files: i64,
-}
-
 #[derive(sqlx::FromRow, Default)]
 pub struct Stats {
     pub posts: i64,
@@ -1119,30 +1009,28 @@ CREATE INDEX IF NOT EXISTS manifests_post ON manifests (platform, creator_id, po
 CREATE INDEX IF NOT EXISTS manifests_hash ON manifests (file_hash);
 CREATE INDEX IF NOT EXISTS manifests_infohash ON manifests (infohash);
 CREATE INDEX IF NOT EXISTS manifests_recent ON manifests (created_at DESC);
-
-CREATE TABLE IF NOT EXISTS pubkeys (
-    pubkey     TEXT PRIMARY KEY,
-    status     TEXT NOT NULL DEFAULT 'pending',
-    first_seen BIGINT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS pubkeys_status ON pubkeys (status);
--- grandfather pubkeys already indexed into the queue (one-time, idempotent)
-INSERT INTO pubkeys (pubkey, status, first_seen)
-SELECT pubkey, 'pending', MIN(created_at) FROM manifests GROUP BY pubkey
-ON CONFLICT (pubkey) DO NOTHING;
-
-CREATE TABLE IF NOT EXISTS authors (
-    platform   TEXT NOT NULL,
-    creator_id TEXT NOT NULL,
-    status     TEXT NOT NULL DEFAULT 'pending',
-    first_seen BIGINT NOT NULL,
-    PRIMARY KEY (platform, creator_id)
-);
-CREATE INDEX IF NOT EXISTS authors_status ON authors (status);
--- grandfather authors already indexed as approved so nothing currently public disappears (one-time, idempotent)
-INSERT INTO authors (platform, creator_id, status, first_seen)
-SELECT platform, creator_id, 'approved', MIN(created_at) FROM manifests GROUP BY platform, creator_id
-ON CONFLICT (platform, creator_id) DO NOTHING;
+-- every post's manifests queue as pending and are approved per-post; there is no per-identity trust
+ALTER TABLE manifests ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';
+CREATE INDEX IF NOT EXISTS manifests_status ON manifests (status);
+CREATE INDEX IF NOT EXISTS manifests_pending ON manifests (pubkey, platform, creator_id, post_id) WHERE status = 'pending';
+-- one-time migration off the old per-contributor/per-author approval tables: keep whatever was public
+-- (approved pubkey and approved author) as approved, leave the rest pending, then retire the tables
+DO $$
+BEGIN
+  IF EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'pubkeys') THEN
+    IF EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'authors') THEN
+      EXECUTE 'UPDATE manifests m SET status = ''approved''
+               WHERE m.pubkey IN (SELECT pubkey FROM pubkeys WHERE status = ''approved'')
+                 AND EXISTS (SELECT 1 FROM authors a
+                             WHERE a.platform = m.platform AND a.creator_id = m.creator_id AND a.status = ''approved'')';
+    ELSE
+      EXECUTE 'UPDATE manifests SET status = ''approved''
+               WHERE pubkey IN (SELECT pubkey FROM pubkeys WHERE status = ''approved'')';
+    END IF;
+    EXECUTE 'DROP TABLE IF EXISTS authors';
+    EXECUTE 'DROP TABLE pubkeys';
+  END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS torrent_health (
     infohash   TEXT PRIMARY KEY,
@@ -1187,12 +1075,10 @@ CREATE TABLE IF NOT EXISTS reports (
 );
 CREATE INDEX IF NOT EXISTS reports_status ON reports (status);
 
--- the single definition of what the public UI shows: approved pubkeys, minus anything a takedown hides
+-- the single definition of what the public UI shows: per-post approved manifests, minus takedowns
 CREATE OR REPLACE VIEW visible_manifests AS
 SELECT m.* FROM manifests m
-WHERE m.pubkey IN (SELECT pubkey FROM pubkeys WHERE status = 'approved')
-  AND EXISTS (SELECT 1 FROM authors a
-              WHERE a.platform = m.platform AND a.creator_id = m.creator_id AND a.status = 'approved')
+WHERE m.status = 'approved'
   AND NOT EXISTS (
       SELECT 1 FROM takedowns t WHERE
           (t.target_type = 'e' AND t.target = m.event_id) OR
@@ -1252,10 +1138,9 @@ mod tests {
 
         let older = manifest.to_event_at(&keys, 1_000).unwrap();
         upsert(&pool, &older, &manifest).await.unwrap();
-        approve_pubkey(&pool, &keys.public_key().to_hex())
+        approve_pending(&pool, &keys.public_key().to_hex(), "", "", "")
             .await
             .unwrap();
-        approve_author(&pool, "patreon", &creator_id).await.unwrap();
         let files = post_files(&pool, &manifest.platform, &creator_id, &manifest.post_id)
             .await
             .unwrap();
@@ -1266,6 +1151,10 @@ mod tests {
         manifest.size = 999;
         let newer = manifest.to_event_at(&keys, 2_000).unwrap();
         upsert(&pool, &newer, &manifest).await.unwrap();
+        // a replacement re-enters the queue as pending, so approve it before the visible check
+        approve_pending(&pool, &keys.public_key().to_hex(), "", "", "")
+            .await
+            .unwrap();
         let files = post_files(&pool, &manifest.platform, &creator_id, &manifest.post_id)
             .await
             .unwrap();
@@ -1303,13 +1192,8 @@ mod tests {
         let b = manifest.to_event(&kb).unwrap();
         upsert(&pool, &a, &manifest).await.unwrap();
         upsert(&pool, &b, &manifest).await.unwrap();
-        approve_pubkey(&pool, &ka.public_key().to_hex())
-            .await
-            .unwrap();
-        approve_pubkey(&pool, &kb.public_key().to_hex())
-            .await
-            .unwrap();
-        approve_author(&pool, "patreon", &creator_id).await.unwrap();
+        approve_pending(&pool, &ka.public_key().to_hex(), "", "", "").await.unwrap();
+        approve_pending(&pool, &kb.public_key().to_hex(), "", "", "").await.unwrap();
 
         let files = post_files(&pool, &manifest.platform, &creator_id, &manifest.post_id)
             .await
@@ -1344,10 +1228,9 @@ mod tests {
 
         let event = manifest.to_event(&keys).unwrap();
         upsert(&pool, &event, &manifest).await.unwrap();
-        approve_pubkey(&pool, &keys.public_key().to_hex())
+        approve_pending(&pool, &keys.public_key().to_hex(), "", "", "")
             .await
             .unwrap();
-        approve_author(&pool, "patreon", &creator_id).await.unwrap();
         assert_eq!(
             post_files(&pool, &manifest.platform, &creator_id, &manifest.post_id)
                 .await
@@ -1391,7 +1274,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_cap_sheds_fresh_keys_when_full() {
+    async fn pending_post_approval_and_reject() {
         let Ok(url) = std::env::var("BAKEMONO_TEST_DB") else {
             eprintln!("skipping: BAKEMONO_TEST_DB not set");
             return;
@@ -1403,76 +1286,70 @@ mod tests {
                 return;
             }
         };
-        let full = format!("capfull-{}", std::process::id());
-        let room = format!("caproom-{}", std::process::id());
-
-        // a zero cap is always full, so a fresh key is shed
-        assert!(!try_enqueue_pubkey(&pool, &full, 0).await.unwrap());
-        // a generous cap enqueues the fresh key once; a repeat is not a new insert
-        assert!(try_enqueue_pubkey(&pool, &room, 1_000_000).await.unwrap());
-        assert!(!try_enqueue_pubkey(&pool, &room, 1_000_000).await.unwrap());
-
-        sqlx::query("DELETE FROM pubkeys WHERE pubkey = ANY($1)")
-            .bind(vec![full, room])
-            .execute(&pool)
+        let keys = Keys::generate();
+        let creator_id = format!("pp-{}", std::process::id());
+        let manifest = sample(&creator_id);
+        upsert(&pool, &manifest.to_event_at(&keys, 1_000).unwrap(), &manifest)
             .await
             .unwrap();
-    }
+        let pk = keys.public_key().to_hex();
+        let (p, c, post) = (manifest.platform.as_str(), creator_id.as_str(), manifest.post_id.as_str());
 
-    #[tokio::test]
-    async fn gc_drops_stale_pending_with_manifests() {
-        let Ok(url) = std::env::var("BAKEMONO_TEST_DB") else {
-            eprintln!("skipping: BAKEMONO_TEST_DB not set");
-            return;
-        };
-        let pool = match connect(&url).await {
-            Ok(pool) => pool,
-            Err(e) => {
-                eprintln!("skipping: cannot reach test db: {e}");
-                return;
-            }
-        };
-        let stale = Keys::generate();
-        let fresh = Keys::generate();
-        let creator_id = format!("gc-{}", std::process::id());
-        let mut manifest = sample(&creator_id);
-        manifest.file_hash =
-            format!("{:0<64}", creator_id.replace(|c: char| !c.is_ascii_hexdigit(), ""));
+        // every new post queues as pending -> not public until that specific post is approved
+        assert!(!post_is_visible(&pool, p, c, post).await.unwrap());
+        assert!(pending_queue(&pool, 100).await.unwrap().iter().any(|r| r.pubkey == pk && r.post_id == post));
 
-        upsert(&pool, &manifest.to_event(&stale).unwrap(), &manifest)
-            .await
-            .unwrap();
-        upsert(&pool, &manifest.to_event(&fresh).unwrap(), &manifest)
-            .await
-            .unwrap();
+        approve_pending(&pool, &pk, p, c, post).await.unwrap();
+        assert!(post_is_visible(&pool, p, c, post).await.unwrap());
+        assert!(!pending_queue(&pool, 100).await.unwrap().iter().any(|r| r.pubkey == pk && r.post_id == post));
 
-        // backdate one pending key so only it falls outside the ttl window
-        sqlx::query("UPDATE pubkeys SET first_seen = 0 WHERE pubkey = $1")
-            .bind(stale.public_key().to_hex())
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        gc_pending(&pool, 24 * 3_600).await.unwrap();
-
-        assert_eq!(
-            count_manifests(&pool, &stale.public_key().to_hex()).await,
-            0,
-            "a stale pending key and its manifests are collected"
-        );
-        assert_eq!(
-            count_manifests(&pool, &fresh.public_key().to_hex()).await,
-            1,
-            "a recently-seen pending key survives gc"
-        );
+        // a second pending post, rejected, is deleted outright
+        let mut m2 = sample(&creator_id);
+        m2.post_id = "2".into();
+        m2.file_hash = "b".repeat(64);
+        upsert(&pool, &m2.to_event_at(&keys, 2_000).unwrap(), &m2).await.unwrap();
+        assert_eq!(post_files_any(&pool, p, c, "2").await.unwrap().len(), 1);
+        reject_pending(&pool, &pk, p, c, "2").await.unwrap();
+        assert_eq!(post_files_any(&pool, p, c, "2").await.unwrap().len(), 0);
 
         sqlx::query("DELETE FROM manifests WHERE creator_id = $1")
             .bind(&creator_id)
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("DELETE FROM pubkeys WHERE pubkey = $1")
-            .bind(fresh.public_key().to_hex())
+    }
+
+    #[tokio::test]
+    async fn gc_drops_stale_pending_manifests() {
+        let Ok(url) = std::env::var("BAKEMONO_TEST_DB") else {
+            eprintln!("skipping: BAKEMONO_TEST_DB not set");
+            return;
+        };
+        let pool = match connect(&url).await {
+            Ok(pool) => pool,
+            Err(e) => {
+                eprintln!("skipping: cannot reach test db: {e}");
+                return;
+            }
+        };
+        let keys = Keys::generate();
+        let creator_id = format!("gc-{}", std::process::id());
+        // an old pending post (1970 timestamp) is collected; a recent one survives
+        let old = sample(&creator_id);
+        upsert(&pool, &old.to_event_at(&keys, 1_000).unwrap(), &old).await.unwrap();
+        let mut recent = sample(&creator_id);
+        recent.post_id = "2".into();
+        recent.file_hash = "c".repeat(64);
+        upsert(&pool, &recent.to_event(&keys).unwrap(), &recent).await.unwrap();
+        let p = old.platform.as_str();
+
+        gc_pending(&pool, 24 * 3_600).await.unwrap();
+
+        assert_eq!(post_files_any(&pool, p, &creator_id, "1").await.unwrap().len(), 0, "stale pending post collected");
+        assert_eq!(post_files_any(&pool, p, &creator_id, "2").await.unwrap().len(), 1, "recent pending post survives");
+
+        sqlx::query("DELETE FROM manifests WHERE creator_id = $1")
+            .bind(&creator_id)
             .execute(&pool)
             .await
             .unwrap();
@@ -1496,10 +1373,9 @@ mod tests {
         let manifest = sample(&creator_id);
         let event = manifest.to_event_at(&keys, 1_000).unwrap();
         upsert(&pool, &event, &manifest).await.unwrap();
-        approve_pubkey(&pool, &keys.public_key().to_hex())
+        approve_pending(&pool, &keys.public_key().to_hex(), "", "", "")
             .await
             .unwrap();
-        approve_author(&pool, "patreon", &creator_id).await.unwrap();
 
         let (p, c, post) = (
             manifest.platform.as_str(),
@@ -1543,11 +1419,6 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("DELETE FROM pubkeys WHERE pubkey = $1")
-            .bind(keys.public_key().to_hex())
-            .execute(&pool)
-            .await
-            .unwrap();
     }
 
     #[tokio::test]
@@ -1569,10 +1440,9 @@ mod tests {
         let manifest = sample(&creator_id);
         let event = manifest.to_event_at(&keys, 1_000).unwrap();
         upsert(&pool, &event, &manifest).await.unwrap();
-        approve_pubkey(&pool, &keys.public_key().to_hex())
+        approve_pending(&pool, &keys.public_key().to_hex(), "", "", "")
             .await
             .unwrap();
-        approve_author(&pool, "patreon", &creator_id).await.unwrap();
         let (p, c, post) = (
             manifest.platform.as_str(),
             creator_id.as_str(),
@@ -1595,11 +1465,6 @@ mod tests {
 
         sqlx::query("DELETE FROM manifests WHERE creator_id = $1")
             .bind(&creator_id)
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query("DELETE FROM pubkeys WHERE pubkey = $1")
-            .bind(keys.public_key().to_hex())
             .execute(&pool)
             .await
             .unwrap();
@@ -1663,15 +1528,11 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("DELETE FROM pubkeys WHERE pubkey = $1")
-            .bind(keys.public_key().to_hex())
-            .execute(&pool)
-            .await
-            .unwrap();
     }
 
     #[tokio::test]
-    async fn author_gate_holds_content_until_approved() {
+    async fn a_pubkey_takedown_drops_new_manifests_at_ingest() {
+        use bakemono_core::Target;
         let Ok(url) = std::env::var("BAKEMONO_TEST_DB") else {
             eprintln!("skipping: BAKEMONO_TEST_DB not set");
             return;
@@ -1684,50 +1545,41 @@ mod tests {
             }
         };
         let keys = Keys::generate();
-        let creator_id = format!("ag-{}", std::process::id());
+        let pk = keys.public_key().to_hex();
+        let creator_id = format!("bi-{}", std::process::id());
         let manifest = sample(&creator_id);
-        let event = manifest.to_event_at(&keys, 1_000).unwrap();
-        upsert(&pool, &event, &manifest).await.unwrap();
-        approve_pubkey(&pool, &keys.public_key().to_hex())
-            .await
-            .unwrap();
         let (p, c, post) = (
             manifest.platform.as_str(),
             creator_id.as_str(),
             manifest.post_id.as_str(),
         );
 
-        // contributor approved, but a first-seen author is still pending -> not public
-        assert_eq!(author_status(&pool, p, c).await.unwrap().as_deref(), Some("pending"));
-        assert!(!post_is_visible(&pool, p, c, post).await.unwrap());
-
-        // approve the author -> public
-        approve_author(&pool, p, c).await.unwrap();
-        assert!(post_is_visible(&pool, p, c, post).await.unwrap());
-
-        // reject the author -> its content is dropped from the index
-        reject_author(&pool, p, c).await.unwrap();
+        // ban the contributor: their upload is dropped at ingest and never reaches the queue
+        let td = Takedown {
+            target: Target::Pubkey(pk.clone()),
+            reason: "spam".into(),
+            applied_at: None,
+            explanation: String::new(),
+        };
+        record_takedown(&pool, &td, "local", None).await.unwrap();
+        upsert(&pool, &manifest.to_event(&keys).unwrap(), &manifest).await.unwrap();
         assert_eq!(post_files_any(&pool, p, c, post).await.unwrap().len(), 0);
-        assert_eq!(author_status(&pool, p, c).await.unwrap().as_deref(), Some("rejected"));
 
-        sqlx::query("DELETE FROM authors WHERE creator_id = $1")
+        // lifting the ban lets a re-publish queue again
+        remove_takedown(&pool, &td.d_tag()).await.unwrap();
+        upsert(&pool, &manifest.to_event(&keys).unwrap(), &manifest).await.unwrap();
+        assert_eq!(post_files_any(&pool, p, c, post).await.unwrap().len(), 1);
+
+        sqlx::query("DELETE FROM manifests WHERE creator_id = $1")
             .bind(&creator_id)
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("DELETE FROM pubkeys WHERE pubkey = $1")
-            .bind(keys.public_key().to_hex())
+        sqlx::query("DELETE FROM takedowns WHERE target = $1")
+            .bind(&pk)
             .execute(&pool)
             .await
             .unwrap();
-    }
-
-    async fn count_manifests(pool: &PgPool, pubkey: &str) -> i64 {
-        sqlx::query_scalar("SELECT COUNT(*) FROM manifests WHERE pubkey = $1")
-            .bind(pubkey)
-            .fetch_one(pool)
-            .await
-            .unwrap()
     }
 
     fn sample(creator_id: &str) -> Manifest {
