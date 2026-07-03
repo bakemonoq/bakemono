@@ -115,11 +115,6 @@ pub async fn is_running() -> bool {
     tokio::net::UnixStream::connect(socket_path()).await.is_ok()
 }
 
-#[cfg(not(unix))]
-pub async fn is_running() -> bool {
-    false
-}
-
 #[cfg(unix)]
 pub async fn serve<C: ContentSource>(daemon: Arc<Daemon<C>>) -> Result<()> {
     use tokio_util::sync::CancellationToken;
@@ -143,14 +138,8 @@ pub async fn serve<C: ContentSource>(daemon: Arc<Daemon<C>>) -> Result<()> {
             _ = shutdown.cancelled() => break,
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
-                let daemon = daemon.clone();
-                let shutdown = shutdown.clone();
-                tokio::spawn(async move {
-                    let (reader, writer) = stream.into_split();
-                    if let Err(e) = serve_request(reader, writer, daemon, shutdown).await {
-                        tracing::debug!("ipc connection ended: {e:#}");
-                    }
-                });
+                let (reader, writer) = stream.into_split();
+                spawn_connection(reader, writer, daemon.clone(), shutdown.clone());
             }
         }
     }
@@ -167,8 +156,133 @@ pub async fn call(request: Value, mut on_event: impl FnMut(Value)) -> Result<Val
     let stream = tokio::net::UnixStream::connect(&path)
         .await
         .with_context(|| format!("connecting to {}", path.display()))?;
-    let (reader, mut writer) = stream.into_split();
-    write_line(&mut writer, &request).await?;
+    let (reader, writer) = stream.into_split();
+    converse(reader, writer, &request, &mut on_event).await
+}
+
+// named pipes share one machine-global namespace, so derive the name from the per-user
+// data dir to keep separate users/installs from colliding on one box
+#[cfg(windows)]
+fn pipe_name() -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    super::data_dir().hash(&mut hasher);
+    format!(r"\\.\pipe\bakemono-daemon-{:016x}", hasher.finish())
+}
+
+#[cfg(windows)]
+pub async fn is_running() -> bool {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    match ClientOptions::new().open(pipe_name()) {
+        Ok(_) => true,
+        // ERROR_PIPE_BUSY: a server owns the name but every instance is mid-handshake
+        Err(e) => e.raw_os_error() == Some(231),
+    }
+}
+
+#[cfg(windows)]
+pub async fn serve<C: ContentSource>(daemon: Arc<Daemon<C>>) -> Result<()> {
+    use tokio::net::windows::named_pipe::ServerOptions;
+    use tokio_util::sync::CancellationToken;
+
+    let name = pipe_name();
+    if is_running().await {
+        bail!("a daemon is already running at {name}");
+    }
+    // first_pipe_instance rejects a second server binding the same name
+    let mut server = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&name)
+        .with_context(|| format!("creating pipe {name}"))?;
+    tracing::info!(pipe = %name, "ipc listening");
+
+    let shutdown = CancellationToken::new();
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            res = server.connect() => res?,
+        }
+        // stand up the next listener before handing off the connected one; the connect future
+        // that borrowed `server` is dropped when the select! above ends, so the move is clean
+        let connected = server;
+        server = ServerOptions::new().create(&name)?;
+        let (reader, writer) = tokio::io::split(connected);
+        spawn_connection(reader, writer, daemon.clone(), shutdown.clone());
+    }
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), daemon.shutdown()).await;
+    Ok(())
+}
+
+#[cfg(windows)]
+pub async fn call(request: Value, mut on_event: impl FnMut(Value)) -> Result<Value> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    let name = pipe_name();
+    let mut waited = 0;
+    let client = loop {
+        match ClientOptions::new().open(&name) {
+            Ok(client) => break client,
+            // ERROR_PIPE_BUSY: server is between instances, retry briefly
+            Err(e) if e.raw_os_error() == Some(231) && waited < 50 => {
+                waited += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e))
+                    .with_context(|| format!("connecting to {name}"));
+            }
+        }
+    };
+    let (reader, writer) = tokio::io::split(client);
+    converse(reader, writer, &request, &mut on_event).await
+}
+
+#[cfg(not(any(unix, windows)))]
+pub async fn is_running() -> bool {
+    false
+}
+
+#[cfg(not(any(unix, windows)))]
+pub async fn serve<C: ContentSource>(_daemon: Arc<Daemon<C>>) -> Result<()> {
+    bail!("daemon IPC is not implemented on this platform")
+}
+
+#[cfg(not(any(unix, windows)))]
+pub async fn call(_request: Value, _on_event: impl FnMut(Value)) -> Result<Value> {
+    bail!("daemon IPC is not implemented on this platform")
+}
+
+#[cfg(any(unix, windows))]
+fn spawn_connection<C, R, W>(
+    reader: R,
+    writer: W,
+    daemon: Arc<Daemon<C>>,
+    shutdown: tokio_util::sync::CancellationToken,
+) where
+    C: ContentSource,
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        if let Err(e) = serve_request(reader, writer, daemon, shutdown).await {
+            tracing::debug!("ipc connection ended: {e:#}");
+        }
+    });
+}
+
+// client side of the wire protocol, transport-agnostic: send the request, relay progress
+// events to the caller, return the terminal ok/error
+#[cfg(any(unix, windows))]
+async fn converse<R, W>(
+    reader: R,
+    mut writer: W,
+    request: &Value,
+    on_event: &mut impl FnMut(Value),
+) -> Result<Value>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    write_line(&mut writer, request).await?;
     let mut lines = BufReader::new(reader).lines();
     while let Some(line) = lines.next_line().await? {
         let msg: Value = serde_json::from_str(&line)?;
@@ -186,15 +300,4 @@ pub async fn call(request: Value, mut on_event: impl FnMut(Value)) -> Result<Val
         }
     }
     bail!("daemon closed the connection without a response")
-}
-
-// TODO: Windows named-pipe transport; the protocol above is transport-agnostic so only these two wrappers change
-#[cfg(not(unix))]
-pub async fn serve<C: ContentSource>(_daemon: Arc<Daemon<C>>) -> Result<()> {
-    bail!("daemon IPC is not yet implemented on this platform")
-}
-
-#[cfg(not(unix))]
-pub async fn call(_request: Value, _on_event: impl FnMut(Value)) -> Result<Value> {
-    bail!("daemon IPC is not yet implemented on this platform")
 }
