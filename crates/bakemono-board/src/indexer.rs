@@ -5,6 +5,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use nostr_sdk::prelude::*;
 use sqlx::postgres::PgPool;
+use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::mpsc;
 
 use bakemono_core::protocol::{KIND_MANIFEST, KIND_TAKEDOWN};
 use bakemono_core::{Manifest, Takedown};
@@ -15,6 +17,57 @@ pub async fn run(pool: PgPool, relays: Vec<String>, trusted: Vec<PublicKey>) -> 
         client.add_relay(relay).await?;
     }
     client.connect().await;
+    tracing::info!(
+        "indexer connected to {} relay(s), honoring takedowns from {} instance(s)",
+        relays.len(),
+        trusted.len()
+    );
+
+    let trusted_set: Arc<HashSet<String>> =
+        Arc::new(trusted.iter().map(PublicKey::to_hex).collect());
+    spawn_pending_gc(pool.clone());
+
+    // enqueue only; the worker upserts, so a slow DB write can't lag the notification feed into dying
+    let (tx, rx) = mpsc::channel::<Event>(QUEUE_CAP);
+    let limiter = Arc::new(IngestLimiter::default());
+    tokio::spawn(ingest_worker(pool.clone(), trusted_set.clone(), limiter, rx));
+    // periodic full re-pull backfills whatever the live feed missed (lag, a reconnect gap, downtime)
+    tokio::spawn(resync_loop(client.clone(), pool, trusted.clone(), trusted_set));
+
+    forward_live(client, trusted, tx).await
+}
+
+// forwards live events to the worker, surviving broadcast lag rather than dying on it like handle_notifications
+async fn forward_live(client: Client, trusted: Vec<PublicKey>, tx: mpsc::Sender<Event>) -> Result<()> {
+    loop {
+        let mut rx = client.notifications();
+        if let Err(e) = subscribe_all(&client, &trusted).await {
+            tracing::warn!("indexer subscribe failed: {e:#}, retrying");
+            tokio::time::sleep(RECONNECT_DELAY).await;
+            continue;
+        }
+        loop {
+            match rx.recv().await {
+                Ok(RelayPoolNotification::Event { event, .. }) => {
+                    if tx.try_send(*event).is_err() {
+                        tracing::warn!("indexer queue full, dropping event (resync will backfill)");
+                    }
+                }
+                Ok(RelayPoolNotification::Shutdown) => return Ok(()),
+                Ok(_) => {}
+                Err(RecvError::Lagged(n)) => {
+                    tracing::warn!("indexer notification lag, skipped {n} (resync will backfill)");
+                }
+                Err(RecvError::Closed) => break,
+            }
+        }
+        tracing::warn!("indexer notification channel closed, reconnecting");
+        tokio::time::sleep(RECONNECT_DELAY).await;
+        client.connect().await;
+    }
+}
+
+async fn subscribe_all(client: &Client, trusted: &[PublicKey]) -> Result<()> {
     client
         .subscribe(Filter::new().kind(Kind::from(KIND_MANIFEST)), None)
         .await?;
@@ -23,38 +76,95 @@ pub async fn run(pool: PgPool, relays: Vec<String>, trusted: Vec<PublicKey>) -> 
             .subscribe(
                 Filter::new()
                     .kind(Kind::from(KIND_TAKEDOWN))
-                    .authors(trusted.clone()),
+                    .authors(trusted.to_vec()),
                 None,
             )
             .await?;
     }
-    tracing::info!(
-        "indexer subscribed to {} relay(s), honoring takedowns from {} instance(s)",
-        relays.len(),
-        trusted.len()
-    );
+    Ok(())
+}
 
-    let trusted: Arc<HashSet<String>> = Arc::new(trusted.iter().map(PublicKey::to_hex).collect());
-    let limiter = Arc::new(IngestLimiter::default());
-    spawn_pending_gc(pool.clone());
-    client
-        .handle_notifications(|notification| {
-            let pool = pool.clone();
-            let trusted = trusted.clone();
-            let limiter = limiter.clone();
-            async move {
-                if let RelayPoolNotification::Event { event, .. } = notification {
-                    match event.kind.as_u16() {
-                        KIND_MANIFEST => ingest_manifest(&pool, &event, &limiter).await,
-                        KIND_TAKEDOWN => ingest_takedown(&pool, &event, &trusted).await,
-                        _ => {}
+// periodic full re-pull backstop; has_event + idempotent upsert make it cheap, and it is what makes
+// ingestion lossless when the live feed drops events
+async fn resync_loop(
+    client: Client,
+    pool: PgPool,
+    trusted: Vec<PublicKey>,
+    trusted_set: Arc<HashSet<String>>,
+) {
+    let mut tick = tokio::time::interval(resync_interval());
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        resync_once(&client, &pool, &trusted, &trusted_set).await;
+    }
+}
+
+async fn resync_once(
+    client: &Client,
+    pool: &PgPool,
+    trusted: &[PublicKey],
+    trusted_set: &HashSet<String>,
+) {
+    match client
+        .fetch_events(Filter::new().kind(Kind::from(KIND_MANIFEST)), FETCH_TIMEOUT)
+        .await
+    {
+        Ok(events) => {
+            let total = events.len();
+            let mut fresh = 0usize;
+            for event in events {
+                match crate::db::has_event(pool, &event.id.to_hex()).await {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!("resync existence check failed: {e:#}");
+                        continue;
                     }
                 }
-                Ok(false)
+                ingest_manifest(pool, &event, None).await;
+                fresh += 1;
             }
-        })
-        .await?;
-    Ok(())
+            if fresh > 0 {
+                tracing::info!("resync backfilled {fresh} of {total} manifest(s) on relays");
+            }
+        }
+        Err(e) => tracing::warn!("resync manifest fetch failed: {e:#}"),
+    }
+    if trusted.is_empty() {
+        return;
+    }
+    match client
+        .fetch_events(
+            Filter::new()
+                .kind(Kind::from(KIND_TAKEDOWN))
+                .authors(trusted.to_vec()),
+            FETCH_TIMEOUT,
+        )
+        .await
+    {
+        Ok(events) => {
+            for event in events {
+                ingest_takedown(pool, &event, trusted_set).await;
+            }
+        }
+        Err(e) => tracing::warn!("resync takedown fetch failed: {e:#}"),
+    }
+}
+
+async fn ingest_worker(
+    pool: PgPool,
+    trusted: Arc<HashSet<String>>,
+    limiter: Arc<IngestLimiter>,
+    mut rx: mpsc::Receiver<Event>,
+) {
+    while let Some(event) = rx.recv().await {
+        match event.kind.as_u16() {
+            KIND_MANIFEST => ingest_manifest(&pool, &event, Some(&limiter)).await,
+            KIND_TAKEDOWN => ingest_takedown(&pool, &event, &trusted).await,
+            _ => {}
+        }
+    }
 }
 
 // pending pubkeys never reviewed within the ttl are swept on a timer so an unreviewed flood self-heals
@@ -71,7 +181,7 @@ fn spawn_pending_gc(pool: PgPool) {
     });
 }
 
-async fn ingest_manifest(pool: &PgPool, event: &Event, limiter: &IngestLimiter) {
+async fn ingest_manifest(pool: &PgPool, event: &Event, limiter: Option<&IngestLimiter>) {
     if event.verify().is_err() {
         return;
     }
@@ -79,9 +189,11 @@ async fn ingest_manifest(pool: &PgPool, event: &Event, limiter: &IngestLimiter) 
     if !event.id.check_pow(pow_min()) {
         return;
     }
-    // rate-limit on the authenticated pubkey so no single key (even an approved one) can flood the index
-    if !limiter.allow(&event.pubkey.to_hex(), now_secs()) {
-        return;
+    // live feed rate-limits per pubkey; the resync backfill passes None since a re-pull is not a flood
+    if let Some(limiter) = limiter {
+        if !limiter.allow(&event.pubkey.to_hex(), now_secs()) {
+            return;
+        }
     }
     let manifest = match Manifest::from_event(event) {
         Ok(manifest) => manifest,
@@ -102,6 +214,14 @@ fn pow_min() -> u8 {
     })
 }
 
+fn resync_interval() -> Duration {
+    let secs = std::env::var("BAKEMONO_RESYNC_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_RESYNC_SECS);
+    Duration::from_secs(secs.max(30))
+}
+
 // honor a takedown only from a trusted operator; the relay author filter is advisory, so re-check here
 async fn ingest_takedown(pool: &PgPool, event: &Event, trusted: &HashSet<String>) {
     if event.verify().is_err() || !trusted.contains(&event.pubkey.to_hex()) {
@@ -120,6 +240,10 @@ async fn ingest_takedown(pool: &PgPool, event: &Event, trusted: &HashSet<String>
 }
 
 const GC_INTERVAL: Duration = Duration::from_secs(3_600);
+const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+const QUEUE_CAP: usize = 20_000;
+const DEFAULT_RESYNC_SECS: u64 = 600;
 const RATE_WINDOW_SECS: u64 = 10;
 const PER_PUBKEY_MAX: u32 = 600;
 const GLOBAL_MAX: u32 = 6_000;
@@ -317,6 +441,64 @@ mod tests {
             .await
             .unwrap();
         assert!(hidden, "a trusted instance takedown should hide the file");
+    }
+
+    // backfill must recover a manifest the live feed never saw. set BAKEMONO_TEST_DB to run
+    #[tokio::test]
+    async fn resync_backfills_a_manifest_the_live_feed_missed() {
+        let Ok(url) = std::env::var("BAKEMONO_TEST_DB") else {
+            eprintln!("skipping: BAKEMONO_TEST_DB not set");
+            return;
+        };
+        let Ok(pool) = crate::db::connect(&url).await else {
+            eprintln!("skipping: cannot reach test db");
+            return;
+        };
+
+        let relay = MockRelay::run().await.unwrap();
+        let relay_url = relay.url().await.to_string();
+        let contributor = Keys::generate();
+        let creator_id = format!("resync-{}", std::process::id());
+        let hash = format!("{:0<64}", creator_id.replace(|c: char| !c.is_ascii_hexdigit(), ""));
+
+        // publish with no indexer subscribed, so the event only exists on the relay, never seen live
+        let publisher = Client::new(Keys::generate());
+        publisher.add_relay(&relay_url).await.unwrap();
+        publisher.connect().await;
+        let mut manifest = Manifest {
+            platform: "patreon".into(),
+            creator: "Peer".into(),
+            creator_id: creator_id.clone(),
+            post_id: "1".into(),
+            mime: "image/jpeg".into(),
+            magnet: "magnet:?xt=urn:btih:abc".into(),
+            content: "body".into(),
+            ..Default::default()
+        };
+        manifest.file_hash = hash.clone();
+        manifest.size = 1;
+        let event = manifest
+            .to_event_pow(&contributor, bakemono_core::protocol::POW_DIFFICULTY)
+            .unwrap();
+        publisher.send_event(&event).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let indexer_client = Client::new(Keys::generate());
+        indexer_client.add_relay(&relay_url).await.unwrap();
+        indexer_client.connect().await;
+        resync_once(&indexer_client, &pool, &[], &HashSet::new()).await;
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM manifests WHERE creator_id = $1")
+            .bind(&creator_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM manifests WHERE creator_id = $1")
+            .bind(&creator_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "resync should backfill the missed manifest");
     }
 
     async fn visible(pool: &PgPool, creator_id: &str) -> usize {

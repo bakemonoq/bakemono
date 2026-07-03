@@ -77,6 +77,17 @@ pub async fn upsert(pool: &PgPool, event: &Event, manifest: &Manifest) -> Result
     Ok(())
 }
 
+// lets the resync skip the full upsert for an event it already stores; a replaceable edit gets a fresh
+// event_id, so this never suppresses a real update
+pub async fn has_event(pool: &PgPool, event_id: &str) -> Result<bool> {
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM manifests WHERE event_id = $1)")
+            .bind(event_id)
+            .fetch_one(pool)
+            .await?;
+    Ok(exists)
+}
+
 // the gateway only serves infohashes the board carries and that pass moderation, so resolve through
 // visible_manifests; an unknown or hidden hash returns None and the route 404s. a takedown against any
 // manifest sharing this infohash suppresses the bytes for all of them, so dedup-by-content cannot keep
