@@ -321,7 +321,7 @@ dependencies = [
 
 [[package]]
 name = "bakemono-app"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "bakemono-engine",
@@ -338,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "bakemono-board"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "ammonia",
  "anyhow",
@@ -364,7 +364,7 @@ dependencies = [
 
 [[package]]
 name = "bakemono-cli"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "bakemono-engine",
@@ -374,7 +374,7 @@ dependencies = [
 
 [[package]]
 name = "bakemono-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "nostr",
  "serde_json",
@@ -383,7 +383,7 @@ dependencies = [
 
 [[package]]
 name = "bakemono-daemon"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "bakemono-core",
@@ -404,7 +404,7 @@ dependencies = [
 
 [[package]]
 name = "bakemono-engine"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "bakemono-core",
@@ -423,7 +423,7 @@ dependencies = [
 
 [[package]]
 name = "bakemono-scraper"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "thiserror 2.0.18",
@@ -434,7 +434,7 @@ dependencies = [
 
 [[package]]
 name = "bakemono-torrent"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "hex 0.4.3",
