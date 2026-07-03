@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -36,12 +37,11 @@ pub fn gather_event_sidecars(dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 pub fn manifest_from_files(media: &Path, sidecar: &Path) -> Result<Manifest> {
-    let bytes = fs::read(media).with_context(|| format!("reading {}", media.display()))?;
     let raw = fs::read(sidecar).with_context(|| format!("reading {}", sidecar.display()))?;
     let meta: Value =
         serde_json::from_slice(&raw).with_context(|| format!("parsing {}", sidecar.display()))?;
 
-    let file_hash = hex::encode(Sha256::digest(&bytes));
+    let (file_hash, size, mime) = hash_media(media)?;
     Ok(Manifest {
         platform: string_at(&meta, &["category"]).unwrap_or_else(|| "patreon".to_string()),
         creator: string_at(&meta, &["creator", "full_name"])
@@ -54,8 +54,8 @@ pub fn manifest_from_files(media: &Path, sidecar: &Path) -> Result<Manifest> {
             .and_then(Value::as_u64)
             .map(|n| n.saturating_sub(1) as u32)
             .unwrap_or(0),
-        size: bytes.len() as u64,
-        mime: sniff_mime(&bytes).to_string(),
+        size,
+        mime,
         magnet: placeholder_magnet(&file_hash),
         file_hash,
         filename: media.file_name().map(|n| n.to_string_lossy().into_owned()),
@@ -66,6 +66,30 @@ pub fn manifest_from_files(media: &Path, sidecar: &Path) -> Result<Manifest> {
         thumb: None,
         content: string_at(&meta, &["content"]).unwrap_or_default(),
     })
+}
+
+// one streaming pass over the media: sha256 + byte count + a 12-byte header sniff, never buffering the whole file
+fn hash_media(media: &Path) -> Result<(String, u64, String)> {
+    let mut file = fs::File::open(media).with_context(|| format!("reading {}", media.display()))?;
+    let mut hasher = Sha256::new();
+    let mut header = Vec::with_capacity(12);
+    let mut size: u64 = 0;
+    let mut buf = vec![0u8; 128 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("reading {}", media.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        if header.len() < 12 {
+            let take = (12 - header.len()).min(n);
+            header.extend_from_slice(&buf[..take]);
+        }
+        size += n as u64;
+    }
+    Ok((hex::encode(hasher.finalize()), size, sniff_mime(&header).to_string()))
 }
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {

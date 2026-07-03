@@ -243,7 +243,12 @@ async fn build_seed_publish(
             tracing::info!("job cancelled before file {}", index + 1);
             break;
         }
-        let mut manifest = match manifest_from_files(media, sidecar) {
+        let (media_c, sidecar_c) = (media.clone(), sidecar.clone());
+        let hashed =
+            tokio::task::spawn_blocking(move || manifest_from_files(&media_c, &sidecar_c))
+                .await
+                .context("hashing file")?;
+        let mut manifest = match hashed {
             Ok(manifest) => manifest,
             Err(e) => {
                 progress(Progress::Skipped {
