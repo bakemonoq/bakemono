@@ -1,4 +1,5 @@
-use std::ffi::OsString;
+use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
@@ -141,6 +142,7 @@ impl Scraper {
         let stderr_task = tokio::spawn(drain_stderr(stderr, stderr_tail.clone()));
         let mut lines = BufReader::new(stdout).lines();
         let mut downloaded = 0usize;
+        let mut dir_cache: HashMap<PathBuf, PathBuf> = HashMap::new();
 
         loop {
             tokio::select! {
@@ -154,8 +156,7 @@ impl Scraper {
                         // gallery-dl prints downloaded paths plainly and already-present ones as "# path"
                         let line = line.trim();
                         let line = line.strip_prefix("# ").unwrap_or(line);
-                        let path = PathBuf::from(line);
-                        if path.is_file() {
+                        if let Some(path) = resolve_printed(Path::new(line), &request.dest, &mut dir_cache) {
                             downloaded += 1;
                             on_file(path);
                         }
@@ -242,7 +243,89 @@ fn kill_group(child: &mut tokio::process::Child) {
             .args(["-KILL", &format!("-{pid}")])
             .status();
     }
+    // on Windows start_kill reaps only the bootstrap; the worker survives holding the stdout/stderr
+    // pipes, so the caller blocks forever awaiting stderr EOF. taskkill /T tears down the whole tree
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .status();
+    }
     let _ = child.start_kill();
+}
+
+// gallery-dl echoes each file's path to stdout, but on Windows it encodes the path in the ANSI
+// codepage, so a component the codepage cannot represent (e.g. a creator named with `☾`) prints as
+// `?` and no longer matches the real file on disk. map the printed path back to the actual file by
+// walking dest, matching each component exactly or, failing that, to the sole `?`-masked candidate.
+// dir_cache memoizes resolved parent dirs so every file under one creator resolves without re-reading
+fn resolve_printed(
+    printed: &Path,
+    dest: &Path,
+    dir_cache: &mut HashMap<PathBuf, PathBuf>,
+) -> Option<PathBuf> {
+    if printed.is_file() {
+        return Some(printed.to_path_buf());
+    }
+    let rel = printed.strip_prefix(dest).ok()?;
+    let name = rel.file_name()?;
+    let parent_rel = rel.parent().unwrap_or_else(|| Path::new(""));
+    let real_dir = match dir_cache.get(parent_rel) {
+        Some(dir) => dir.clone(),
+        None => {
+            let dir = resolve_dir(dest, parent_rel)?;
+            dir_cache.insert(parent_rel.to_path_buf(), dir.clone());
+            dir
+        }
+    };
+    let exact = real_dir.join(name);
+    if exact.is_file() {
+        return Some(exact);
+    }
+    match_entry(&real_dir, name).filter(|p| p.is_file())
+}
+
+fn resolve_dir(dest: &Path, rel: &Path) -> Option<PathBuf> {
+    let mut real = dest.to_path_buf();
+    for comp in rel.components() {
+        let comp = comp.as_os_str();
+        let exact = real.join(comp);
+        real = if exact.is_dir() {
+            exact
+        } else {
+            match_entry(&real, comp).filter(|p| p.is_dir())?
+        };
+    }
+    Some(real)
+}
+
+// the single entry in `dir` whose real name masks to `target` once unrepresentable chars become `?`
+fn match_entry(dir: &Path, target: &OsStr) -> Option<PathBuf> {
+    let target = target.to_string_lossy();
+    let mut found = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        if masks_to(&entry.file_name().to_string_lossy(), &target) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(entry.path());
+        }
+    }
+    found
+}
+
+// `?` is illegal in a real Windows filename, so a `?` in the printed name always marks a replaced,
+// unrepresentable char; every other position must match the real name one-for-one
+fn masks_to(real: &str, masked: &str) -> bool {
+    let real: Vec<char> = real.chars().collect();
+    let masked: Vec<char> = masked.chars().collect();
+    real.len() == masked.len()
+        && real
+            .iter()
+            .zip(&masked)
+            .all(|(r, m)| r == m || (*m == '?' && !r.is_ascii()))
 }
 
 fn build_args(request: &ScrapeRequest) -> Vec<String> {
@@ -388,5 +471,32 @@ mod tests {
             "boxofmittens"
         );
         assert_eq!(creator_name("boxofmittens"), "boxofmittens");
+    }
+
+    #[test]
+    fn masks_to_matches_replaced_non_ascii() {
+        // gallery-dl prints "BONI ☾" as "BONI ?" when the codepage cannot encode the moon
+        assert!(masks_to("BONI ☾", "BONI ?"));
+        assert!(!masks_to("BONI ☾", "BONA ?"));
+        assert!(!masks_to("BONI ☾x", "BONI ?"));
+        // an ascii `?` in the real name is impossible on Windows, so a `?` only masks non-ascii
+        assert!(!masks_to("BONI a", "BONI ?"));
+        assert!(masks_to("plain", "plain"));
+    }
+
+    #[test]
+    fn resolve_printed_recovers_masked_directory() {
+        let base = std::env::temp_dir().join(format!("bakemono-resolve-{}", std::process::id()));
+        let real_dir = base.join("patreon").join("BONI ☾");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let real_file = real_dir.join("162532880_wip_01.jpg");
+        std::fs::write(&real_file, b"x").unwrap();
+
+        let printed = base.join("patreon").join("BONI ?").join("162532880_wip_01.jpg");
+        let mut cache = HashMap::new();
+        let resolved = resolve_printed(&printed, &base, &mut cache).unwrap();
+
+        std::fs::remove_dir_all(&base).ok();
+        assert_eq!(resolved, real_file);
     }
 }
