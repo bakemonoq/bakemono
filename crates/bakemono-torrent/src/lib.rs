@@ -591,6 +591,8 @@ impl Seeder {
             // reuse of the stored DHT port collides when several sessions run on one host; take a fresh port
             disable_dht_persistence: true,
             listen_port_range: listen_port.map(|p| p..p + 1),
+            // a home seeder is behind NAT; map the listen port so the board gateway can actually dial it
+            enable_upnp_port_forwarding: true,
             // session-wide rate caps in bytes/sec; None (or 0) is unlimited
             ratelimits: LimitsConfig {
                 upload_bps: up_bps.and_then(NonZeroU32::new),
