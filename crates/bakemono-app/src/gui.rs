@@ -404,6 +404,12 @@ fn spawn_daemon() -> std::io::Result<()> {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW: the detached daemon must not pop a console
+        cmd.creation_flags(0x0800_0000);
+    }
     cmd.spawn()?;
     tracing::info!("spawned daemon");
     Ok(())

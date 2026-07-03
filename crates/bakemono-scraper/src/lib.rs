@@ -128,6 +128,8 @@ impl Scraper {
         // own process group so cancel can kill gallery-dl's PyInstaller worker, not just the bootstrap
         #[cfg(unix)]
         cmd.process_group(0);
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         let mut child = cmd.spawn().map_err(|source| Error::Spawn {
             binary: self.binary.to_string_lossy().into_owned(),
             source,
@@ -208,7 +210,14 @@ impl Scraper {
     fn output_with_retry(&self, args: &[String]) -> Result<std::process::Output, Error> {
         let mut attempts = 0;
         loop {
-            match Command::new(&self.binary).args(args).output() {
+            let mut cmd = Command::new(&self.binary);
+            cmd.args(args);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            }
+            match cmd.output() {
                 Err(e) if e.raw_os_error() == Some(26) && attempts < 50 => {
                     attempts += 1;
                     std::thread::sleep(std::time::Duration::from_millis(20));

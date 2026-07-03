@@ -44,6 +44,8 @@ fn tmp_path(media: &Path) -> PathBuf {
 async fn run(media: &Path, out: &Path, seek: Option<&str>) -> Result<()> {
     let bin = ffmpeg_bin();
     let mut cmd = Command::new(&bin);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     cmd.arg("-hide_banner")
         .arg("-loglevel")
         .arg("error")
