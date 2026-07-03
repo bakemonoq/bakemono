@@ -776,6 +776,9 @@ async fn keepers(State(state): State<AppState>, headers: HeaderMap) -> Html<Stri
     let backfill = format!(
         "curl -s \"{feed}?limit=1000\" \\\n  | grep -oE 'magnet:[^\"]+' | sed 's/&amp;/\\&/g'"
     );
+    let walk = format!(
+        "url=\"{feed}?limit=1000\"\nwhile [ -n \"$url\" ]; do\n  page=$(curl -s \"$url\")\n  printf '%s' \"$page\" | grep -oE 'magnet:[^\"]+' | sed 's/&amp;/\\&/g' | while read magnet; do\n    echo \"$magnet\"          # print; swap for your client's add command\n  done\n  url=$(printf '%s' \"$page\" | grep -oE 'rel=\"next\" href=\"[^\"]+\"' | sed 's/.*href=\"//; s/\".*//; s/&amp;/\\&/g')\ndone"
+    );
     let endangered = db::endangered(&state.pool, 30).await.unwrap_or_default();
     render(
         "keepers",
@@ -807,6 +810,16 @@ async fn keepers(State(state): State<AppState>, headers: HeaderMap) -> Html<Stri
                     p.muted {
                         "Robust walker and per-client setup: "
                         a href=(format!("{REPO}/blob/main/docs/SEEDING.md")) { "docs/SEEDING.md" }
+                    }
+                    details.helpbox {
+                        summary { "Set up a feed-walker (mirror everything, keep up with bursts)" }
+                        p { "RSS auto-download reads only one page of the feed per refresh, so a large or bursty batch of uploads can scroll past before your client polls. A walker follows the feed's next-page cursor to the end and hands every torrent to your client. Walk all pages and print every magnet:" }
+                        pre { code { (walk) } }
+                        p.muted {
+                            "Swap the " code { "echo \"$magnet\"" } " line for your client's add command - qBittorrent's WebUI: "
+                            code { "curl -s localhost:8080/api/v2/torrents/add --data-urlencode \"urls=$magnet\"" }
+                            " - then run it from cron or a systemd timer (every ~10 min) so it back-fills the archive and keeps catching new uploads"
+                        }
                     }
                 }
                 li.step {
