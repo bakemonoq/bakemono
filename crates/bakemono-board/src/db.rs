@@ -127,20 +127,70 @@ async fn is_banned(pool: &PgPool, event_id: &str, pubkey: &str, manifest: &Manif
     Ok(banned)
 }
 
-// the review queue: one row per pending post, ordered so the ui can group contributor -> author -> post
-pub async fn pending_queue(pool: &PgPool, limit: i64) -> Result<Vec<QueueRow>> {
-    let rows = sqlx::query_as::<_, QueueRow>(
+// the main queue collapses pending to one row per (contributor, author); it never lists individual
+// posts (a contributor can queue thousands). pending_posts_for paginates the actual posts per group
+pub async fn pending_groups(pool: &PgPool, limit: i64) -> Result<Vec<QueueGroup>> {
+    let rows = sqlx::query_as::<_, QueueGroup>(
         "SELECT pubkey, platform, creator_id, MAX(creator) AS creator,
-                post_id, MAX(post_title) AS post_title, COUNT(DISTINCT file_hash) AS files
+                COUNT(DISTINCT post_id) AS posts, COUNT(DISTINCT file_hash) AS files
          FROM manifests WHERE status = 'pending'
-         GROUP BY pubkey, platform, creator_id, post_id
-         ORDER BY pubkey, platform, creator_id, MIN(created_at) DESC
+         GROUP BY pubkey, platform, creator_id
+         ORDER BY pubkey, MAX(created_at) DESC
          LIMIT $1",
     )
     .bind(limit)
     .fetch_all(pool)
     .await?;
     Ok(rows)
+}
+
+// one page of a group's pending posts, newest first, for the paginated drill-in view
+pub async fn pending_posts_for(
+    pool: &PgPool,
+    pubkey: &str,
+    platform: &str,
+    creator_id: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<QueueRow>> {
+    let rows = sqlx::query_as::<_, QueueRow>(
+        "SELECT MAX(creator) AS creator, post_id, MAX(post_title) AS post_title,
+                COUNT(DISTINCT file_hash) AS files
+         FROM manifests
+         WHERE status = 'pending' AND pubkey = $1 AND platform = $2 AND creator_id = $3
+         GROUP BY post_id
+         ORDER BY MIN(created_at) DESC
+         LIMIT $4 OFFSET $5",
+    )
+    .bind(pubkey)
+    .bind(platform)
+    .bind(creator_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+pub async fn pending_group_post_count(
+    pool: &PgPool,
+    pubkey: &str,
+    platform: &str,
+    creator_id: &str,
+) -> Result<i64> {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM (
+             SELECT 1 FROM manifests
+             WHERE status = 'pending' AND pubkey = $1 AND platform = $2 AND creator_id = $3
+             GROUP BY post_id
+         ) t",
+    )
+    .bind(pubkey)
+    .bind(platform)
+    .bind(creator_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
 }
 
 pub async fn pending_post_count(pool: &PgPool) -> Result<i64> {
@@ -227,12 +277,19 @@ pub async fn gc_pending(pool: &PgPool, ttl_secs: i64) -> Result<u64> {
 
 #[derive(sqlx::FromRow)]
 pub struct QueueRow {
+    pub creator: Option<String>,
+    pub post_id: String,
+    pub post_title: Option<String>,
+    pub files: i64,
+}
+
+#[derive(sqlx::FromRow)]
+pub struct QueueGroup {
     pub pubkey: String,
     pub platform: String,
     pub creator_id: String,
     pub creator: Option<String>,
-    pub post_id: String,
-    pub post_title: Option<String>,
+    pub posts: i64,
     pub files: i64,
 }
 
@@ -1297,11 +1354,11 @@ mod tests {
 
         // every new post queues as pending -> not public until that specific post is approved
         assert!(!post_is_visible(&pool, p, c, post).await.unwrap());
-        assert!(pending_queue(&pool, 100).await.unwrap().iter().any(|r| r.pubkey == pk && r.post_id == post));
+        assert!(pending_posts_for(&pool, &pk, p, c, 100, 0).await.unwrap().iter().any(|r| r.post_id == post));
 
         approve_pending(&pool, &pk, p, c, post).await.unwrap();
         assert!(post_is_visible(&pool, p, c, post).await.unwrap());
-        assert!(!pending_queue(&pool, 100).await.unwrap().iter().any(|r| r.pubkey == pk && r.post_id == post));
+        assert!(!pending_posts_for(&pool, &pk, p, c, 100, 0).await.unwrap().iter().any(|r| r.post_id == post));
 
         // a second pending post, rejected, is deleted outright
         let mut m2 = sample(&creator_id);
