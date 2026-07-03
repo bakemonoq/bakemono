@@ -138,6 +138,7 @@ impl Scraper {
         let stderr_tail = Arc::new(Mutex::new(Vec::<String>::new()));
         let stderr_task = tokio::spawn(drain_stderr(stderr, stderr_tail.clone()));
         let mut lines = BufReader::new(stdout).lines();
+        let mut downloaded = 0usize;
 
         loop {
             tokio::select! {
@@ -153,6 +154,7 @@ impl Scraper {
                         let line = line.strip_prefix("# ").unwrap_or(line);
                         let path = PathBuf::from(line);
                         if path.is_file() {
+                            downloaded += 1;
                             on_file(path);
                         }
                     }
@@ -166,13 +168,22 @@ impl Scraper {
             source,
         })?;
         let _ = stderr_task.await;
-        // a kill we asked for is not a failure; anything else with a bad status is
+        // a kill we asked for is not a failure. gallery-dl also exits non-zero when single items fail
+        // (a dead embedded CDN link, a gated post); for an archival run that is expected, so only abort
+        // when the whole run produced nothing
         if !cancel.is_cancelled() && !status.success() {
             let tail = stderr_tail.lock().expect("stderr tail").join("\n");
-            return Err(Error::Failed {
-                status: status_label(&status),
-                stderr: tail,
-            });
+            if downloaded == 0 {
+                return Err(Error::Failed {
+                    status: status_label(&status),
+                    stderr: tail,
+                });
+            }
+            tracing::warn!(
+                status = %status_label(&status),
+                kept = downloaded,
+                "gallery-dl reported errors on some items, keeping what downloaded:\n{tail}"
+            );
         }
         Ok(ScrapeOutcome {
             creator: creator_name(&request.creator),
