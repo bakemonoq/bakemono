@@ -22,6 +22,13 @@ pub async fn run(pool: PgPool, relays: Vec<String>, trusted: Vec<PublicKey>) -> 
         relays.len(),
         trusted.len()
     );
+    if pow_min() > bakemono_core::protocol::POW_DIFFICULTY {
+        tracing::warn!(
+            "BAKEMONO_POW_MIN={} exceeds the network mining difficulty {}; contributions mined at the network floor will be rejected",
+            pow_min(),
+            bakemono_core::protocol::POW_DIFFICULTY
+        );
+    }
 
     let trusted_set: Arc<HashSet<String>> =
         Arc::new(trusted.iter().map(PublicKey::to_hex).collect());
@@ -112,7 +119,7 @@ async fn resync_once(
     {
         Ok(events) => {
             let total = events.len();
-            let mut fresh = 0usize;
+            let (mut stored, mut rejected) = (0usize, 0usize);
             for event in events {
                 match crate::db::has_event(pool, &event.id.to_hex()).await {
                     Ok(true) => continue,
@@ -122,11 +129,16 @@ async fn resync_once(
                         continue;
                     }
                 }
-                ingest_manifest(pool, &event, None).await;
-                fresh += 1;
+                if ingest_manifest(pool, &event, None).await {
+                    stored += 1;
+                } else {
+                    rejected += 1;
+                }
             }
-            if fresh > 0 {
-                tracing::info!("resync backfilled {fresh} of {total} manifest(s) on relays");
+            if stored > 0 || rejected > 0 {
+                // a large rejected count usually means BAKEMONO_POW_MIN sits above the network mining
+                // difficulty, so every contribution is being thrown away before it reaches the DB
+                tracing::info!("resync stored {stored}, rejected {rejected}, of {total} on relays");
             }
         }
         Err(e) => tracing::warn!("resync manifest fetch failed: {e:#}"),
@@ -160,7 +172,9 @@ async fn ingest_worker(
 ) {
     while let Some(event) = rx.recv().await {
         match event.kind.as_u16() {
-            KIND_MANIFEST => ingest_manifest(&pool, &event, Some(&limiter)).await,
+            KIND_MANIFEST => {
+                ingest_manifest(&pool, &event, Some(&limiter)).await;
+            }
             KIND_TAKEDOWN => ingest_takedown(&pool, &event, &trusted).await,
             _ => {}
         }
@@ -181,27 +195,31 @@ fn spawn_pending_gc(pool: PgPool) {
     });
 }
 
-async fn ingest_manifest(pool: &PgPool, event: &Event, limiter: Option<&IngestLimiter>) {
+// returns true if the event cleared the gates and reached the DB; false when a gate dropped it, so the
+// resync can report real persistence instead of counting silently-rejected events as backfilled
+async fn ingest_manifest(pool: &PgPool, event: &Event, limiter: Option<&IngestLimiter>) -> bool {
     if event.verify().is_err() {
-        return;
+        return false;
     }
     // NIP-13 floor: drop manifests that never paid the proof-of-work before any DB work
     if !event.id.check_pow(pow_min()) {
-        return;
+        return false;
     }
     // live feed rate-limits per pubkey; the resync backfill passes None since a re-pull is not a flood
     if let Some(limiter) = limiter {
         if !limiter.allow(&event.pubkey.to_hex(), now_secs()) {
-            return;
+            return false;
         }
     }
     let manifest = match Manifest::from_event(event) {
         Ok(manifest) => manifest,
-        Err(_) => return,
+        Err(_) => return false,
     };
     if let Err(e) = crate::db::upsert(pool, event, &manifest).await {
         eprintln!("ingest error for {}: {e:#}", event.id.to_hex());
+        return false;
     }
+    true
 }
 
 fn pow_min() -> u8 {
