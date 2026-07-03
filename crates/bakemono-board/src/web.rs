@@ -870,6 +870,19 @@ async fn info_page(State(state): State<AppState>) -> Html<String> {
             h3 { "Source" }
             p { a href=(REPO) { (REPO) } }
 
+            h3 { "Desktop app" }
+            p {
+                "Installers for macOS, Windows and Linux are on the "
+                a href=(format!("{REPO}/releases/latest")) { "latest release" }
+                " page"
+            }
+            details.helpbox {
+                summary { "macOS says the app is \"damaged\"?" }
+                p { "The builds are not signed with an Apple Developer ID yet, so macOS quarantines the download and reports it as \"damaged\" rather than offering an Open button. It is not actually damaged. Drag Bakemono to Applications, then clear the quarantine flag once from Terminal:" }
+                pre { code { "xattr -dr com.apple.quarantine /Applications/Bakemono.app" } }
+                p.muted { "After that it opens normally. If macOS still refuses, run " code { "sudo xattr -cr /Applications/Bakemono.app" } }
+            }
+
             h3 { "DMCA and contact" }
             p { "Takedowns on this board are published as signed kind 31064 Nostr events, a public transparency log. Each board sets its own posture by jurisdiction" }
             @match dmca_contact() {
@@ -2685,6 +2698,10 @@ main { max-width:1240px; margin:0 auto; padding:1.4rem 1.1rem 3rem }
 .reportbox form { display:flex; gap:.5rem; align-items:center; flex-wrap:wrap; margin-top:.6rem }
 .reportbox select { padding:.35rem .6rem; border-radius:8px; background:var(--surface0); color:var(--text); border:1px solid var(--surface1) }
 .reportbox button { padding:.35rem .7rem; border-radius:8px; background:var(--accent); color:var(--crust); border:none; cursor:pointer; font-weight:600 }
+.helpbox { max-width:720px; margin:.8rem 0 1.2rem }
+.helpbox summary { cursor:pointer; color:var(--accent); font-weight:600; list-style:none }
+.helpbox summary::-webkit-details-marker { display:none }
+.helpbox[open] summary { margin-bottom:.4rem }
 .reported { max-width:720px; margin:1.2rem auto 0; color:#a6e3a1; font-size:.9rem }
 .hp { position:absolute; left:-9999px; width:1px; height:1px; opacity:0 }
 li.report.csam { border-left:3px solid var(--red); padding-left:.6rem }
