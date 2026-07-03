@@ -34,6 +34,7 @@ listen('progress', (e) => log('  ' + render(e.payload)))
 function setRunning(running) {
   $('stop').disabled = !running
   $('scrape').disabled = running
+  $('republish').disabled = running
   $('runState').textContent = running ? 'running' : ''
 }
 
@@ -180,6 +181,10 @@ $('saveSettings').onclick = async () => {
 $('stop').onclick = async () => {
   await invoke('cancel_job')
   log('stop requested')
+}
+
+$('republish').onclick = () => {
+  withJob('re-publish to relays', () => invoke('republish'))
 }
 
 $('patreonLogin').onclick = async () => {

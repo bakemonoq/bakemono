@@ -25,6 +25,16 @@ pub fn gather_pairs(dir: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
     Ok(pairs)
 }
 
+// signed events we saved next to each media file at publish time, so a new relay can be backfilled
+// without re-hashing or re-mining proof-of-work
+pub fn gather_event_sidecars(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    walk(dir, &mut files)?;
+    let mut events: Vec<PathBuf> = files.into_iter().filter(|p| is_event_sidecar(p)).collect();
+    events.sort();
+    Ok(events)
+}
+
 pub fn manifest_from_files(media: &Path, sidecar: &Path) -> Result<Manifest> {
     let bytes = fs::read(media).with_context(|| format!("reading {}", media.display()))?;
     let raw = fs::read(sidecar).with_context(|| format!("reading {}", sidecar.display()))?;
@@ -75,6 +85,12 @@ fn is_sidecar(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()) == Some("json")
 }
 
+fn is_event_sidecar(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".event.json"))
+}
+
 // skip legacy seeded previews and any leftover inline-thumb temp file so neither is ingested as media
 fn is_thumb(path: &Path) -> bool {
     path.file_name()
@@ -85,6 +101,12 @@ fn is_thumb(path: &Path) -> bool {
 fn sidecar_path(media: &Path) -> PathBuf {
     let mut name = media.to_path_buf().into_os_string();
     name.push(".json");
+    PathBuf::from(name)
+}
+
+pub fn event_sidecar_path(media: &Path) -> PathBuf {
+    let mut name = media.to_path_buf().into_os_string();
+    name.push(".event.json");
     PathBuf::from(name)
 }
 

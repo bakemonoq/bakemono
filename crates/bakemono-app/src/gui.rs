@@ -55,6 +55,7 @@ pub fn run() {
             open_path,
             sharing_stats,
             start_scrape,
+            republish,
             open_patreon_login,
             capture_patreon_cookies,
             saved_patreon_cookies,
@@ -267,6 +268,19 @@ async fn start_scrape(
         "job": {"kind": "scrape", "creator": creator, "limit": limit, "cookies": cookies, "browser": browser}
     });
     let app = app.clone();
+    ipc::call(job, move |data| {
+        let _ = app.emit("progress", data);
+    })
+    .await
+    .map_err(stringify)
+}
+
+// re-send the events already saved on disk to the current relay set; use after adding a relay so it
+// gets backfilled without a full re-scrape
+#[tauri::command]
+async fn republish(app: AppHandle) -> Result<Value, String> {
+    ensure_daemon().await.map_err(stringify)?;
+    let job = json!({"cmd": "run", "job": {"kind": "republish"}});
     ipc::call(job, move |data| {
         let _ = app.emit("progress", data);
     })

@@ -9,7 +9,7 @@ use bakemono_core::Manifest;
 use bakemono_scraper::{ScrapeRequest, Scraper};
 
 use bakemono_engine::identity::Identity;
-use crate::scrape::{gather_pairs, manifest_from_files};
+use crate::scrape::{event_sidecar_path, gather_event_sidecars, gather_pairs, manifest_from_files};
 use crate::thumbnail;
 use bakemono_engine::seeder::SeederHandle;
 
@@ -156,6 +156,49 @@ pub async fn run_ingest(dir: &Path, ctx: &JobContext<'_>) -> Result<RunSummary> 
     build_seed_publish(gather_pairs(dir)?, ctx).await
 }
 
+// re-send the events we already signed and saved on disk to the current relay set, so a newly added
+// relay gets backfilled without re-hashing, re-seeding, or re-mining proof-of-work
+pub async fn run_republish(dir: &Path, ctx: &JobContext<'_>) -> Result<RunSummary> {
+    let progress = ctx.progress;
+    let events = load_saved_events(dir)?;
+    if events.is_empty() {
+        bail!(
+            "no saved events under {}; scrape or ingest once to generate them",
+            dir.display()
+        );
+    }
+    tracing::info!(dir = %dir.display(), count = events.len(), "republish start");
+    progress(Progress::Publishing {
+        relays: ctx.relays.to_vec(),
+        count: events.len(),
+    });
+    let ids = publish(ctx.relays, ctx.identity.keys(), &events).await?;
+    let event_ids: Vec<String> = ids.iter().map(|id| id.to_hex()).collect();
+    progress(Progress::Published {
+        event_ids: event_ids.clone(),
+    });
+    progress(Progress::Done {
+        manifests: events.len(),
+    });
+    Ok(RunSummary {
+        manifests: Vec::new(),
+        event_ids,
+        relays: ctx.relays.to_vec(),
+    })
+}
+
+fn load_saved_events(dir: &Path) -> Result<Vec<Event>> {
+    let mut events = Vec::new();
+    for path in gather_event_sidecars(dir)? {
+        let raw = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        match serde_json::from_slice::<Event>(&raw) {
+            Ok(event) => events.push(event),
+            Err(e) => tracing::warn!("skipping unreadable event sidecar {}: {e:#}", path.display()),
+        }
+    }
+    Ok(events)
+}
+
 // re-seed everything in the scrape dir, so the swarm has the bytes again after a restart
 pub async fn reseed(seeder: &SeederHandle, dir: &Path) -> usize {
     let pairs = match gather_pairs(dir) {
@@ -191,6 +234,7 @@ async fn build_seed_publish(
 
     let total = pairs.len();
     let mut manifests = Vec::new();
+    let mut media_paths = Vec::new();
     let mut summaries = Vec::new();
     let mut cancelled = false;
     for (index, (media, sidecar)) in pairs.iter().enumerate() {
@@ -245,6 +289,7 @@ async fn build_seed_publish(
         }
         summaries.push(summary_of(&manifest));
         manifests.push(manifest);
+        media_paths.push(media.clone());
     }
 
     if manifests.is_empty() {
@@ -261,6 +306,7 @@ async fn build_seed_publish(
 
     let difficulty = pow_difficulty();
     let events = mint_events(ctx.identity.keys(), &manifests, difficulty, ctx.cancel, progress).await?;
+    persist_events(&events, &media_paths);
     if events.len() < manifests.len() {
         cancelled = true;
     }
@@ -330,6 +376,21 @@ async fn mint_events(
         events.push(event);
     }
     Ok(events)
+}
+
+// best-effort: save each signed event beside its media so republish can resend it without re-minting
+fn persist_events(events: &[Event], media_paths: &[PathBuf]) {
+    for (event, media) in events.iter().zip(media_paths) {
+        let path = event_sidecar_path(media);
+        match serde_json::to_vec(event) {
+            Ok(bytes) => {
+                if let Err(e) = std::fs::write(&path, bytes) {
+                    tracing::warn!("could not save event sidecar {}: {e:#}", path.display());
+                }
+            }
+            Err(e) => tracing::warn!("could not serialize event for {}: {e:#}", media.display()),
+        }
+    }
 }
 
 fn pow_difficulty() -> u8 {

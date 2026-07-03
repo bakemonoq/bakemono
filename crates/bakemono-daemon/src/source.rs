@@ -11,7 +11,7 @@ use bakemono_engine::seeder::SeederHandle;
 use bakemono_scraper::{Cookies, ScrapeRequest};
 
 use bakemono_engine::identity::Identity;
-use crate::pipeline::{run_ingest, run_scrape, JobContext, Progress};
+use crate::pipeline::{run_ingest, run_republish, run_scrape, JobContext, Progress};
 use crate::scrape::gather_pairs;
 
 // the app's half of the daemon: scrape -> hash -> sign -> publish -> seed what I made
@@ -36,6 +36,10 @@ enum AppJob {
     },
     Ingest {
         dir: String,
+    },
+    Republish {
+        #[serde(default)]
+        dir: Option<String>,
     },
 }
 
@@ -71,6 +75,10 @@ impl ContentSource for AppContentSource {
                     run_scrape(request, limit.map(|n| n as usize), &ctx).await?
                 }
                 AppJob::Ingest { dir } => run_ingest(Path::new(&dir), &ctx).await?,
+                AppJob::Republish { dir } => {
+                    let dir = dir.map(PathBuf::from).unwrap_or_else(scrape_dest);
+                    run_republish(&dir, &ctx).await?
+                }
             };
             Ok(serde_json::to_value(summary)?)
         }
