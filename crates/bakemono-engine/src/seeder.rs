@@ -53,10 +53,18 @@ impl SeederHandle {
         Ok(())
     }
 
-    pub async fn seed(&self, file: &Path) -> Result<SeedInfo> {
+    pub async fn seed(&self, file: &Path, sha256: Option<&str>) -> Result<SeedInfo> {
         let guard = self.inner.lock().await;
         match guard.as_ref() {
-            Some(seeder) => seeder.seed(file).await,
+            Some(seeder) => seeder.seed(file, sha256).await,
+            None => bail!("seeder not started"),
+        }
+    }
+
+    pub async fn seed_in_place(&self, file: &Path) -> Result<SeedInfo> {
+        let guard = self.inner.lock().await;
+        match guard.as_ref() {
+            Some(seeder) => seeder.seed_in_place(file).await,
             None => bail!("seeder not started"),
         }
     }

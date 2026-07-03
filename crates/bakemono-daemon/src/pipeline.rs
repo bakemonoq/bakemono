@@ -210,7 +210,7 @@ pub async fn reseed(seeder: &SeederHandle, dir: &Path) -> usize {
     };
     let mut count = 0;
     for (media, _sidecar) in &pairs {
-        match seeder.seed(media).await {
+        match seeder.seed(media, None).await {
             Ok(_) => count += 1,
             Err(e) => tracing::warn!("reseed failed for {}: {e:#}", media.display()),
         }
@@ -266,7 +266,11 @@ async fn build_seed_publish(
             size: manifest.size,
         });
         if let Some(seeder) = ctx.seeder {
-            manifest.magnet = seeder.seed(media).await.context("seeding file")?.magnet;
+            manifest.magnet = seeder
+                .seed(media, Some(&manifest.file_hash))
+                .await
+                .context("seeding file")?
+                .magnet;
             progress(Progress::Seeded {
                 file: file_label(media),
                 magnet: manifest.magnet.clone(),

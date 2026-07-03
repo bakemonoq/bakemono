@@ -92,6 +92,15 @@ impl ContentSource for AppContentSource {
             .collect()
     }
 
+    // the signed event saved beside the media at publish time carries the magnet the network knows
+    fn published_magnet(&self, media: &Path) -> Option<String> {
+        let raw = std::fs::read(crate::scrape::event_sidecar_path(media)).ok()?;
+        let event: bakemono_core::nostr::Event = serde_json::from_slice(&raw).ok()?;
+        bakemono_core::Manifest::from_event(&event)
+            .ok()
+            .map(|m| m.magnet)
+    }
+
     fn stats(&self, content_dir: &Path) -> Value {
         serde_json::to_value(crate::catalog::stats(content_dir)).unwrap_or(Value::Null)
     }

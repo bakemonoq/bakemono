@@ -45,6 +45,12 @@ A Bakemono manifest is a Nostr event of **kind 31063** (in the parameterized-rep
 - `size` - file size in bytes as a decimal string.
 - `m` - MIME type from the file's magic bytes, not extension.
 - `magnet` - BitTorrent v1 magnet link, full URI. Format: `magnet:?xt=urn:btih:<sha1-of-bencoded-info-dict>&dn=<filename>&tr=...`. The infohash is sha1, what BT v1 uses and what librqbit produces when it creates the torrent. The `x` tag above is sha256 of the file bytes and is independent of the infohash; the two coexist (one identifies the torrent the board's gateway joins, the other identifies the file content for dedup).
+
+  Torrent construction is deterministic so that independent contributors of the same file land in the same swarm instead of forking it: single-file torrent, info-dict name = `<sha256-of-file-bytes>.<ext>` (extension lowercased, `jpeg` normalized to `jpg`, omitted when the source file has none), piece length fixed at 1 MiB (1048576 bytes). Same bytes -> same info dict -> same infohash on every client.
+
+  These construction parameters are frozen protocol constants (`PIECE_LENGTH` and the staged-name scheme in `bakemono-torrent`). Any client change MUST reproduce them exactly: a different piece length, name, or any extra info-dict field changes the infohash, splits contributors of the same file into disjoint swarms that cannot share peers, and silently breaks cross-client dedup. Torrents created before this rule existed (librqbit defaults, original filename) stay valid; clients keep seeding them alongside the deterministic torrent until their manifests are re-published.
+
+  Boards treat manifests sharing an `x` value as interchangeable at the gateway: if the requested torrent's swarm is dead, the gateway may serve the same bytes from a sibling manifest's torrent. This trusts the `x` a manifest claims, so the fallback pool MUST be limited to manifests that passed local moderation and carry no takedown; a manifest lying about `x` could otherwise substitute wrong bytes under a content-addressed URL. Byte-level verification at the gateway is a future hardening.
 - `platform` - lowercase identifier matching the source extractor name. Clients SHOULD use the gallery-dl extractor identifier for interoperability. Any non-empty lowercase string is valid; indexers MUST treat unknown values as opaque.
 - `creator` - human-readable source handle.
 - `creator_id` - source-specific creator identifier.

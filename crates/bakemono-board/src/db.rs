@@ -115,6 +115,34 @@ pub async fn magnet_by_infohash(pool: &PgPool, infohash: &str) -> Result<Option<
     Ok(magnet)
 }
 
+// every visible torrent carrying the same file bytes as the requested one, with probed seeder counts,
+// so the gateway can dodge a swarm the prober saw empty; the takedown guard matches magnet_by_infohash,
+// so the fallback can never resurrect suppressed bytes through a sibling manifest
+pub async fn swarm_alternates(pool: &PgPool, infohash: &str) -> Result<Vec<(String, Option<i32>)>> {
+    let rows = sqlx::query_as::<_, (String, Option<i32>)>(
+        "SELECT DISTINCT m.infohash, h.seeders
+         FROM visible_manifests m
+         LEFT JOIN torrent_health h ON h.infohash = m.infohash
+         WHERE m.infohash IS NOT NULL
+           AND m.file_hash IN (SELECT file_hash FROM visible_manifests WHERE infohash = $1)
+           AND NOT EXISTS (
+               SELECT 1 FROM manifests m2 JOIN takedowns t ON (
+                   (t.target_type = 'e' AND t.target = m2.event_id) OR
+                   (t.target_type = 'x' AND t.target = m2.file_hash) OR
+                   (t.target_type = 'p' AND t.target = m2.pubkey) OR
+                   (t.target_type = 'i' AND t.target = m2.infohash) OR
+                   (t.target_type = 'post' AND t.target = m2.platform || ':' || m2.creator_id || ':' || m2.post_id) OR
+                   (t.target_type = 'creator' AND t.target = m2.platform || ':' || m2.creator_id)
+               )
+               WHERE m2.infohash = m.infohash
+           )",
+    )
+    .bind(infohash)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 // true if a takedown already bans this manifest's event, file, contributor, infohash, post, or author
 async fn is_banned(pool: &PgPool, event_id: &str, pubkey: &str, manifest: &Manifest) -> Result<bool> {
     let banned: bool = sqlx::query_scalar(
@@ -465,22 +493,28 @@ pub async fn feed(
     pool: &PgPool,
     limit: i64,
     before: Option<i64>,
+    before_id: Option<&str>,
     scope: &FeedScope,
 ) -> Result<Vec<ManifestRow>> {
+    // cursor is the (created_at, event_id) of the last row, matching the ORDER BY, so a page boundary inside
+    // a same-second burst continues past that exact row instead of skipping the rest of the second
     let rows = sqlx::query_as::<_, ManifestRow>(
         "SELECT * FROM (
              SELECT DISTINCT ON (infohash) * FROM visible_manifests
              WHERE infohash IS NOT NULL
-               AND ($2::bigint IS NULL OR created_at < $2)
-               AND ($3::text IS NULL OR platform = $3)
-               AND ($4::text IS NULL OR creator_id = $4)
-               AND ($5::text IS NULL OR post_id = $5)
-               AND ($6::text IS NULL OR pubkey = $6)
+               AND ($2::bigint IS NULL
+                    OR created_at < $2
+                    OR (created_at = $2 AND ($3::text IS NULL OR event_id < $3)))
+               AND ($4::text IS NULL OR platform = $4)
+               AND ($5::text IS NULL OR creator_id = $5)
+               AND ($6::text IS NULL OR post_id = $6)
+               AND ($7::text IS NULL OR pubkey = $7)
              ORDER BY infohash, created_at DESC
          ) t ORDER BY created_at DESC, event_id DESC LIMIT $1",
     )
     .bind(limit)
     .bind(before)
+    .bind(before_id)
     .bind(&scope.platform)
     .bind(&scope.creator_id)
     .bind(&scope.post_id)

@@ -25,6 +25,13 @@ pub trait ContentSource: Send + Sync + 'static {
     // files to (re)seed on startup, i.e. the current content set on disk
     fn seedable(&self, content_dir: &Path) -> Vec<PathBuf>;
 
+    // the magnet this file was published under, if the head knows it; reseed compares it against the
+    // deterministic infohash to keep swarms behind older published magnets alive
+    fn published_magnet(&self, media: &Path) -> Option<String> {
+        let _ = media;
+        None
+    }
+
     // opaque stats for the `stats` ipc command (files/bytes/...); default = none
     fn stats(&self, content_dir: &Path) -> Value {
         let _ = content_dir;

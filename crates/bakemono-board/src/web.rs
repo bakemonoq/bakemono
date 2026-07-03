@@ -530,6 +530,7 @@ async fn seed_feed(
 struct FeedQuery {
     limit: Option<i64>,
     before: Option<i64>,
+    before_id: Option<String>,
     sort: Option<String>,
     platform: Option<String>,
     creator: Option<String>,
@@ -561,14 +562,22 @@ async fn catalog_feed(
 ) -> (String, Option<String>, String) {
     let scope = q.scope();
     let scope_qs = scope_query(&scope);
-    let rows = db::feed(pool, limit, q.before, &scope).await.unwrap_or_default();
+    let rows = db::feed(pool, limit, q.before, q.before_id.as_deref(), &scope)
+        .await
+        .unwrap_or_default();
     let items = rows.iter().map(|m| feed_item(base, m)).collect();
     let self_href = format!("{base}/feed.xml?limit={limit}{scope_qs}");
     // a full page means older torrents remain: hand out the cursor to the next page of this same slice
     let next = (rows.len() as i64 == limit)
         .then(|| rows.last())
         .flatten()
-        .map(|last| format!("{base}/feed.xml?before={}&limit={limit}{scope_qs}", last.created_at));
+        .map(|last| {
+            format!(
+                "{base}/feed.xml?before={}&before_id={}&limit={limit}{scope_qs}",
+                last.created_at,
+                qs_encode(&last.event_id)
+            )
+        });
     (self_href, next, items)
 }
 
@@ -1066,7 +1075,7 @@ async fn gateway_meta(
         return (StatusCode::NOT_FOUND, "unknown infohash").into_response();
     };
     if !private {
-        if let Some(resp) = cold_miss_guard(&state, &infohash, &headers, peer) {
+        if let Some(resp) = cold_miss_guard(&state, &magnet, &headers, peer) {
             return resp;
         }
     }
@@ -1086,7 +1095,7 @@ async fn gateway_file(
         return (StatusCode::NOT_FOUND, "unknown infohash").into_response();
     };
     if !private {
-        if let Some(resp) = cold_miss_guard(&state, &infohash, &headers, peer) {
+        if let Some(resp) = cold_miss_guard(&state, &magnet, &headers, peer) {
             return resp;
         }
     }
@@ -1100,11 +1109,11 @@ async fn gateway_file(
 // client can trigger those. returns Some(429) when the client is over budget, None to proceed
 fn cold_miss_guard(
     state: &AppState,
-    infohash: &str,
+    magnet: &str,
     headers: &HeaderMap,
     peer: SocketAddr,
 ) -> Option<Response> {
-    let infohash = infohash.trim().to_ascii_lowercase();
+    let infohash = bakemono_torrent::infohash_from_magnet(magnet)?;
     if state.gateway.is_cached(&infohash) {
         return None;
     }
@@ -1153,7 +1162,7 @@ async fn resolve_gateway(state: &AppState, infohash: &str, headers: &HeaderMap) 
         return None;
     }
     if public_infohash(state, &infohash).await {
-        return Some((clean_magnet(&infohash), false));
+        return Some((clean_magnet(&live_infohash(state, &infohash).await), false));
     }
     // a moderator additionally resolves pending or taken-down content (flagged private so it is never
     // cached) so the mod views can preview what the public cannot see
@@ -1168,6 +1177,43 @@ async fn public_infohash(state: &AppState, infohash: &str) -> bool {
         return true;
     }
     env_opt("BAKEMONO_GATEWAY_OPEN").is_some()
+}
+
+// a swarm the prober saw empty falls back to a sibling torrent carrying the same file bytes (same
+// file_hash), so the response stays byte-identical to what the requested infohash names
+async fn live_infohash(state: &AppState, requested: &str) -> String {
+    if state.gateway.is_cached(requested) {
+        return requested.to_string();
+    }
+    let alternates = match db::swarm_alternates(&state.pool, requested).await {
+        Ok(alternates) => alternates,
+        Err(_) => return requested.to_string(),
+    };
+    choose_alternate(requested, &alternates, |ih| state.gateway.is_cached(ih))
+        .unwrap_or_else(|| requested.to_string())
+}
+
+// the requested torrent wins unless its last probe found zero seeders; then prefer a sibling already
+// on disk, then the best-seeded live one. an unprobed sibling is never picked over the requested hash
+fn choose_alternate(
+    requested: &str,
+    alternates: &[(String, Option<i32>)],
+    is_cached: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let dead = alternates
+        .iter()
+        .any(|(ih, seeders)| ih == requested && *seeders == Some(0));
+    if !dead {
+        return None;
+    }
+    let siblings = || alternates.iter().filter(|(ih, _)| ih != requested);
+    if let Some((ih, _)) = siblings().find(|(ih, _)| is_cached(ih)) {
+        return Some(ih.clone());
+    }
+    siblings()
+        .filter(|(_, seeders)| seeders.is_some_and(|n| n > 0))
+        .max_by_key(|(_, seeders)| *seeders)
+        .map(|(ih, _)| ih.clone())
 }
 
 fn clean_magnet(infohash: &str) -> String {
@@ -2970,9 +3016,38 @@ for (const el of document.querySelectorAll('.carousel')) {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_feed, endangered_item, feed_item, pretty_date};
+    use super::{build_feed, choose_alternate, endangered_item, feed_item, pretty_date};
     use super::{report_token, verify_report_token, ReportLimiter, REPORT_WINDOW_SECS};
     use crate::db::{EndangeredRow, ManifestRow};
+
+    #[test]
+    fn alternate_kicks_in_only_for_a_probed_dead_swarm() {
+        let alts = |req: Option<i32>| {
+            vec![
+                ("req".to_string(), req),
+                ("weak".to_string(), Some(1)),
+                ("strong".to_string(), Some(4)),
+                ("unprobed".to_string(), None),
+            ]
+        };
+        let uncached = |_: &str| false;
+        // live or never-probed requested hash is served as-is
+        assert_eq!(choose_alternate("req", &alts(Some(2)), uncached), None);
+        assert_eq!(choose_alternate("req", &alts(None), uncached), None);
+        // dead requested hash falls back to the best-seeded sibling, never an unprobed one
+        assert_eq!(
+            choose_alternate("req", &alts(Some(0)), uncached),
+            Some("strong".to_string())
+        );
+        // a sibling already on disk beats swarm counts
+        assert_eq!(
+            choose_alternate("req", &alts(Some(0)), |ih| ih == "weak"),
+            Some("weak".to_string())
+        );
+        // no usable sibling -> stay on the requested hash
+        let lonely = vec![("req".to_string(), Some(0)), ("other".to_string(), None)];
+        assert_eq!(choose_alternate("req", &lonely, uncached), None);
+    }
 
     #[test]
     fn report_token_round_trips_within_window() {

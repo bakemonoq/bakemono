@@ -565,10 +565,15 @@ pub struct SeedInfo {
     pub info_hash: String,
 }
 
+// every client must build byte-identical torrents from the same file, or contributors of one file fork
+// into disjoint swarms that cannot share peers; this constant is part of that contract, never change it
+pub const PIECE_LENGTH: u32 = 1 << 20;
+
 // holds a file in the swarm over classic BT: creates the torrent, announces to trackers, serves peers
 pub struct Seeder {
     session: Arc<Session>,
     trackers: Vec<String>,
+    staging: PathBuf,
 }
 
 impl Seeder {
@@ -593,22 +598,49 @@ impl Seeder {
             },
             ..Default::default()
         };
+        let staging = session_dir.join("by-hash");
         let session = Session::new_with_opts(session_dir, opts)
             .await
             .context("starting seed session")?;
-        Ok(Self { session, trackers })
+        Ok(Self {
+            session,
+            trackers,
+            staging,
+        })
     }
 
-    // seed the file in place; for a complete torrent librqbit only reads it, it never rewrites content
-    pub async fn seed(&self, file: &Path) -> Result<SeedInfo> {
+    // seed under a content-addressed name with a fixed piece length, so the infohash depends only on
+    // the bytes and independent contributors of one file land in the same swarm; pass the sha256 when
+    // already known to skip a second hashing pass
+    pub async fn seed(&self, file: &Path, sha256: Option<&str>) -> Result<SeedInfo> {
         let file = file
             .canonicalize()
             .with_context(|| format!("resolving {}", file.display()))?;
+        let staging = self.staging.clone();
+        let hash = sha256.map(str::to_ascii_lowercase);
+        let src = file.clone();
+        let staged = tokio::task::spawn_blocking(move || stage_by_hash(&src, &staging, hash))
+            .await
+            .context("staging worker panicked")??;
+        self.seed_torrent(&staged, Some(PIECE_LENGTH)).await
+    }
+
+    // pre-deterministic construction (original filename, librqbit's default pieces); reseed uses it to
+    // keep the swarms behind already-published magnets alive
+    pub async fn seed_in_place(&self, file: &Path) -> Result<SeedInfo> {
+        let file = file
+            .canonicalize()
+            .with_context(|| format!("resolving {}", file.display()))?;
+        self.seed_torrent(&file, None).await
+    }
+
+    // for a complete torrent librqbit only reads the file, it never rewrites content
+    async fn seed_torrent(&self, file: &Path, piece_length: Option<u32>) -> Result<SeedInfo> {
         let created = librqbit::create_torrent(
-            &file,
+            file,
             CreateTorrentOptions {
                 name: None,
-                piece_length: None,
+                piece_length,
             },
         )
         .await
@@ -633,6 +665,56 @@ impl Seeder {
             info_hash,
         })
     }
+}
+
+// the torrent's info dict hashes the file name, so the on-disk name must be content-derived too; a
+// hardlink into the staging dir gives it that name without copying, with a copy fallback across devices
+fn stage_by_hash(file: &Path, staging: &Path, sha256: Option<String>) -> Result<PathBuf> {
+    let hash = match sha256 {
+        Some(hash) => hash,
+        None => sha256_hex(file)?,
+    };
+    let staged = staging.join(staged_name(&hash, file));
+    if staged.exists() {
+        return Ok(staged);
+    }
+    std::fs::create_dir_all(staging)
+        .with_context(|| format!("creating staging dir {}", staging.display()))?;
+    if std::fs::hard_link(file, &staged).is_err() && !staged.exists() {
+        std::fs::copy(file, &staged).with_context(|| format!("staging {}", file.display()))?;
+    }
+    Ok(staged)
+}
+
+// keep the extension so mime detection by name keeps working; normalize the spelling so a rename
+// cannot fork the staged name (and with it the infohash) between contributors
+fn staged_name(hash: &str, file: &Path) -> String {
+    let ext = file
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        None | Some("") => hash.to_string(),
+        Some("jpeg") => format!("{hash}.jpg"),
+        Some(ext) => format!("{hash}.{ext}"),
+    }
+}
+
+fn sha256_hex(file: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut f =
+        std::fs::File::open(file).with_context(|| format!("opening {}", file.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 128 * 1024];
+    loop {
+        let n = std::io::Read::read(&mut f, &mut buf)
+            .with_context(|| format!("reading {}", file.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 // pull the v1 btih out of magnet:?xt=urn:btih:<40 hex>&...; lowercased so it matches our stored hashes
@@ -696,6 +778,47 @@ mod tests {
             Some("0123456789abcdef0123456789abcdef01234567")
         );
         assert_eq!(infohash_from_magnet("magnet:?xt=urn:btih:short"), None);
+    }
+
+    #[test]
+    fn staged_name_is_content_derived_and_normalized() {
+        let hash = "ab".repeat(32);
+        let name = |p: &str| staged_name(&hash, Path::new(p));
+        assert_eq!(name("/x/161883250_post_02.jpg"), format!("{hash}.jpg"));
+        assert_eq!(name("/y/Renamed Copy.JPEG"), format!("{hash}.jpg"));
+        assert_eq!(name("/z/clip.MP4"), format!("{hash}.mp4"));
+        assert_eq!(name("/z/noext"), hash);
+    }
+
+    #[tokio::test]
+    async fn same_bytes_stage_and_hash_identically_regardless_of_path() {
+        let base = std::env::temp_dir().join(format!("bmdet-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for d in ["a", "b"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+        }
+        let bytes = vec![7u8; 40_000];
+        let a = base.join("a/161883250_post_02.jpg");
+        let b = base.join("b/Renamed Copy.JPEG");
+        std::fs::write(&a, &bytes).unwrap();
+        std::fs::write(&b, &bytes).unwrap();
+
+        let sa = stage_by_hash(&a, &base.join("stage-a"), None).unwrap();
+        let sb = stage_by_hash(&b, &base.join("stage-b"), None).unwrap();
+        assert_eq!(sa.file_name(), sb.file_name());
+        // a caller-supplied hash must land on the same staged name as a computed one
+        let hash = sha256_hex(&a).unwrap();
+        let sc = stage_by_hash(&a, &base.join("stage-a"), Some(hash)).unwrap();
+        assert_eq!(sa, sc);
+
+        let opts = || CreateTorrentOptions {
+            name: None,
+            piece_length: Some(PIECE_LENGTH),
+        };
+        let ta = librqbit::create_torrent(&sa, opts()).await.unwrap();
+        let tb = librqbit::create_torrent(&sb, opts()).await.unwrap();
+        assert_eq!(ta.info_hash().as_string(), tb.info_hash().as_string());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
     let staging = std::env::temp_dir().join(format!("bakemono-seed-{}", std::process::id()));
     let trackers = vec!["udp://tracker.opentrackr.org:1337/announce".to_string()];
     let seeder = Seeder::start(staging, trackers, Some(port), None, None).await?;
-    let info = seeder.seed(Path::new(&file)).await?;
+    let info = seeder.seed(Path::new(&file), None).await?;
     println!("seeding {file} on 127.0.0.1:{port}");
     println!("infohash: {}", info.info_hash);
     println!("magnet:   {}", info.magnet);

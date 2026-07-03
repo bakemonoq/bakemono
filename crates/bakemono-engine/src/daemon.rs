@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{bail, Context, Result};
@@ -53,13 +53,32 @@ impl<C: ContentSource> Daemon<C> {
         let files = self.source.seedable(&self.content_dir);
         let mut count = 0;
         for file in &files {
-            match self.seeder.seed(file).await {
-                Ok(_) => count += 1,
+            match self.seeder.seed(file, None).await {
+                Ok(info) => {
+                    count += 1;
+                    self.reseed_legacy(file, &info.info_hash).await;
+                }
                 Err(e) => tracing::warn!("reseed failed for {}: {e:#}", file.display()),
             }
         }
         tracing::info!(count, "reseeded content set");
         Ok(count)
+    }
+
+    // a magnet published before deterministic construction points at a different infohash; seed that
+    // torrent too so the already-published events stay fetchable
+    async fn reseed_legacy(&self, file: &Path, deterministic: &str) {
+        let Some(magnet) = self.source.published_magnet(file) else {
+            return;
+        };
+        match bakemono_torrent::infohash_from_magnet(&magnet) {
+            Some(old) if old != deterministic => {
+                if let Err(e) = self.seeder.seed_in_place(file).await {
+                    tracing::warn!("legacy reseed failed for {}: {e:#}", file.display());
+                }
+            }
+            _ => {}
+        }
     }
 
     pub async fn run_job(&self, job: Value, progress: ProgressFn<'_>) -> Result<Value> {
