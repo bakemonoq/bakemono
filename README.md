@@ -1,4 +1,6 @@
-# Bakemono
+<p align="center">
+  <img src="assets/banner.png" alt="化け物 bakemono" width="680">
+</p>
 
 Back up the content you follow and keep it available for everyone, even after the original site takes it down. Files live in a BitTorrent swarm, the index lives on independent Nostr relays, and any board serves both to a plain web browser. No single server owns the archive, so no single failure can erase it.
 
