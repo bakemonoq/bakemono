@@ -264,6 +264,11 @@ fn render(p: &Progress) -> String {
         Progress::Seeded { file, magnet } => format!("seeded {file} -> {magnet}"),
         Progress::Thumbnailed { file, bytes } => format!("thumb {file} ({bytes} bytes inline)"),
         Progress::Skipped { file, reason } => format!("skip {file}: {reason}"),
+        Progress::Pow {
+            index,
+            total,
+            difficulty,
+        } => format!("[{index}/{total}] mining pow (difficulty {difficulty})"),
         Progress::Publishing { relays, count } => {
             format!("publishing {count} event(s) to {}", relays.join(", "))
         }
