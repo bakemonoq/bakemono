@@ -2,10 +2,34 @@ const { invoke } = window.__TAURI__.core
 const { listen } = window.__TAURI__.event
 
 const $ = (id) => document.getElementById(id)
+
+const LOG_MAX = 2000
+let logPending = []
+let logScheduled = false
 const log = (line) => {
+  logPending.push(line)
+  if (logScheduled) return
+  logScheduled = true
+  requestAnimationFrame(flushLog)
+}
+
+function flushLog() {
+  logScheduled = false
   const el = $('log')
-  el.textContent += line + '\n'
-  el.scrollTop = el.scrollHeight
+  // keep autoscroll only while parked at the bottom, so scroll-back and selection are not yanked
+  const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 4
+  const frag = document.createDocumentFragment()
+  for (const line of logPending) {
+    const row = document.createElement('div')
+    row.textContent = line
+    frag.appendChild(row)
+  }
+  logPending.length = 0
+  el.appendChild(frag)
+  if (atBottom) {
+    while (el.childElementCount > LOG_MAX) el.removeChild(el.firstChild)
+    el.scrollTop = el.scrollHeight
+  }
 }
 
 function render(p) {
