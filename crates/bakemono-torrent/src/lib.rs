@@ -710,7 +710,9 @@ impl Seeder {
             .add_torrent(
                 AddTorrent::from_bytes(built.torrent),
                 Some(AddTorrentOptions {
-                    output_folder: Some(bundles_root.to_string_lossy().into_owned()),
+                    // librqbit treats an explicit output_folder as the content root and does not prepend the
+                    // torrent name, so point it at the bundle dir the files are staged under
+                    output_folder: Some(bundle_dir.to_string_lossy().into_owned()),
                     overwrite: true,
                     trackers: Some(self.trackers.clone()),
                     disable_trackers: self.lean,

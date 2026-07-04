@@ -149,6 +149,39 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // the pieces must validate against the actual file bytes, or a seeder reports 0 valid pieces and can
+    // serve metadata but never the files
+    #[tokio::test]
+    async fn bundle_seeds_as_complete() {
+        let root = std::env::temp_dir().join(format!("bundle-seed-{}", std::process::id()));
+        let bdir = root.join("tb");
+        std::fs::create_dir_all(&bdir).unwrap();
+        let files = vec![
+            write(&bdir, "aaa", &vec![1u8; 3_000_000]),
+            write(&bdir, "bbb", &vec![2u8; 1_500_000]),
+        ];
+        let built = build_bundle("tb", files, 1 << 20).unwrap();
+        let session = librqbit::Session::new(root.clone()).await.unwrap();
+        let handle = session
+            .add_torrent(
+                librqbit::AddTorrent::from_bytes(built.torrent),
+                Some(librqbit::AddTorrentOptions {
+                    output_folder: Some(bdir.to_string_lossy().into_owned()),
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        handle.wait_until_initialized().await.unwrap();
+        let stats = handle.stats();
+        println!("STATS {stats:?}");
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(stats.progress_bytes, stats.total_bytes, "bundle must validate complete");
+    }
+
     // our bencode + piece hashing must match what librqbit computes from the same bytes, or the torrent
     // is malformed and no client would seed it
     #[test]
