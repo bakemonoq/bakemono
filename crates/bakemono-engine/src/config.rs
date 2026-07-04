@@ -21,6 +21,9 @@ pub struct AppConfig {
     pub ffmpeg_bin: Option<String>,
     #[serde(default)]
     pub gallery_dl_bin: Option<String>,
+    // which board's web UI the gui opens for upload status; boards are federated, so the user picks
+    #[serde(default)]
+    pub board_url: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -34,6 +37,7 @@ impl Default for AppConfig {
             stop_daemon_on_exit: false,
             ffmpeg_bin: None,
             gallery_dl_bin: None,
+            board_url: None,
         }
     }
 }

@@ -51,8 +51,10 @@ pub fn run() {
             get_config,
             save_settings,
             set_stop_on_exit,
+            set_board_url,
             app_paths,
             open_path,
+            open_url,
             sharing_stats,
             start_scrape,
             republish,
@@ -209,6 +211,13 @@ fn set_stop_on_exit(value: bool, state: State<AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn set_board_url(value: String, state: State<AppState>) -> Result<(), String> {
+    let mut guard = state.lock();
+    guard.config.board_url = clean_path(Some(value));
+    guard.config.save().map_err(stringify)
+}
+
+#[tauri::command]
 async fn start_daemon() -> Result<(), String> {
     ensure_daemon().await.map_err(stringify)
 }
@@ -226,6 +235,24 @@ fn app_paths() -> Paths {
 #[tauri::command]
 fn open_path(path: String) -> Result<(), String> {
     open_in_file_manager(&path).map_err(stringify)
+}
+
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        return Err(format!("refusing to open non-http url: {url}"));
+    }
+    open_in_browser(&url).map_err(stringify)
+}
+
+fn open_in_browser(url: &str) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    std::process::Command::new("open").arg(url).spawn()?;
+    #[cfg(target_os = "windows")]
+    std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn()?;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    std::process::Command::new("xdg-open").arg(url).spawn()?;
+    Ok(())
 }
 
 // open a directory in the OS file manager (Finder/Explorer/xdg)

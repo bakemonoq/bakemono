@@ -3,6 +3,14 @@ const { listen } = window.__TAURI__.event
 
 const $ = (id) => document.getElementById(id)
 
+// the user's chosen board, normalized to an origin the /u/npub path can hang off
+function boardUrl() {
+  let url = $('boardUrl').value.trim().replace(/\/+$/, '')
+  if (!url) return null
+  if (!/^https?:\/\//.test(url)) url = 'https://' + url
+  return url
+}
+
 const LOG_MAX = 2000
 let logPending = []
 let logScheduled = false
@@ -68,6 +76,11 @@ async function withJob(label, fn) {
   try {
     const summary = await fn()
     log(`OK: ${summary.event_ids.length} event(s) published`)
+    const npub = $('npub').textContent
+    const base = boardUrl()
+    if (summary.event_ids.length && base && npub.startsWith('npub1')) {
+      log(`posts appear at ${base}/u/${npub} once the board reviews them`)
+    }
   } catch (err) {
     log('ERROR: ' + err)
   } finally {
@@ -110,6 +123,7 @@ async function refreshConfig() {
   $('ffmpegBin').value = cfg.ffmpeg_bin || ''
   $('galleryDlBin').value = cfg.gallery_dl_bin || ''
   $('stopOnExit').checked = !!cfg.stop_daemon_on_exit
+  $('boardUrl').value = cfg.board_url || ''
 }
 
 const lines = (id) => $(id).value.split('\n').map((s) => s.trim()).filter(Boolean)
@@ -185,6 +199,21 @@ $('imp').onclick = async () => {
 $('exp').onclick = async () => {
   const nsec = await invoke('export_nsec')
   prompt('Your nsec (keep it secret):', nsec)
+}
+
+$('uploads').onclick = async () => {
+  const base = boardUrl()
+  if (!base) return alert('enter the URL of a board first')
+  try {
+    const npub = await invoke('identity_npub')
+    await invoke('open_url', { url: `${base}/u/${npub}` })
+  } catch (err) {
+    log('could not open board: ' + err)
+  }
+}
+
+$('boardUrl').onchange = () => {
+  invoke('set_board_url', { value: $('boardUrl').value }).catch((err) => log('failed: ' + err))
 }
 
 $('saveSettings').onclick = async () => {
