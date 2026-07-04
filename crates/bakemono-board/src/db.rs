@@ -274,8 +274,10 @@ pub async fn approve_pending(
     Ok(res.rows_affected())
 }
 
-// drop pending posts within the same scope; rejecting only deletes the queued manifests (the
-// contributor may re-publish), so ban via a pubkey takedown to stop a persistent spammer
+// tombstone pending posts in the same scope instead of deleting them: the resync refetches every
+// manifest from the relays, so a deleted row would just re-ingest as pending. marking 'rejected'
+// keeps has_event true so the resync skips it, while a real re-publish (newer created_at) still
+// replaces the tombstone and re-queues. ban via a pubkey takedown to stop a persistent spammer
 pub async fn reject_pending(
     pool: &PgPool,
     pubkey: &str,
@@ -287,7 +289,7 @@ pub async fn reject_pending(
         return Ok(0);
     }
     let res = sqlx::query(
-        "DELETE FROM manifests
+        "UPDATE manifests SET status = 'rejected'
          WHERE status = 'pending'
            AND ($1 = '' OR pubkey = $1)
            AND ($2 = '' OR platform = $2)
