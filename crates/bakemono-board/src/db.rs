@@ -51,6 +51,15 @@ pub async fn upsert(pool: &PgPool, event: &Event, manifest: &Manifest) -> Result
         .bind(created_at)
         .execute(pool)
         .await?;
+    // if these exact bytes were already vetted under another contributor (a human approved this file_hash
+    // and we verified an infohash serves it), a re-publish of the same content is just more swarm - approve
+    // it outright. anything unproven stays pending for a human
+    let infohash = bakemono_torrent::infohash_from_magnet(&manifest.magnet);
+    let status = if content_trusted(pool, infohash.as_deref(), manifest.file_index, &manifest.file_hash).await? {
+        "approved"
+    } else {
+        "pending"
+    };
     sqlx::query(INSERT)
         .bind(&event_id)
         .bind(&pubkey)
@@ -71,11 +80,40 @@ pub async fn upsert(pool: &PgPool, event: &Event, manifest: &Manifest) -> Result
         .bind(&manifest.tier)
         .bind(&manifest.content)
         .bind(&manifest.thumb)
-        .bind(bakemono_torrent::infohash_from_magnet(&manifest.magnet))
+        .bind(&infohash)
         .bind(manifest.bundle_index as i32)
+        .bind(status)
         .execute(pool)
         .await?;
     Ok(())
+}
+
+// content is trusted when the board has verified an infohash+file actually holds this sha256 (ok=true)
+// AND a human already approved that same sha256 on some post. both halves are required: verification
+// alone proves identity, human approval proves it is allowed, and a mismatch (ok=false) never counts
+async fn content_trusted(
+    pool: &PgPool,
+    infohash: Option<&str>,
+    file_index: u32,
+    file_hash: &str,
+) -> Result<bool> {
+    let Some(infohash) = infohash else {
+        return Ok(false);
+    };
+    let trusted: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+                 SELECT 1 FROM verified_content
+                 WHERE infohash = $1 AND file_index = $2 AND ok AND sha256 = $3
+             ) AND EXISTS(
+                 SELECT 1 FROM manifests WHERE file_hash = $3 AND status = 'approved'
+             )",
+    )
+    .bind(infohash)
+    .bind(file_index as i32)
+    .bind(file_hash)
+    .fetch_one(pool)
+    .await?;
+    Ok(trusted)
 }
 
 // lets the resync skip the full upsert for an event it already stores; a replaceable edit gets a fresh
@@ -87,6 +125,73 @@ pub async fn has_event(pool: &PgPool, event_id: &str) -> Result<bool> {
             .fetch_one(pool)
             .await?;
     Ok(exists)
+}
+
+// record what the gateway hashed for an infohash+file: ok=true when the bytes matched the manifest's
+// file_hash, false when they did not (a lying manifest or a colliding torrent). one row per infohash+file
+pub async fn record_verification(
+    pool: &PgPool,
+    infohash: &str,
+    file_index: usize,
+    sha256: &str,
+    ok: bool,
+    size: u64,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO verified_content (infohash, file_index, sha256, ok, size, checked_at)
+         VALUES ($1,$2,$3,$4,$5, EXTRACT(EPOCH FROM now())::bigint)
+         ON CONFLICT (infohash, file_index) DO UPDATE SET
+             sha256 = EXCLUDED.sha256, ok = EXCLUDED.ok, size = EXCLUDED.size, checked_at = EXCLUDED.checked_at",
+    )
+    .bind(infohash)
+    .bind(file_index as i32)
+    .bind(sha256)
+    .bind(ok)
+    .bind(size as i64)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// the gateway already hashed this infohash+file, so a re-serve need not hash it again
+pub async fn is_verified(pool: &PgPool, infohash: &str, file_index: usize) -> Result<bool> {
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM verified_content WHERE infohash = $1 AND file_index = $2)",
+    )
+    .bind(infohash)
+    .bind(file_index as i32)
+    .fetch_one(pool)
+    .await?;
+    Ok(exists)
+}
+
+// bytes served under this infohash once failed to match their manifest's sha256, so nothing on it is
+// trustworthy: the gateway must refuse every file of a quarantined infohash
+pub async fn is_quarantined(pool: &PgPool, infohash: &str) -> Result<bool> {
+    let bad: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM verified_content WHERE infohash = $1 AND NOT ok)",
+    )
+    .bind(infohash)
+    .fetch_one(pool)
+    .await?;
+    Ok(bad)
+}
+
+// the file_hash and size a manifest declares for an infohash+file, so the gateway knows what the bytes
+// it streams are supposed to hash to
+pub async fn expected_content(
+    pool: &PgPool,
+    infohash: &str,
+    file_index: usize,
+) -> Result<Option<(String, i64)>> {
+    let row = sqlx::query_as::<_, (String, i64)>(
+        "SELECT file_hash, size FROM manifests WHERE infohash = $1 AND file_index = $2 LIMIT 1",
+    )
+    .bind(infohash)
+    .bind(file_index as i32)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
 }
 
 // the gateway only serves infohashes the board carries and that pass moderation, so resolve through
@@ -269,6 +374,49 @@ pub async fn approve_pending(
     .bind(platform)
     .bind(creator_id)
     .bind(post_id)
+    .execute(pool)
+    .await?;
+    // approving these bytes may make an identical, already-verified re-publish trustworthy, so sweep those
+    // out of the queue too. covers a re-publish that landed before the original was approved
+    promote_trusted(pool).await?;
+    Ok(res.rows_affected())
+}
+
+// approve every pending manifest whose exact bytes are now trusted: an infohash+file the gateway verified
+// (ok) to hold this sha256, and a sha256 a human has approved elsewhere. this is content_trusted applied
+// in bulk, so re-publishers of vetted files clear the queue without another human pass
+pub async fn promote_trusted(pool: &PgPool) -> Result<u64> {
+    let res = sqlx::query(
+        "UPDATE manifests m SET status = 'approved'
+         WHERE m.status = 'pending'
+           AND EXISTS (
+               SELECT 1 FROM verified_content v
+               WHERE v.infohash = m.infohash AND v.file_index = m.file_index AND v.ok AND v.sha256 = m.file_hash
+           )
+           AND EXISTS (
+               SELECT 1 FROM manifests a WHERE a.file_hash = m.file_hash AND a.status = 'approved'
+           )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+// promote_trusted scoped to a single infohash, cheap enough to run right after the gateway verifies one:
+// a pending re-publish of freshly-verified bytes clears the moment the original bytes prove out
+pub async fn promote_trusted_for(pool: &PgPool, infohash: &str) -> Result<u64> {
+    let res = sqlx::query(
+        "UPDATE manifests m SET status = 'approved'
+         WHERE m.status = 'pending' AND m.infohash = $1
+           AND EXISTS (
+               SELECT 1 FROM verified_content v
+               WHERE v.infohash = m.infohash AND v.file_index = m.file_index AND v.ok AND v.sha256 = m.file_hash
+           )
+           AND EXISTS (
+               SELECT 1 FROM manifests a WHERE a.file_hash = m.file_hash AND a.status = 'approved'
+           )",
+    )
+    .bind(infohash)
     .execute(pool)
     .await?;
     Ok(res.rows_affected())
@@ -1190,6 +1338,20 @@ CREATE TABLE IF NOT EXISTS torrent_health (
 );
 CREATE INDEX IF NOT EXISTS torrent_health_checked ON torrent_health (checked_at);
 
+-- the board hashes the bytes it serves and records the result here, so 'this infohash+file really holds
+-- this sha256' is something we verified, not something a signed manifest merely claimed. ok=false means
+-- the bytes did not match the claimed file_hash: quarantined, never served or trusted again
+CREATE TABLE IF NOT EXISTS verified_content (
+    infohash   TEXT NOT NULL,
+    file_index INTEGER NOT NULL,
+    sha256     TEXT NOT NULL,
+    ok         BOOLEAN NOT NULL,
+    size       BIGINT NOT NULL,
+    checked_at BIGINT NOT NULL,
+    PRIMARY KEY (infohash, file_index)
+);
+CREATE INDEX IF NOT EXISTS verified_content_bad ON verified_content (infohash) WHERE NOT ok;
+
 -- view tally per post, the signal behind the Popular sort; deduped per browser so a refresh does not inflate it
 CREATE TABLE IF NOT EXISTS post_views (
     platform   TEXT NOT NULL,
@@ -1245,8 +1407,8 @@ const INSERT: &str = "
 INSERT INTO manifests (
     event_id, pubkey, created_at, d_tag, file_hash, size, mime, magnet,
     platform, creator, creator_id, post_id, file_index, filename, post_title, posted_at, tier, content,
-    thumb, infohash, bundle_index
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+    thumb, infohash, bundle_index, status
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
 ON CONFLICT (event_id) DO NOTHING
 ";
 
@@ -1358,6 +1520,116 @@ mod tests {
             .unwrap();
     }
 
+    async fn status_of(pool: &PgPool, event_id: &str) -> String {
+        sqlx::query_scalar("SELECT status FROM manifests WHERE event_id = $1")
+            .bind(event_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    fn manifest_with(creator_id: &str, infohash: &str, file_hash: &str) -> Manifest {
+        let mut m = sample(creator_id);
+        m.file_hash = file_hash.to_string();
+        m.magnet = format!("magnet:?xt=urn:btih:{infohash}");
+        m
+    }
+
+    // the core of the content-trust model: once a human approves a file and the gateway verifies its bytes,
+    // a different contributor publishing the identical bytes is auto-approved, while unproven bytes are not
+    #[tokio::test]
+    async fn verified_and_approved_content_auto_approves_republishers() {
+        let Ok(url) = std::env::var("BAKEMONO_TEST_DB") else {
+            eprintln!("skipping: BAKEMONO_TEST_DB not set");
+            return;
+        };
+        let pool = match connect(&url).await {
+            Ok(pool) => pool,
+            Err(e) => {
+                eprintln!("skipping: cannot reach test db: {e}");
+                return;
+            }
+        };
+        let cid = format!("trust-{}", std::process::id());
+        let ih = "1".repeat(40);
+        let fh = "a".repeat(64);
+
+        // A: first sighting -> pending, no human, no verification yet
+        let ka = Keys::generate();
+        let ma = manifest_with(&cid, &ih, &fh);
+        let ea = ma.to_event(&ka).unwrap();
+        upsert(&pool, &ea, &ma).await.unwrap();
+        assert_eq!(status_of(&pool, &ea.id.to_hex()).await, "pending");
+
+        // a human approves A and the gateway verifies A's bytes really hash to fh
+        approve_pending(&pool, &ka.public_key().to_hex(), "", "", "").await.unwrap();
+        record_verification(&pool, &ih, 0, &fh, true, 123).await.unwrap();
+
+        // B: another contributor, identical verified+approved bytes -> auto-approved at ingest
+        let kb = Keys::generate();
+        let mb = manifest_with(&cid, &ih, &fh);
+        let eb = mb.to_event(&kb).unwrap();
+        upsert(&pool, &eb, &mb).await.unwrap();
+        assert_eq!(status_of(&pool, &eb.id.to_hex()).await, "approved", "same proven bytes should auto-approve");
+
+        // C: unproven bytes (never approved, never verified) -> still needs a human
+        let kc = Keys::generate();
+        let mc = manifest_with(&cid, &"2".repeat(40), &"c".repeat(64));
+        let ec = mc.to_event(&kc).unwrap();
+        upsert(&pool, &ec, &mc).await.unwrap();
+        assert_eq!(status_of(&pool, &ec.id.to_hex()).await, "pending", "unproven content must not auto-approve");
+
+        // a served-bytes mismatch quarantines that infohash, and only that one
+        let bad = "9".repeat(40);
+        record_verification(&pool, &bad, 0, "deadbeef", false, 5).await.unwrap();
+        assert!(is_quarantined(&pool, &bad).await.unwrap());
+        assert!(!is_quarantined(&pool, &ih).await.unwrap());
+
+        sqlx::query("DELETE FROM manifests WHERE creator_id = $1").bind(&cid).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM verified_content WHERE infohash = ANY($1)")
+            .bind(vec![ih, bad]).execute(&pool).await.unwrap();
+    }
+
+    // a re-publish that lands before the original is approved stays pending, then clears the queue the
+    // moment a human approves the original bytes (promote_trusted, run from approve_pending)
+    #[tokio::test]
+    async fn approving_original_promotes_earlier_republish() {
+        let Ok(url) = std::env::var("BAKEMONO_TEST_DB") else {
+            eprintln!("skipping: BAKEMONO_TEST_DB not set");
+            return;
+        };
+        let pool = match connect(&url).await {
+            Ok(pool) => pool,
+            Err(e) => {
+                eprintln!("skipping: cannot reach test db: {e}");
+                return;
+            }
+        };
+        let cid = format!("promote-{}", std::process::id());
+        let ih = "3".repeat(40);
+        let fh = "b".repeat(64);
+
+        // A verified but not yet approved; B (same bytes) lands first and sits pending
+        let ka = Keys::generate();
+        let ma = manifest_with(&cid, &ih, &fh);
+        let ea = ma.to_event(&ka).unwrap();
+        upsert(&pool, &ea, &ma).await.unwrap();
+        record_verification(&pool, &ih, 0, &fh, true, 123).await.unwrap();
+
+        let kb = Keys::generate();
+        let mb = manifest_with(&cid, &ih, &fh);
+        let eb = mb.to_event(&kb).unwrap();
+        upsert(&pool, &eb, &mb).await.unwrap();
+        assert_eq!(status_of(&pool, &eb.id.to_hex()).await, "pending", "no approved copy yet");
+
+        // approving A makes fh trusted; promote_trusted should sweep B in automatically
+        approve_pending(&pool, &ka.public_key().to_hex(), "", "", "").await.unwrap();
+        assert_eq!(status_of(&pool, &eb.id.to_hex()).await, "approved", "approving the original promotes the re-publish");
+
+        sqlx::query("DELETE FROM manifests WHERE creator_id = $1").bind(&cid).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM verified_content WHERE infohash = $1").bind(&ih).execute(&pool).await.unwrap();
+    }
+
     #[tokio::test]
     async fn takedown_hides_then_unhides_a_file() {
         let Ok(url) = std::env::var("BAKEMONO_TEST_DB") else {
@@ -1454,14 +1726,16 @@ mod tests {
         assert!(post_is_visible(&pool, p, c, post).await.unwrap());
         assert!(!pending_posts_for(&pool, &pk, p, c, 100, 0).await.unwrap().iter().any(|r| r.post_id == post));
 
-        // a second pending post, rejected, is deleted outright
+        // a second pending post, rejected, tombstones as a 'rejected' row (so the relay resync cannot
+        // re-ingest it) and drops out of the pending queue
         let mut m2 = sample(&creator_id);
         m2.post_id = "2".into();
         m2.file_hash = "b".repeat(64);
         upsert(&pool, &m2.to_event_at(&keys, 2_000).unwrap(), &m2).await.unwrap();
-        assert_eq!(post_files_any(&pool, p, c, "2").await.unwrap().len(), 1);
+        assert!(pending_posts_for(&pool, &pk, p, c, 100, 0).await.unwrap().iter().any(|r| r.post_id == "2"));
         reject_pending(&pool, &pk, p, c, "2").await.unwrap();
-        assert_eq!(post_files_any(&pool, p, c, "2").await.unwrap().len(), 0);
+        assert!(!pending_posts_for(&pool, &pk, p, c, 100, 0).await.unwrap().iter().any(|r| r.post_id == "2"));
+        assert!(!post_is_visible(&pool, p, c, "2").await.unwrap());
 
         sqlx::query("DELETE FROM manifests WHERE creator_id = $1")
             .bind(&creator_id)

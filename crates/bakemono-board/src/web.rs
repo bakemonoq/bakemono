@@ -1,7 +1,9 @@
 use std::io::SeekFrom;
 use std::net::{IpAddr, SocketAddr};
 use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll};
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Form, FromRef, Path, Query, State};
@@ -16,7 +18,7 @@ use chrono::Utc;
 use maud::{html, Markup, PreEscaped, DOCTYPE};
 use nostr_sdk::prelude::{Client, Event, Keys, PublicKey, ToBech32};
 use sqlx::postgres::PgPool;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, ReadBuf};
 use tokio_util::io::ReaderStream;
 
 use bakemono_core::{Takedown, Target};
@@ -1227,9 +1229,29 @@ async fn gateway_file(
         }
     }
     match state.gateway.open(&magnet, file_index).await {
-        Ok(file) => private_if(stream_file(file, &headers).await, private),
+        Ok(file) => {
+            let verify = verify_context(&state, &magnet, file_index).await;
+            private_if(stream_file(file, &headers, verify).await, private)
+        }
         Err(e) => (StatusCode::BAD_GATEWAY, format!("swarm error: {e:#}")).into_response(),
     }
+}
+
+// build the check the stream runs against: the sha256 and size this infohash+file is supposed to have.
+// None when we already hashed it once (don't re-hash on every serve) or when nothing declares its bytes
+async fn verify_context(state: &AppState, magnet: &str, file_index: usize) -> Option<VerifyContext> {
+    let infohash = bakemono_torrent::infohash_from_magnet(magnet)?;
+    if db::is_verified(&state.pool, &infohash, file_index).await.unwrap_or(true) {
+        return None;
+    }
+    let (expected_hash, size) = db::expected_content(&state.pool, &infohash, file_index).await.ok()??;
+    Some(VerifyContext {
+        pool: state.pool.clone(),
+        infohash,
+        file_index,
+        expected_hash,
+        expected_size: size as u64,
+    })
 }
 
 // warm content serves from disk and is never limited; a cold miss joins a swarm, so cap how fast one
@@ -1286,6 +1308,11 @@ fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
 async fn resolve_gateway(state: &AppState, infohash: &str, headers: &HeaderMap) -> Option<(String, bool)> {
     let infohash = infohash.trim().to_ascii_lowercase();
     if infohash.len() != 40 || !infohash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    // bytes served here once failed to hash to their manifest's claim, so the whole infohash is fraudulent;
+    // refuse it for everyone, mods included
+    if db::is_quarantined(&state.pool, &infohash).await.unwrap_or(false) {
         return None;
     }
     if public_infohash(state, &infohash).await {
@@ -1361,7 +1388,11 @@ fn private_if(mut resp: Response, private: bool) -> Response {
     resp
 }
 
-async fn stream_file(mut file: bakemono_torrent::OpenFile, headers: &HeaderMap) -> Response {
+async fn stream_file(
+    mut file: bakemono_torrent::OpenFile,
+    headers: &HeaderMap,
+    verify: Option<VerifyContext>,
+) -> Response {
     let total = file.size;
     let range = headers
         .get(header::RANGE)
@@ -1378,8 +1409,12 @@ async fn stream_file(mut file: bakemono_torrent::OpenFile, headers: &HeaderMap) 
             let cr = format!("bytes {start}-{end}/{total}");
             (StatusCode::PARTIAL_CONTENT, body, len, Some(cr))
         }
+        // only a whole-file read can be hashed end to end, so verification rides the un-ranged serve
         None => {
-            let body = Body::from_stream(ReaderStream::new(file.stream));
+            let body = match verify {
+                Some(ctx) => Body::from_stream(ReaderStream::new(VerifyingRead::new(file.stream, ctx))),
+                None => Body::from_stream(ReaderStream::new(file.stream)),
+            };
             (StatusCode::OK, body, total, None)
         }
     };
@@ -1401,6 +1436,81 @@ async fn stream_file(mut file: bakemono_torrent::OpenFile, headers: &HeaderMap) 
         h.insert(header::CONTENT_RANGE, cr);
     }
     resp
+}
+
+// what the streamed bytes are supposed to hash to, carried to the finalizer that runs at end of stream
+struct VerifyContext {
+    pool: PgPool,
+    infohash: String,
+    file_index: usize,
+    expected_hash: String,
+    expected_size: u64,
+}
+
+// wraps the file stream, sha256s the bytes as the client reads them, and at end of stream records whether
+// they matched the manifest's claim. a mismatch quarantines the infohash; a match may promote re-publishes
+struct VerifyingRead {
+    inner: Pin<Box<dyn bakemono_torrent::SeekableRead>>,
+    hasher: Sha256,
+    len: u64,
+    ctx: Option<VerifyContext>,
+}
+
+impl VerifyingRead {
+    fn new(inner: Pin<Box<dyn bakemono_torrent::SeekableRead>>, ctx: VerifyContext) -> Self {
+        Self { inner, hasher: Sha256::new(), len: 0, ctx: Some(ctx) }
+    }
+}
+
+impl AsyncRead for VerifyingRead {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let start = buf.filled().len();
+        let r = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &r {
+            let fresh = &buf.filled()[start..];
+            if fresh.is_empty() {
+                // a zero-length read is EOF: the client saw the whole file, so finalize exactly once
+                if let Some(ctx) = this.ctx.take() {
+                    let digest = hex_lower(this.hasher.finalize_reset());
+                    let len = this.len;
+                    tokio::spawn(finish_verification(ctx, digest, len));
+                }
+            } else {
+                this.hasher.update(fresh);
+                this.len += fresh.len() as u64;
+            }
+        }
+        r
+    }
+}
+
+async fn finish_verification(ctx: VerifyContext, digest: String, len: u64) {
+    let ok = len == ctx.expected_size && digest == ctx.expected_hash;
+    if db::record_verification(&ctx.pool, &ctx.infohash, ctx.file_index, &digest, ok, len)
+        .await
+        .is_ok()
+        && ok
+    {
+        let _ = db::promote_trusted_for(&ctx.pool, &ctx.infohash).await;
+    }
+    if !ok {
+        tracing::warn!(infohash = %ctx.infohash, file = ctx.file_index, "served bytes do not match manifest hash, quarantined");
+    }
+}
+
+fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
+    let bytes = bytes.as_ref();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+        out.push(char::from_digit((b & 0xf) as u32, 16).unwrap());
+    }
+    out
 }
 
 // one "bytes=start-end" range; suffix ("-N") and open-ended ("N-") forms supported, multi-range is not
