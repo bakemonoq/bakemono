@@ -415,13 +415,27 @@ pub async fn post_files_any(
     Ok(rows)
 }
 
-// mod-only: every file a contributor uploaded, deduped by hash, ordered so posts stay contiguous
+// every file a contributor uploaded, deduped by hash, ordered so posts stay contiguous
 pub async fn pubkey_files(pool: &PgPool, pubkey: &str) -> Result<Vec<ManifestRow>> {
     let rows = sqlx::query_as::<_, ManifestRow>(
         "SELECT * FROM (
              SELECT DISTINCT ON (file_hash) * FROM manifests WHERE pubkey = $1
              ORDER BY file_hash, created_at DESC
          ) t ORDER BY platform, creator_id, post_id, file_index",
+    )
+    .bind(pubkey)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+// which of a contributor's posts are actually public, for the uploader status page
+pub async fn visible_posts_for_pubkey(
+    pool: &PgPool,
+    pubkey: &str,
+) -> Result<Vec<(String, String, String)>> {
+    let rows = sqlx::query_as(
+        "SELECT DISTINCT platform, creator_id, post_id FROM visible_manifests WHERE pubkey = $1",
     )
     .bind(pubkey)
     .fetch_all(pool)
@@ -1070,6 +1084,7 @@ pub struct ManifestRow {
     pub content: String,
     pub thumb: Option<String>,
     pub infohash: Option<String>,
+    pub status: String,
 }
 
 const SCHEMA: &str = "

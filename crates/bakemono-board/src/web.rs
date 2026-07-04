@@ -1,6 +1,6 @@
 use std::io::SeekFrom;
 use std::net::{IpAddr, SocketAddr};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::body::Body;
@@ -55,6 +55,7 @@ pub fn router(state: AppState) -> Router {
         .route("/info", get(info_page))
         .route("/c/{platform}/{creator_id}", get(creator_page))
         .route("/p/{platform}/{creator_id}/{post_id}", get(post_page))
+        .route("/u/{pubkey}", get(uploader_page))
         .route("/mod", get(mod_queue))
         .route("/mod/queue-approve", post(mod_queue_approve))
         .route("/mod/queue-reject", post(mod_queue_reject))
@@ -1072,6 +1073,119 @@ fn carousel(files: &[db::ManifestRow]) -> Markup {
             @if multi { button.cnext type="button" aria-label="Next image" { (PreEscaped(ICON_NEXT)) } }
             @if multi { div.ccount {} }
         }
+    }
+}
+
+// public: a contributor's posts with their moderation state, so a publisher can tell whether this
+// board received their events and what still waits on review
+async fn uploader_page(State(pool): State<PgPool>, Path(pubkey): Path<String>) -> Response {
+    let Ok(pk) = PublicKey::parse(&pubkey) else {
+        return (StatusCode::NOT_FOUND, "not a pubkey").into_response();
+    };
+    let hex = pk.to_hex();
+    let files = db::pubkey_files(&pool, &hex).await.unwrap_or_default();
+    let live: HashSet<(String, String, String)> = db::visible_posts_for_pubkey(&pool, &hex)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let groups = upload_groups(&files, &live);
+    let live_count = groups.iter().filter(|g| g.state == UploadState::Live).count();
+    let pending_count = groups.iter().filter(|g| g.state == UploadState::Pending).count();
+    let removed_count = groups.len() - live_count - pending_count;
+    render(
+        "contributor",
+        html! {
+            h1 { "Contributor" }
+            p { code { (npub(&hex)) } }
+            @if groups.is_empty() {
+                p.muted { "This board has not seen any manifests from this key. If you published just now, allow a minute for the relays; otherwise check that your relay list overlaps the board's" }
+            } @else {
+                p.muted {
+                    (groups.len()) @if groups.len() == 1 { " post: " } @else { " posts: " }
+                    (live_count) " live, " (pending_count) " pending review"
+                    @if removed_count > 0 { ", " (removed_count) " removed" }
+                }
+                p.muted { "Pending posts wait in the mod queue and are not public yet. A rejected post leaves this list; re-publishing queues it again" }
+                @for g in &groups {
+                    div.postgroup {
+                        h3 {
+                            @if g.state == UploadState::Live {
+                                a href=(format!("/p/{}/{}/{}", g.platform, g.creator_id, g.post_id)) { (g.title) }
+                            } @else { (g.title) }
+                            " " (state_chip(&g.state))
+                        }
+                        p.muted {
+                            span.chip.platform { (pretty_platform(g.platform)) }
+                            " " (g.files) @if g.files == 1 { " file" } @else { " files" }
+                            " - " (human_size(g.bytes))
+                        }
+                    }
+                }
+            }
+        },
+    )
+    .into_response()
+}
+
+#[derive(PartialEq)]
+enum UploadState {
+    Live,
+    Pending,
+    Removed,
+}
+
+struct UploadGroup<'a> {
+    platform: &'a str,
+    creator_id: &'a str,
+    post_id: &'a str,
+    title: &'a str,
+    latest: i64,
+    files: usize,
+    bytes: i64,
+    state: UploadState,
+}
+
+// fold a contributor's files (already post-contiguous) into one entry per post, newest post first
+fn upload_groups<'a>(
+    files: &'a [db::ManifestRow],
+    live: &HashSet<(String, String, String)>,
+) -> Vec<UploadGroup<'a>> {
+    let mut groups: Vec<UploadGroup> = Vec::new();
+    for f in files {
+        let same_post = groups.last().is_some_and(|g| {
+            g.platform == f.platform && g.creator_id == f.creator_id && g.post_id == f.post_id
+        });
+        if !same_post {
+            let key = (f.platform.clone(), f.creator_id.clone(), f.post_id.clone());
+            groups.push(UploadGroup {
+                platform: &f.platform,
+                creator_id: &f.creator_id,
+                post_id: &f.post_id,
+                title: f.post_title.as_deref().unwrap_or(&f.post_id),
+                latest: 0,
+                files: 0,
+                bytes: 0,
+                state: if live.contains(&key) { UploadState::Live } else { UploadState::Removed },
+            });
+        }
+        let g = groups.last_mut().expect("group just pushed");
+        g.files += 1;
+        g.bytes += f.size;
+        g.latest = g.latest.max(f.created_at);
+        if g.state != UploadState::Live && f.status == "pending" {
+            g.state = UploadState::Pending;
+        }
+    }
+    groups.sort_by_key(|g| std::cmp::Reverse(g.latest));
+    groups
+}
+
+fn state_chip(state: &UploadState) -> Markup {
+    match state {
+        UploadState::Live => html! { span.chip.ok { "live" } },
+        UploadState::Pending => html! { span.chip { "pending review" } },
+        UploadState::Removed => html! { span.chip.danger { "removed" } },
     }
 }
 
@@ -2683,6 +2797,7 @@ main { max-width:1240px; margin:0 auto; padding:1.4rem 1.1rem 3rem }
   color:var(--subtext1); font-size:.72rem; font-weight:600 }
 .chip.platform { background:color-mix(in srgb, var(--accent) 22%, var(--surface1)); color:var(--text) }
 .chip.danger { background:color-mix(in srgb, var(--red) 26%, var(--surface1)); color:var(--text); font-weight:700 }
+.chip.ok { background:color-mix(in srgb, var(--green) 22%, var(--surface1)); color:var(--text) }
 
 .filters { display:flex; flex-wrap:wrap; align-items:center; gap:.6rem; margin:0 0 1rem }
 .searchfield { position:relative; display:flex; align-items:center; flex:1; min-width:220px }
@@ -3031,7 +3146,38 @@ for (const el of document.querySelectorAll('.carousel')) {
 mod tests {
     use super::{build_feed, choose_alternate, endangered_item, feed_item, pretty_date};
     use super::{report_token, verify_report_token, ReportLimiter, REPORT_WINDOW_SECS};
+    use super::{upload_groups, UploadState};
     use crate::db::{EndangeredRow, ManifestRow};
+
+    #[test]
+    fn upload_groups_fold_posts_and_rank_newest_first() {
+        let mut old_live = row("e1", 10);
+        let mut old_live_2 = row("e2", 20);
+        old_live_2.file_hash = "h2".into();
+        let mut queued = row("e3", 15);
+        queued.post_id = "p2".into();
+        queued.status = "pending".into();
+        let mut gone = row("e4", 5);
+        gone.post_id = "p3".into();
+        old_live.size = 1;
+        old_live_2.size = 2;
+        let files = vec![old_live, old_live_2, queued, gone];
+        let live = std::iter::once(("patreon".to_string(), "c1".to_string(), "p1".to_string())).collect();
+
+        let groups = upload_groups(&files, &live);
+
+        assert_eq!(groups.len(), 3);
+        // p1 carries the newest event so it leads despite sitting first in post order too
+        assert_eq!(groups[0].post_id, "p1");
+        assert!(groups[0].state == UploadState::Live);
+        assert_eq!(groups[0].files, 2);
+        assert_eq!(groups[0].bytes, 3);
+        assert_eq!(groups[1].post_id, "p2");
+        assert!(groups[1].state == UploadState::Pending);
+        // approved but absent from the visible set means a takedown removed it
+        assert_eq!(groups[2].post_id, "p3");
+        assert!(groups[2].state == UploadState::Removed);
+    }
 
     #[test]
     fn alternate_kicks_in_only_for_a_probed_dead_swarm() {
@@ -3178,6 +3324,7 @@ mod tests {
             content: "body".into(),
             thumb: None,
             infohash: None,
+            status: "approved".into(),
         }
     }
 }
