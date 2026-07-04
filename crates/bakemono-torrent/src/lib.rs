@@ -14,6 +14,7 @@ use librqbit::api::TorrentIdOrHash;
 use librqbit::limits::LimitsConfig;
 use librqbit::{
     AddTorrent, AddTorrentOptions, CreateTorrentOptions, ManagedTorrent, Session, SessionOptions,
+    SessionPersistenceConfig,
 };
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncSeek};
@@ -574,6 +575,7 @@ pub struct Seeder {
     session: Arc<Session>,
     trackers: Vec<String>,
     staging: PathBuf,
+    lean: bool,
 }
 
 impl Seeder {
@@ -586,13 +588,27 @@ impl Seeder {
     ) -> Result<Self> {
         std::fs::create_dir_all(&session_dir)
             .with_context(|| format!("creating session dir {}", session_dir.display()))?;
+        // a pinned board seeder is dialed directly, so it needs no DHT/tracker discovery at all; dropping
+        // both is what keeps a library of thousands of per-file torrents inside a home-grade memory budget
+        let lean = std::env::var("BAKEMONO_SEED_LEAN")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false);
         let opts = SessionOptions {
-            persistence: None,
+            // persist the piece map and fast-resume from it, so a restart never re-hashes the whole
+            // library (that re-validation is what spiked memory and OOM-looped a large seeder)
+            persistence: Some(SessionPersistenceConfig::Json {
+                folder: Some(session_dir.join("resume")),
+            }),
+            fastresume: true,
+            // bound how many torrents hash at once so even a cold first run cannot spike memory
+            concurrent_init_limit: Some(8),
+            disable_dht: lean,
             // reuse of the stored DHT port collides when several sessions run on one host; take a fresh port
             disable_dht_persistence: true,
             listen_port_range: listen_port.map(|p| p..p + 1),
-            // a home seeder is behind NAT; map the listen port so the board gateway can actually dial it
-            enable_upnp_port_forwarding: true,
+            // a home seeder is behind NAT; map the listen port so the board gateway can actually dial it.
+            // a pinned seeder is reached directly, so it skips uPnP too
+            enable_upnp_port_forwarding: !lean,
             // session-wide rate caps in bytes/sec; None (or 0) is unlimited
             ratelimits: LimitsConfig {
                 upload_bps: up_bps.and_then(NonZeroU32::new),
@@ -608,6 +624,7 @@ impl Seeder {
             session,
             trackers,
             staging,
+            lean,
         })
     }
 
@@ -657,6 +674,7 @@ impl Seeder {
                     output_folder,
                     overwrite: true,
                     trackers: Some(self.trackers.clone()),
+                    disable_trackers: self.lean,
                     ..Default::default()
                 }),
             )
