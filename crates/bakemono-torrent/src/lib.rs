@@ -167,8 +167,8 @@ impl Gateway {
     pub async fn open(&self, magnet: &str, file_index: usize) -> Result<OpenFile> {
         let infohash =
             infohash_from_magnet(magnet).ok_or_else(|| anyhow!("magnet carries no infohash"))?;
-        // cache hit: a fully-downloaded file serves straight from disk over HTTP, no torrent, no peer.
-        // scoped to single-file torrents (index 0), which is what our manifests produce
+        // cache hit: a fully-downloaded single-file torrent serves straight from disk, no torrent, no
+        // peer. complete_file only fires for a lone content file, so a bundle always falls through to add
         if file_index == 0 {
             if let Some((path, size)) = self.cache.complete_file(&infohash) {
                 let file = tokio::fs::File::open(&path)
@@ -281,8 +281,8 @@ impl Gateway {
         };
         // a bundle serves many files under one infohash. the first request adds it with only_files=[i];
         // a later request for a different file finds it already managed, and add_torrent ignores the new
-        // selection, so that file never downloads and its stream hangs. union the request into the live
-        // selection. only_files() None means every file is already selected
+        // selection, so that file stays unselected and only downloads if the read happens to trigger it.
+        // widen the live selection so the picker fetches it outright. only_files() None means all selected
         if let Some(current) = handle.only_files() {
             if !selected.iter().all(|i| current.contains(i)) {
                 let mut want: HashSet<usize> = current.into_iter().collect();
@@ -425,19 +425,27 @@ impl Cache {
 
     // the cached file for an infohash, but only if its download finished (a .done marker is present),
     // so it serves from disk with no peer. single-file torrents, so returns the one non-marker file
+    // the disk fast-path can only serve a single-file torrent: there file 0 IS the whole torrent, so the
+    // .done marker means it is complete. a bundle dir holds many files, most allocated but never fetched
+    // (zero-filled), and .done fires when just the one selected file finishes - serving "the first file"
+    // would hand back another file's zeros. bail on any dir with more than one content file and let the
+    // caller route through the session, which serves the real bytes per index
     fn complete_file(&self, infohash: &str) -> Option<(PathBuf, u64)> {
         let dir = self.dir.join(infohash);
         if !dir.join(".done").is_file() {
             return None;
         }
+        let mut found: Option<(PathBuf, u64)> = None;
         for e in std::fs::read_dir(&dir).ok()?.flatten() {
             let p = e.path();
             if p.is_file() && p.file_name().map(|n| n != ".done").unwrap_or(false) {
-                let size = e.metadata().ok()?.len();
-                return Some((p, size));
+                if found.is_some() {
+                    return None;
+                }
+                found = Some((p, e.metadata().ok()?.len()));
             }
         }
-        None
+        found
     }
 
     async fn evict(&self, session: &Session) {
@@ -1010,24 +1018,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    // a post bundle is one infohash with many files; the browser opens them in sequence. the second open
-    // finds the torrent already managed, and add_torrent ignores its only_files, so without widening the
-    // live selection the file never downloads and its stream hangs. dial a complete seeder and drain both
+    // the .done disk fast-path may only serve a single-file torrent. a bundle dir holds many files, most
+    // zero-filled until fetched, and .done fires when one selected file finishes - so returning any file
+    // would hand back another's zeros. one content file -> serve it; more than one -> None
+    #[test]
+    fn complete_file_only_serves_a_single_file_dir() {
+        let base = std::env::temp_dir().join(format!("cf-single-{}", std::process::id()));
+        let cache = Cache::load(base.clone(), 1 << 30).unwrap();
+
+        let one = base.join("aaaa");
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::write(one.join("file.jpg"), vec![7u8; 500]).unwrap();
+        std::fs::write(one.join(".done"), b"").unwrap();
+        assert!(cache.complete_file("aaaa").is_some(), "single-file dir must serve");
+
+        let many = base.join("bbbb");
+        std::fs::create_dir_all(&many).unwrap();
+        std::fs::write(many.join("real.jpg"), vec![7u8; 500]).unwrap();
+        std::fs::write(many.join("blank.bin"), vec![0u8; 4000]).unwrap();
+        std::fs::write(many.join(".done"), b"").unwrap();
+        assert!(cache.complete_file("bbbb").is_none(), "bundle dir must not serve a zero-filled file");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // reproduces the "images load blank" bug end to end: fetch the second bundle file first so the dir's
+    // .done marker is written while the first file is still zero-filled on disk, then open the first file
+    // and prove the gateway serves its real bytes, not the zero-fill the fast-path used to hand back
     #[tokio::test]
-    async fn gateway_serves_every_file_in_a_bundle() {
+    async fn gateway_serves_real_bytes_not_cached_zeros() {
         use tokio::io::AsyncReadExt;
         let root = std::env::temp_dir().join(format!("gw-bundle-{}", std::process::id()));
         let bdir = root.join("seed").join("b");
         std::fs::create_dir_all(&bdir).unwrap();
-        // piece-aligned so file 1 lives entirely in pieces file 0 never touches: only_files=[0] must not
-        // drag file 1's pieces in incidentally, or the test can't tell the fix from librqbit's picker
-        std::fs::write(bdir.join("0aaa"), vec![1u8; 1 << 20]).unwrap();
-        std::fs::write(bdir.join("1bbb"), vec![2u8; 2 << 20]).unwrap();
+        // distinct content per file so a zero-fill or wrong-file serve is detectable, not just a length
+        std::fs::write(bdir.join("a"), vec![0xAAu8; 2 << 20]).unwrap();
+        std::fs::write(bdir.join("b"), vec![0xBBu8; 1 << 20]).unwrap();
         let built = build_bundle(
             "b",
             vec![
-                BundleFile { rel: "0aaa".into(), path: bdir.join("0aaa") },
-                BundleFile { rel: "1bbb".into(), path: bdir.join("1bbb") },
+                BundleFile { rel: "a".into(), path: bdir.join("a") },
+                BundleFile { rel: "b".into(), path: bdir.join("b") },
             ],
             1 << 20,
         )
@@ -1071,23 +1101,33 @@ mod tests {
         .await
         .unwrap();
 
-        // drain file 0 fully first (as a browser loads the first image), so the torrent finishes its
-        // selection before file 1 is ever requested - the exact order that strands later bundle files
-        let mut f0 = gw.open(&magnet, 0).await.expect("file 0 opens");
-        let mut b0 = Vec::new();
-        tokio::time::timeout(Duration::from_secs(30), f0.stream.read_to_end(&mut b0))
-            .await
-            .expect("file 0 must not hang")
-            .unwrap();
-        let mut f1 = gw.open(&magnet, 1).await.expect("file 1 opens");
-        let mut b1 = Vec::new();
-        tokio::time::timeout(Duration::from_secs(30), f1.stream.read_to_end(&mut b1))
+        // fetch file 1 first: this completes it and drops the dir's .done marker while file 0 is untouched
+        let mut fb = gw.open(&magnet, 1).await.expect("file 1 opens");
+        let mut bb = Vec::new();
+        tokio::time::timeout(Duration::from_secs(30), fb.stream.read_to_end(&mut bb))
             .await
             .expect("file 1 must not hang")
             .unwrap();
+        assert!(bb.len() == 1 << 20 && bb.iter().all(|&x| x == 0xBB), "file 1 corrupt");
 
+        let done = root.join("gw").join(&built.info_hash).join(".done");
+        for _ in 0..300 {
+            if done.is_file() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(done.is_file(), "completion marker never written");
+
+        // now file 0 through the fast-path: it must fetch the real bytes, not serve file 0's zero-fill
+        let mut fa = gw.open(&magnet, 0).await.expect("file 0 opens");
+        let mut ba = Vec::new();
+        tokio::time::timeout(Duration::from_secs(30), fa.stream.read_to_end(&mut ba))
+            .await
+            .expect("file 0 must not hang")
+            .unwrap();
         std::fs::remove_dir_all(&root).ok();
-        assert_eq!(b0.len(), 1 << 20);
-        assert_eq!(b1.len(), 2 << 20, "second bundle file must stream, not hang");
+        assert_eq!(ba.len(), 2 << 20, "file 0 wrong length");
+        assert!(ba.iter().all(|&x| x == 0xAA), "file 0 served zeros or the wrong file");
     }
 }
