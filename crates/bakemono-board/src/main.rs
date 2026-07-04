@@ -6,6 +6,7 @@ mod instance;
 mod ratelimit;
 mod sanitize;
 mod trusted_proxy;
+mod verifier;
 mod web;
 
 use std::net::SocketAddr;
@@ -47,6 +48,8 @@ async fn main() -> Result<()> {
 
     let health_pool = pool.clone();
     tokio::spawn(health::run(health_pool, bakemono_core::default_trackers()));
+
+    tokio::spawn(verifier::run(pool.clone(), gateway.clone()));
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!("board on http://{bind}");

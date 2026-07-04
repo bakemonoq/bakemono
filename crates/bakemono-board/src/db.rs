@@ -52,13 +52,13 @@ pub async fn upsert(pool: &PgPool, event: &Event, manifest: &Manifest) -> Result
         .execute(pool)
         .await?;
     // if these exact bytes were already vetted under another contributor (a human approved this file_hash
-    // and we verified an infohash serves it), a re-publish of the same content is just more swarm - approve
-    // it outright. anything unproven stays pending for a human
+    // and we verified an infohash serves it), a re-publish is just more swarm - approve it outright.
+    // everything else lands 'unverified': the verifier must hash its bytes before it can reach a mod
     let infohash = bakemono_torrent::infohash_from_magnet(&manifest.magnet);
     let status = if content_trusted(pool, infohash.as_deref(), manifest.file_index, &manifest.file_hash).await? {
         "approved"
     } else {
-        "pending"
+        "unverified"
     };
     sqlx::query(INSERT)
         .bind(&event_id)
@@ -402,24 +402,61 @@ pub async fn promote_trusted(pool: &PgPool) -> Result<u64> {
     Ok(res.rows_affected())
 }
 
-// promote_trusted scoped to a single infohash, cheap enough to run right after the gateway verifies one:
-// a pending re-publish of freshly-verified bytes clears the moment the original bytes prove out
-pub async fn promote_trusted_for(pool: &PgPool, infohash: &str) -> Result<u64> {
-    let res = sqlx::query(
-        "UPDATE manifests m SET status = 'approved'
-         WHERE m.status = 'pending' AND m.infohash = $1
-           AND EXISTS (
-               SELECT 1 FROM verified_content v
-               WHERE v.infohash = m.infohash AND v.file_index = m.file_index AND v.ok AND v.sha256 = m.file_hash
-           )
-           AND EXISTS (
-               SELECT 1 FROM manifests a WHERE a.file_hash = m.file_hash AND a.status = 'approved'
-           )",
-    )
-    .bind(infohash)
-    .execute(pool)
-    .await?;
+// once an infohash+file has been byte-checked, settle every manifest that points at it. a match with an
+// already-approved twin goes public, a match that is new content goes to the mod queue, a mismatch rejects
+// the lot (fraudulent bytes). approved manifests are only ever pulled back by a mismatch
+pub async fn apply_verification(
+    pool: &PgPool,
+    infohash: &str,
+    file_index: usize,
+    ok: bool,
+) -> Result<u64> {
+    let sql = if ok {
+        "UPDATE manifests m SET status = CASE
+             WHEN EXISTS (SELECT 1 FROM manifests a WHERE a.file_hash = m.file_hash AND a.status = 'approved')
+             THEN 'approved' ELSE 'pending' END
+         WHERE m.infohash = $1 AND m.file_index = $2 AND m.status IN ('unverified', 'pending')"
+    } else {
+        "UPDATE manifests SET status = 'rejected'
+         WHERE infohash = $1 AND file_index = $2 AND status <> 'rejected'"
+    };
+    let res = sqlx::query(sql)
+        .bind(infohash)
+        .bind(file_index as i32)
+        .execute(pool)
+        .await?;
     Ok(res.rows_affected())
+}
+
+#[derive(sqlx::FromRow)]
+pub struct VerifyJob {
+    pub infohash: String,
+    pub file_index: i32,
+    pub file_hash: String,
+    pub size: i64,
+    pub magnet: String,
+}
+
+// content still owed the required byte-check, one row per distinct (infohash, file). brand-new content is
+// ordered first so nothing sits invisible for long, the current queue next; approved content is left to
+// verify lazily on serve. same bytes across contributors share an infohash, so each is hashed once
+pub async fn unverified_batch(pool: &PgPool, limit: i64) -> Result<Vec<VerifyJob>> {
+    let rows = sqlx::query_as::<_, VerifyJob>(
+        "SELECT infohash, file_index, MAX(file_hash) AS file_hash, MAX(size) AS size, MAX(magnet) AS magnet
+         FROM manifests m
+         WHERE m.infohash IS NOT NULL
+           AND m.status IN ('unverified', 'pending')
+           AND NOT EXISTS (
+               SELECT 1 FROM verified_content v WHERE v.infohash = m.infohash AND v.file_index = m.file_index
+           )
+         GROUP BY infohash, file_index
+         ORDER BY MIN(CASE status WHEN 'unverified' THEN 0 ELSE 1 END), MAX(created_at) DESC
+         LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
 }
 
 // tombstone pending posts in the same scope instead of deleting them: the resync refetches every
@@ -455,8 +492,10 @@ pub async fn reject_pending(
 
 // drop pending manifests left unreviewed past the ttl so an abandoned flood self-heals
 pub async fn gc_pending(pool: &PgPool, ttl_secs: i64) -> Result<u64> {
+    // unverified content that never proved out (no seeder ever answered) is stale garbage just like an
+    // un-moderated pending post, so collect both
     let res = sqlx::query(
-        "DELETE FROM manifests WHERE status = 'pending'
+        "DELETE FROM manifests WHERE status IN ('pending', 'unverified')
            AND created_at < EXTRACT(EPOCH FROM now())::bigint - $1",
     )
     .bind(ttl_secs)
@@ -1450,7 +1489,7 @@ mod tests {
         let mut manifest = sample(&creator_id);
 
         let older = manifest.to_event_at(&keys, 1_000).unwrap();
-        upsert(&pool, &older, &manifest).await.unwrap();
+        ingest_ok(&pool, &older, &manifest).await;
         approve_pending(&pool, &keys.public_key().to_hex(), "", "", "")
             .await
             .unwrap();
@@ -1463,7 +1502,7 @@ mod tests {
         // newer event, same (pubkey, d) -> replaces the older per NIP-33
         manifest.size = 999;
         let newer = manifest.to_event_at(&keys, 2_000).unwrap();
-        upsert(&pool, &newer, &manifest).await.unwrap();
+        ingest_ok(&pool, &newer, &manifest).await;
         // a replacement re-enters the queue as pending, so approve it before the visible check
         approve_pending(&pool, &keys.public_key().to_hex(), "", "", "")
             .await
@@ -1503,8 +1542,8 @@ mod tests {
         let kb = Keys::generate();
         let a = manifest.to_event(&ka).unwrap();
         let b = manifest.to_event(&kb).unwrap();
-        upsert(&pool, &a, &manifest).await.unwrap();
-        upsert(&pool, &b, &manifest).await.unwrap();
+        ingest_ok(&pool, &a, &manifest).await;
+        ingest_ok(&pool, &b, &manifest).await;
         approve_pending(&pool, &ka.public_key().to_hex(), "", "", "").await.unwrap();
         approve_pending(&pool, &kb.public_key().to_hex(), "", "", "").await.unwrap();
 
@@ -1535,6 +1574,17 @@ mod tests {
         m
     }
 
+    // upsert then stand in for the verifier: the bytes check out, so the manifest advances from 'unverified'
+    // to its resting state (the mod queue, or straight to approved if these bytes were already vetted)
+    async fn ingest_ok(pool: &PgPool, event: &Event, m: &Manifest) {
+        upsert(pool, event, m).await.unwrap();
+        let ih = bakemono_torrent::infohash_from_magnet(&m.magnet).unwrap();
+        record_verification(pool, &ih, m.file_index as usize, &m.file_hash, true, m.size)
+            .await
+            .unwrap();
+        apply_verification(pool, &ih, m.file_index as usize, true).await.unwrap();
+    }
+
     // the core of the content-trust model: once a human approves a file and the gateway verifies its bytes,
     // a different contributor publishing the identical bytes is auto-approved, while unproven bytes are not
     #[tokio::test]
@@ -1554,30 +1604,35 @@ mod tests {
         let ih = "1".repeat(40);
         let fh = "a".repeat(64);
 
-        // A: first sighting -> pending, no human, no verification yet
+        // A: first sighting -> unverified, hidden from the mod queue until its bytes are checked
         let ka = Keys::generate();
         let ma = manifest_with(&cid, &ih, &fh);
         let ea = ma.to_event(&ka).unwrap();
         upsert(&pool, &ea, &ma).await.unwrap();
-        assert_eq!(status_of(&pool, &ea.id.to_hex()).await, "pending");
+        assert_eq!(status_of(&pool, &ea.id.to_hex()).await, "unverified");
 
-        // a human approves A and the gateway verifies A's bytes really hash to fh
-        approve_pending(&pool, &ka.public_key().to_hex(), "", "", "").await.unwrap();
+        // the verifier hashes A's bytes: they match, and nothing is approved yet -> A enters the mod queue
         record_verification(&pool, &ih, 0, &fh, true, 123).await.unwrap();
+        apply_verification(&pool, &ih, 0, true).await.unwrap();
+        assert_eq!(status_of(&pool, &ea.id.to_hex()).await, "pending", "verified new content reaches the mod");
 
-        // B: another contributor, identical verified+approved bytes -> auto-approved at ingest
+        // a human approves A
+        approve_pending(&pool, &ka.public_key().to_hex(), "", "", "").await.unwrap();
+        assert_eq!(status_of(&pool, &ea.id.to_hex()).await, "approved");
+
+        // B: another contributor, identical verified+approved bytes -> auto-approved at ingest, no mod
         let kb = Keys::generate();
         let mb = manifest_with(&cid, &ih, &fh);
         let eb = mb.to_event(&kb).unwrap();
         upsert(&pool, &eb, &mb).await.unwrap();
         assert_eq!(status_of(&pool, &eb.id.to_hex()).await, "approved", "same proven bytes should auto-approve");
 
-        // C: unproven bytes (never approved, never verified) -> still needs a human
+        // C: unproven bytes -> unverified, must not reach the mod until the verifier checks them
         let kc = Keys::generate();
         let mc = manifest_with(&cid, &"2".repeat(40), &"c".repeat(64));
         let ec = mc.to_event(&kc).unwrap();
         upsert(&pool, &ec, &mc).await.unwrap();
-        assert_eq!(status_of(&pool, &ec.id.to_hex()).await, "pending", "unproven content must not auto-approve");
+        assert_eq!(status_of(&pool, &ec.id.to_hex()).await, "unverified", "unproven content must not auto-approve");
 
         // a served-bytes mismatch quarantines that infohash, and only that one
         let bad = "9".repeat(40);
@@ -1609,20 +1664,22 @@ mod tests {
         let ih = "3".repeat(40);
         let fh = "b".repeat(64);
 
-        // A verified but not yet approved; B (same bytes) lands first and sits pending
+        // A and B are the same bytes from two contributors; both ingest unverified
         let ka = Keys::generate();
         let ma = manifest_with(&cid, &ih, &fh);
         let ea = ma.to_event(&ka).unwrap();
         upsert(&pool, &ea, &ma).await.unwrap();
-        record_verification(&pool, &ih, 0, &fh, true, 123).await.unwrap();
-
         let kb = Keys::generate();
         let mb = manifest_with(&cid, &ih, &fh);
         let eb = mb.to_event(&kb).unwrap();
         upsert(&pool, &eb, &mb).await.unwrap();
+
+        // the verifier checks the bytes (one hash covers both): new content, so both enter the mod queue
+        record_verification(&pool, &ih, 0, &fh, true, 123).await.unwrap();
+        apply_verification(&pool, &ih, 0, true).await.unwrap();
         assert_eq!(status_of(&pool, &eb.id.to_hex()).await, "pending", "no approved copy yet");
 
-        // approving A makes fh trusted; promote_trusted should sweep B in automatically
+        // approving A makes fh trusted; promote_trusted (run from approve_pending) sweeps B in automatically
         approve_pending(&pool, &ka.public_key().to_hex(), "", "", "").await.unwrap();
         assert_eq!(status_of(&pool, &eb.id.to_hex()).await, "approved", "approving the original promotes the re-publish");
 
@@ -1650,7 +1707,7 @@ mod tests {
         manifest.file_hash = hash.clone();
 
         let event = manifest.to_event(&keys).unwrap();
-        upsert(&pool, &event, &manifest).await.unwrap();
+        ingest_ok(&pool, &event, &manifest).await;
         approve_pending(&pool, &keys.public_key().to_hex(), "", "", "")
             .await
             .unwrap();
@@ -1711,14 +1768,17 @@ mod tests {
         };
         let keys = Keys::generate();
         let creator_id = format!("pp-{}", std::process::id());
-        let manifest = sample(&creator_id);
-        upsert(&pool, &manifest.to_event_at(&keys, 1_000).unwrap(), &manifest)
-            .await
-            .unwrap();
+        let manifest = manifest_with(&creator_id, &"a".repeat(40), &"a".repeat(64));
+        let event = manifest.to_event_at(&keys, 1_000).unwrap();
+
+        // fresh ingest is 'unverified': hidden from the queue until its bytes are checked
+        upsert(&pool, &event, &manifest).await.unwrap();
         let pk = keys.public_key().to_hex();
         let (p, c, post) = (manifest.platform.as_str(), creator_id.as_str(), manifest.post_id.as_str());
+        assert!(!pending_posts_for(&pool, &pk, p, c, 100, 0).await.unwrap().iter().any(|r| r.post_id == post), "unverified is not in the queue");
 
-        // every new post queues as pending -> not public until that specific post is approved
+        // verified new content enters the queue, not public until that specific post is approved
+        ingest_ok(&pool, &event, &manifest).await;
         assert!(!post_is_visible(&pool, p, c, post).await.unwrap());
         assert!(pending_posts_for(&pool, &pk, p, c, 100, 0).await.unwrap().iter().any(|r| r.post_id == post));
 
@@ -1726,12 +1786,11 @@ mod tests {
         assert!(post_is_visible(&pool, p, c, post).await.unwrap());
         assert!(!pending_posts_for(&pool, &pk, p, c, 100, 0).await.unwrap().iter().any(|r| r.post_id == post));
 
-        // a second pending post, rejected, tombstones as a 'rejected' row (so the relay resync cannot
-        // re-ingest it) and drops out of the pending queue
-        let mut m2 = sample(&creator_id);
+        // a second post, rejected, tombstones as a 'rejected' row (so the relay resync cannot re-ingest it)
+        // and drops out of the pending queue
+        let mut m2 = manifest_with(&creator_id, &"b".repeat(40), &"b".repeat(64));
         m2.post_id = "2".into();
-        m2.file_hash = "b".repeat(64);
-        upsert(&pool, &m2.to_event_at(&keys, 2_000).unwrap(), &m2).await.unwrap();
+        ingest_ok(&pool, &m2.to_event_at(&keys, 2_000).unwrap(), &m2).await;
         assert!(pending_posts_for(&pool, &pk, p, c, 100, 0).await.unwrap().iter().any(|r| r.post_id == "2"));
         reject_pending(&pool, &pk, p, c, "2").await.unwrap();
         assert!(!pending_posts_for(&pool, &pk, p, c, 100, 0).await.unwrap().iter().any(|r| r.post_id == "2"));
@@ -1797,7 +1856,7 @@ mod tests {
         let creator_id = format!("rep-{}", std::process::id());
         let manifest = sample(&creator_id);
         let event = manifest.to_event_at(&keys, 1_000).unwrap();
-        upsert(&pool, &event, &manifest).await.unwrap();
+        ingest_ok(&pool, &event, &manifest).await;
         approve_pending(&pool, &keys.public_key().to_hex(), "", "", "")
             .await
             .unwrap();
@@ -1864,7 +1923,7 @@ mod tests {
         let creator_id = format!("ban-{}", std::process::id());
         let manifest = sample(&creator_id);
         let event = manifest.to_event_at(&keys, 1_000).unwrap();
-        upsert(&pool, &event, &manifest).await.unwrap();
+        ingest_ok(&pool, &event, &manifest).await;
         approve_pending(&pool, &keys.public_key().to_hex(), "", "", "")
             .await
             .unwrap();
@@ -2008,6 +2067,13 @@ mod tests {
     }
 
     fn sample(creator_id: &str) -> Manifest {
+        // a valid 40-hex btih derived from the creator, so infohash_from_magnet resolves and each test's
+        // content keys distinctly in verified_content
+        let mut ih: String = creator_id.bytes().map(|b| format!("{b:02x}")).collect();
+        ih.truncate(40);
+        while ih.len() < 40 {
+            ih.push('0');
+        }
         Manifest {
             platform: "patreon".into(),
             creator: "Tester".into(),
@@ -2017,7 +2083,7 @@ mod tests {
             file_hash: "a".repeat(64),
             size: 123,
             mime: "image/jpeg".into(),
-            magnet: "magnet:?xt=urn:btih:abc".into(),
+            magnet: format!("magnet:?xt=urn:btih:{ih}"),
             post_title: Some("hi".into()),
             content: "body".into(),
             ..Default::default()

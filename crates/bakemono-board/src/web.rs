@@ -1494,16 +1494,15 @@ async fn finish_verification(ctx: VerifyContext, digest: String, len: u64) {
     if db::record_verification(&ctx.pool, &ctx.infohash, ctx.file_index, &digest, ok, len)
         .await
         .is_ok()
-        && ok
     {
-        let _ = db::promote_trusted_for(&ctx.pool, &ctx.infohash).await;
+        let _ = db::apply_verification(&ctx.pool, &ctx.infohash, ctx.file_index, ok).await;
     }
     if !ok {
         tracing::warn!(infohash = %ctx.infohash, file = ctx.file_index, "served bytes do not match manifest hash, quarantined");
     }
 }
 
-fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
+pub(crate) fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
     let bytes = bytes.as_ref();
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {

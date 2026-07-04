@@ -401,7 +401,7 @@ mod tests {
             creator_id: creator_id.clone(),
             post_id: "1".into(),
             mime: "image/jpeg".into(),
-            magnet: "magnet:?xt=urn:btih:abc".into(),
+            magnet: format!("magnet:?xt=urn:btih:{}", "a".repeat(40)),
             content: "body".into(),
             ..Default::default()
         };
@@ -412,8 +412,12 @@ mod tests {
             .unwrap();
         publisher.send_event(&manifest_event).await.unwrap();
 
-        // the post lands in the review queue on ingest; approve it so the file would be visible
+        // ingest lands the post 'unverified'; stand in for the verifier (bytes check out) then approve it,
+        // so the file would be visible
+        let ih = "a".repeat(40);
         wait_for(|| async {
+            crate::db::record_verification(&pool, &ih, 0, &hash, true, 1).await.ok();
+            crate::db::apply_verification(&pool, &ih, 0, true).await.ok();
             crate::db::approve_pending(&pool, &contributor.public_key().to_hex(), "", "", "")
                 .await
                 .ok();
