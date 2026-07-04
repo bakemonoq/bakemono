@@ -212,6 +212,19 @@ impl Gateway {
     async fn add(&self, magnet: &str, only_files: Vec<usize>) -> Result<(Arc<ManagedTorrent>, String)> {
         let infohash =
             infohash_from_magnet(magnet).ok_or_else(|| anyhow!("magnet carries no infohash"))?;
+        // a torrent whose peers all dropped stays managed but stalls forever on read; drop it so the add
+        // below re-dials the configured seeder instead of handing back a dead handle
+        if let Ok(id) = TorrentIdOrHash::parse(&infohash) {
+            if let Some(handle) = self.session.get(id) {
+                let stats = handle.stats();
+                if let (false, Some(live)) = (stats.finished, stats.live) {
+                    let peers = &live.snapshot.peer_stats;
+                    if peers.live == 0 && peers.connecting == 0 {
+                        let _ = self.session.delete(id, false).await;
+                    }
+                }
+            }
+        }
         // admit a new infohash only under the ceiling; try to reclaim finished idle torrents first so a
         // steady stream of requests keeps flowing, and never count an already-managed infohash against it
         if self.max_torrents > 0 && !self.cache.is_managed(&infohash) {
