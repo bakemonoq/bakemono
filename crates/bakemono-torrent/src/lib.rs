@@ -1,3 +1,5 @@
+mod post_torrent;
+pub use post_torrent::{build_bundle, BundleFile, BundleTorrent};
 mod scrape;
 pub use scrape::scrape_seeders;
 

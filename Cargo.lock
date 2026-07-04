@@ -440,6 +440,7 @@ dependencies = [
  "hex 0.4.3",
  "librqbit",
  "serde",
+ "sha1",
  "sha2 0.11.0",
  "tokio",
  "tracing",
