@@ -265,6 +265,7 @@ fn sample_manifest() -> Manifest {
         size: 245_760,
         mime: "image/jpeg".into(),
         magnet: "magnet:?xt=urn:btmh:1220abcd&dn=post123_image.jpg".into(),
+        bundle_index: 2,
         filename: Some("post123_image.jpg".into()),
         post_title: Some("March art dump".into()),
         posted_at: Some("2026-03-14T10:00:00Z".into()),

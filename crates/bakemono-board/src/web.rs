@@ -1058,7 +1058,7 @@ fn carousel(files: &[db::ManifestRow]) -> Markup {
         .filter_map(|f| {
             let ih = f.infohash.as_deref()?;
             let video = f.mime.starts_with("video/");
-            Some(format!("{{\"u\":\"/t/{ih}/f/0\",\"v\":{video}}}"))
+            Some(format!("{{\"u\":\"/t/{ih}/f/{}\",\"v\":{video}}}", f.bundle_index))
         })
         .collect();
     if items.is_empty() {
@@ -2113,7 +2113,7 @@ fn file_list(files: &[&db::ManifestRow]) -> Markup {
             @for f in files {
                 li {
                     @match &f.infohash {
-                        Some(ih) => a.filelink href=(format!("/t/{ih}/f/0")) target="_blank" rel="noopener" {
+                        Some(ih) => a.filelink href=(format!("/t/{ih}/f/{}", f.bundle_index)) target="_blank" rel="noopener" {
                             (f.filename.clone().unwrap_or_else(|| format!("file {}", f.file_index)))
                         }
                         None => span { (f.filename.clone().unwrap_or_else(|| format!("file {}", f.file_index))) }
@@ -3324,6 +3324,7 @@ mod tests {
             content: "body".into(),
             thumb: None,
             infohash: None,
+            bundle_index: 0,
             status: "approved".into(),
         }
     }

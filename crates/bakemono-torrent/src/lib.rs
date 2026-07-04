@@ -568,6 +568,28 @@ pub struct SeedInfo {
     pub info_hash: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct BundleSeedInfo {
+    pub magnet: String,
+    pub info_hash: String,
+    // file sha256 hashes in bundle order; a hash's position here is its file_index in the torrent
+    pub order: Vec<String>,
+}
+
+// content-addressed bundle name derived only from the file set, so two contributors of the same post
+// produce the same torrent name and therefore the same infohash
+fn bundle_name(files: &[(PathBuf, String)]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hashes: Vec<&str> = files.iter().map(|(_, s)| s.as_str()).collect();
+    hashes.sort_unstable();
+    hashes.dedup();
+    let mut h = Sha256::new();
+    for s in hashes {
+        h.update(s.as_bytes());
+    }
+    hex::encode(&h.finalize()[..8])
+}
+
 // every client must build byte-identical torrents from the same file, or contributors of one file fork
 // into disjoint swarms that cannot share peers; this constant is part of that contract, never change it
 pub const PIECE_LENGTH: u32 = 1 << 20;
@@ -655,6 +677,55 @@ impl Seeder {
         self.seed_torrent(&file, None).await
     }
 
+    // seed a whole post as ONE torrent instead of one-per-file, to keep the session's per-torrent memory
+    // flat as a library grows. files are (path, sha256); the returned order maps each hash to its file
+    // index in the bundle, which the manifest carries so the gateway can serve a single file back
+    pub async fn seed_bundle(&self, files: Vec<(PathBuf, String)>) -> Result<BundleSeedInfo> {
+        if files.is_empty() {
+            anyhow::bail!("cannot seed an empty bundle");
+        }
+        let bundles_root = self.staging.join("bundles");
+        let name = bundle_name(&files);
+        let bundle_dir = bundles_root.join(&name);
+        std::fs::create_dir_all(&bundle_dir)
+            .with_context(|| format!("creating bundle dir {}", bundle_dir.display()))?;
+        let mut bfiles = Vec::with_capacity(files.len());
+        for (path, sha) in &files {
+            let src = path
+                .canonicalize()
+                .with_context(|| format!("resolving {}", path.display()))?;
+            let staged = bundle_dir.join(sha);
+            if !staged.exists() && std::fs::hard_link(&src, &staged).is_err() && !staged.exists() {
+                std::fs::copy(&src, &staged).with_context(|| format!("staging {}", src.display()))?;
+            }
+            bfiles.push(BundleFile {
+                rel: sha.clone(),
+                path: staged,
+            });
+        }
+        let bname = name.clone();
+        let built =
+            tokio::task::spawn_blocking(move || build_bundle(&bname, bfiles, PIECE_LENGTH)).await??;
+        self.session
+            .add_torrent(
+                AddTorrent::from_bytes(built.torrent),
+                Some(AddTorrentOptions {
+                    output_folder: Some(bundles_root.to_string_lossy().into_owned()),
+                    overwrite: true,
+                    trackers: Some(self.trackers.clone()),
+                    disable_trackers: self.lean,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .context("adding bundle to seed session")?;
+        Ok(BundleSeedInfo {
+            magnet: synth_magnet(&built.info_hash, &self.trackers),
+            info_hash: built.info_hash,
+            order: built.order,
+        })
+    }
+
     // for a complete torrent librqbit only reads the file, it never rewrites content
     async fn seed_torrent(&self, file: &Path, piece_length: Option<u32>) -> Result<SeedInfo> {
         let created = librqbit::create_torrent(
@@ -722,7 +793,7 @@ fn staged_name(hash: &str, file: &Path) -> String {
     }
 }
 
-fn sha256_hex(file: &Path) -> Result<String> {
+pub fn sha256_hex(file: &Path) -> Result<String> {
     use sha2::{Digest, Sha256};
     let mut f =
         std::fs::File::open(file).with_context(|| format!("opening {}", file.display()))?;

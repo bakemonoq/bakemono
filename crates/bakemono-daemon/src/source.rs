@@ -92,6 +92,22 @@ impl ContentSource for AppContentSource {
             .collect()
     }
 
+    // group a post's files (gallery-dl prefixes each filename with the numeric post id) so reseed rebuilds
+    // the same one-bundle-per-post torrents the scrape published
+    fn seedable_bundles(&self, content_dir: &Path) -> Vec<Vec<PathBuf>> {
+        let mut by_post: std::collections::BTreeMap<String, Vec<PathBuf>> = Default::default();
+        for (media, _sidecar) in gather_pairs(content_dir).unwrap_or_default() {
+            let key = media
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.chars().take_while(|c| c.is_ascii_digit()).collect::<String>())
+                .filter(|d| !d.is_empty())
+                .unwrap_or_else(|| media.to_string_lossy().into_owned());
+            by_post.entry(key).or_default().push(media);
+        }
+        by_post.into_values().collect()
+    }
+
     // the signed event saved beside the media at publish time carries the magnet the network knows
     fn published_magnet(&self, media: &Path) -> Option<String> {
         let raw = std::fs::read(crate::scrape::event_sidecar_path(media)).ok()?;

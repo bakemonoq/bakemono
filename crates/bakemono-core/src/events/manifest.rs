@@ -22,6 +22,8 @@ pub struct Manifest {
     pub size: u64,
     pub mime: String,
     pub magnet: String,
+    // this file's index inside the post-bundle torrent the magnet points at (0 for a single-file magnet)
+    pub bundle_index: u32,
     pub filename: Option<String>,
     pub post_title: Option<String>,
     pub posted_at: Option<String>,
@@ -64,6 +66,9 @@ impl Manifest {
             size: parse_u64(tags::SIZE, &tags::require(event, tags::SIZE)?)?,
             mime: tags::require(event, tags::MIME)?,
             magnet: tags::require(event, tags::MAGNET)?,
+            bundle_index: tags::first(event, tags::BUNDLE_INDEX)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
             filename: tags::first(event, tags::FILENAME),
             post_title: tags::first(event, tags::POST_TITLE),
             posted_at: tags::first(event, tags::POSTED_AT),
@@ -124,6 +129,7 @@ impl Manifest {
             vec![tags::SIZE.to_string(), self.size.to_string()],
             vec![tags::MIME.to_string(), self.mime.clone()],
             vec![tags::MAGNET.to_string(), self.magnet.clone()],
+            vec![tags::BUNDLE_INDEX.to_string(), self.bundle_index.to_string()],
             vec![tags::PLATFORM.to_string(), self.platform.clone()],
             vec![tags::CREATOR.to_string(), self.creator.clone()],
             vec![tags::CREATOR_ID.to_string(), self.creator_id.clone()],

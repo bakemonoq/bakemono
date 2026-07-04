@@ -8,6 +8,8 @@ pub const SIZE: &str = "size";
 pub const MIME: &str = "m";
 pub const FILENAME: &str = "filename";
 pub const MAGNET: &str = "magnet";
+// the file's index within its post-bundle torrent, so the gateway can serve one file from the swarm
+pub const BUNDLE_INDEX: &str = "bi";
 pub const PLATFORM: &str = "platform";
 pub const CREATOR: &str = "creator";
 pub const CREATOR_ID: &str = "creator_id";

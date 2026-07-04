@@ -57,6 +57,7 @@ pub fn manifest_from_files(media: &Path, sidecar: &Path) -> Result<Manifest> {
         size,
         mime,
         magnet: placeholder_magnet(&file_hash),
+        bundle_index: 0,
         file_hash,
         filename: media.file_name().map(|n| n.to_string_lossy().into_owned()),
         post_title: string_at(&meta, &["title"]).map(|t| t.trim().to_string()),

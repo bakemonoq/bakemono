@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -233,10 +234,10 @@ async fn build_seed_publish(
     }
 
     let total = pairs.len();
-    let mut manifests = Vec::new();
-    let mut media_paths = Vec::new();
-    let mut summaries = Vec::new();
+    let mut manifests: Vec<Manifest> = Vec::new();
+    let mut media_paths: Vec<PathBuf> = Vec::new();
     let mut cancelled = false;
+    // pass 1: hash and thumbnail every file; seeding is grouped per post below
     for (index, (media, sidecar)) in pairs.iter().enumerate() {
         if ctx.cancel.is_cancelled() {
             cancelled = true;
@@ -265,38 +266,9 @@ async fn build_seed_publish(
             hash: manifest.file_hash.clone(),
             size: manifest.size,
         });
-        if let Some(seeder) = ctx.seeder {
-            manifest.magnet = seeder
-                .seed(media, Some(&manifest.file_hash))
-                .await
-                .context("seeding file")?
-                .magnet;
-            progress(Progress::Seeded {
-                file: file_label(media),
-                magnet: manifest.magnet.clone(),
-            });
-            match thumbnail::generate_inline(media, &manifest.mime).await {
-                Ok(Some(thumb)) => {
-                    progress(Progress::Thumbnailed {
-                        file: file_label(media),
-                        bytes: thumb.len(),
-                    });
-                    manifest.thumb = Some(thumb);
-                }
-                Ok(None) => tracing::warn!(
-                    "thumbnail skipped for {}: too large to embed",
-                    media.display()
-                ),
-                Err(e) => {
-                    tracing::warn!("thumbnail skipped for {}: {e:#}", media.display());
-                    progress(Progress::Skipped {
-                        file: format!("{} (thumbnail)", file_label(media)),
-                        reason: format!("{e:#}"),
-                    });
-                }
-            }
+        if ctx.seeder.is_some() {
+            thumbnail_into(&mut manifest, media, progress).await;
         }
-        summaries.push(summary_of(&manifest));
         manifests.push(manifest);
         media_paths.push(media.clone());
     }
@@ -305,13 +277,19 @@ async fn build_seed_publish(
         if cancelled {
             progress(Progress::Cancelled);
             return Ok(RunSummary {
-                manifests: summaries,
+                manifests: Vec::new(),
                 event_ids: Vec::new(),
                 relays: ctx.relays.to_vec(),
             });
         }
         bail!("no manifests built");
     }
+
+    // pass 2: seed each post as ONE bundle torrent, stamping the bundle magnet + in-bundle file index
+    if let Some(seeder) = ctx.seeder {
+        seed_post_bundles(seeder, &mut manifests, &media_paths, progress).await?;
+    }
+    let summaries: Vec<ManifestSummary> = manifests.iter().map(summary_of).collect();
 
     let difficulty = pow_difficulty();
     let events = mint_events(ctx.identity.keys(), &manifests, difficulty, ctx.cancel, progress).await?;
@@ -352,6 +330,64 @@ async fn build_seed_publish(
         event_ids,
         relays: ctx.relays.to_vec(),
     })
+}
+
+async fn thumbnail_into(manifest: &mut Manifest, media: &Path, progress: ProgressFn<'_>) {
+    match thumbnail::generate_inline(media, &manifest.mime).await {
+        Ok(Some(thumb)) => {
+            progress(Progress::Thumbnailed {
+                file: file_label(media),
+                bytes: thumb.len(),
+            });
+            manifest.thumb = Some(thumb);
+        }
+        Ok(None) => tracing::warn!("thumbnail skipped for {}: too large to embed", media.display()),
+        Err(e) => {
+            tracing::warn!("thumbnail skipped for {}: {e:#}", media.display());
+            progress(Progress::Skipped {
+                file: format!("{} (thumbnail)", file_label(media)),
+                reason: format!("{e:#}"),
+            });
+        }
+    }
+}
+
+// group manifests by post, seed each post's files as one bundle torrent, then copy the bundle magnet and
+// this file's index within the bundle onto every manifest so the gateway can serve one file from the swarm
+async fn seed_post_bundles(
+    seeder: &SeederHandle,
+    manifests: &mut [Manifest],
+    media_paths: &[PathBuf],
+    progress: ProgressFn<'_>,
+) -> Result<()> {
+    let mut by_post: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, m) in manifests.iter().enumerate() {
+        by_post
+            .entry(format!("{}:{}:{}", m.platform, m.creator_id, m.post_id))
+            .or_default()
+            .push(i);
+    }
+    for idxs in by_post.into_values() {
+        let files: Vec<(PathBuf, String)> = idxs
+            .iter()
+            .map(|&i| (media_paths[i].clone(), manifests[i].file_hash.clone()))
+            .collect();
+        let bundle = seeder.seed_bundle(files).await.context("seeding post bundle")?;
+        for &i in &idxs {
+            let bundle_index = bundle
+                .order
+                .iter()
+                .position(|h| h == &manifests[i].file_hash)
+                .unwrap_or(0) as u32;
+            manifests[i].magnet = bundle.magnet.clone();
+            manifests[i].bundle_index = bundle_index;
+            progress(Progress::Seeded {
+                file: file_label(&media_paths[i]),
+                magnet: bundle.magnet.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 // grind NIP-13 proof-of-work per file off the async runtime, one event at a time so the activity

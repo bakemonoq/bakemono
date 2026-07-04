@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use anyhow::{bail, Context, Result};
@@ -50,35 +50,29 @@ impl<C: ContentSource> Daemon<C> {
 
     pub async fn reseed(&self) -> Result<usize> {
         self.ensure_seeder().await?;
-        let files = self.source.seedable(&self.content_dir);
+        let bundles = self.source.seedable_bundles(&self.content_dir);
         let mut count = 0;
-        for file in &files {
-            match self.seeder.seed(file, None).await {
-                Ok(info) => {
-                    count += 1;
-                    self.reseed_legacy(file, &info.info_hash).await;
-                }
-                Err(e) => tracing::warn!("reseed failed for {}: {e:#}", file.display()),
+        for group in &bundles {
+            let files: Vec<(PathBuf, String)> = group
+                .iter()
+                .filter_map(|p| match bakemono_torrent::sha256_hex(p) {
+                    Ok(hash) => Some((p.clone(), hash)),
+                    Err(e) => {
+                        tracing::warn!("reseed hash failed for {}: {e:#}", p.display());
+                        None
+                    }
+                })
+                .collect();
+            if files.is_empty() {
+                continue;
+            }
+            match self.seeder.seed_bundle(files).await {
+                Ok(_) => count += group.len(),
+                Err(e) => tracing::warn!("reseed bundle failed: {e:#}"),
             }
         }
-        tracing::info!(count, "reseeded content set");
+        tracing::info!(count, bundles = bundles.len(), "reseeded content set");
         Ok(count)
-    }
-
-    // a magnet published before deterministic construction points at a different infohash; seed that
-    // torrent too so the already-published events stay fetchable
-    async fn reseed_legacy(&self, file: &Path, deterministic: &str) {
-        let Some(magnet) = self.source.published_magnet(file) else {
-            return;
-        };
-        match bakemono_torrent::infohash_from_magnet(&magnet) {
-            Some(old) if old != deterministic => {
-                if let Err(e) = self.seeder.seed_in_place(file).await {
-                    tracing::warn!("legacy reseed failed for {}: {e:#}", file.display());
-                }
-            }
-            _ => {}
-        }
     }
 
     pub async fn run_job(&self, job: Value, progress: ProgressFn<'_>) -> Result<Value> {

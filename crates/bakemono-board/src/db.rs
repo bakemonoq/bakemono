@@ -72,6 +72,7 @@ pub async fn upsert(pool: &PgPool, event: &Event, manifest: &Manifest) -> Result
         .bind(&manifest.content)
         .bind(&manifest.thumb)
         .bind(bakemono_torrent::infohash_from_magnet(&manifest.magnet))
+        .bind(manifest.bundle_index as i32)
         .execute(pool)
         .await?;
     Ok(())
@@ -1084,6 +1085,7 @@ pub struct ManifestRow {
     pub content: String,
     pub thumb: Option<String>,
     pub infohash: Option<String>,
+    pub bundle_index: i32,
     pub status: String,
 }
 
@@ -1108,8 +1110,10 @@ CREATE TABLE IF NOT EXISTS manifests (
     tier       TEXT,
     content    TEXT NOT NULL,
     thumb      TEXT,
-    infohash   TEXT
+    infohash   TEXT,
+    bundle_index INTEGER NOT NULL DEFAULT 0
 );
+ALTER TABLE manifests ADD COLUMN IF NOT EXISTS bundle_index INTEGER NOT NULL DEFAULT 0;
 -- drop the view first so the seeded-thumb columns it expanded via m.* can be dropped below
 DROP VIEW IF EXISTS visible_manifests;
 -- inline preview lives in the event now; retire the seeded-thumb columns
@@ -1211,8 +1215,8 @@ const INSERT: &str = "
 INSERT INTO manifests (
     event_id, pubkey, created_at, d_tag, file_hash, size, mime, magnet,
     platform, creator, creator_id, post_id, file_index, filename, post_title, posted_at, tier, content,
-    thumb, infohash
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+    thumb, infohash, bundle_index
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
 ON CONFLICT (event_id) DO NOTHING
 ";
 

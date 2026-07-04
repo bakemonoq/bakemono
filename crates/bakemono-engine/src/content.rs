@@ -25,6 +25,15 @@ pub trait ContentSource: Send + Sync + 'static {
     // files to (re)seed on startup, i.e. the current content set on disk
     fn seedable(&self, content_dir: &Path) -> Vec<PathBuf>;
 
+    // the same content grouped by post, so a restart rebuilds one bundle torrent per post instead of one
+    // per file; the default keeps each file in its own bundle
+    fn seedable_bundles(&self, content_dir: &Path) -> Vec<Vec<PathBuf>> {
+        self.seedable(content_dir)
+            .into_iter()
+            .map(|f| vec![f])
+            .collect()
+    }
+
     // the magnet this file was published under, if the head knows it; reseed compares it against the
     // deterministic infohash to keep swarms behind older published magnets alive
     fn published_magnet(&self, media: &Path) -> Option<String> {

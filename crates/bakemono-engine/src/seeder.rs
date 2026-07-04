@@ -4,7 +4,9 @@ use std::sync::Arc;
 use anyhow::{bail, Result};
 use tokio::sync::Mutex;
 
-use bakemono_torrent::{SeedInfo, Seeder};
+use std::path::PathBuf;
+
+use bakemono_torrent::{BundleSeedInfo, SeedInfo, Seeder};
 
 // one librqbit seed session for the daemon lifetime: started once, fed files as they arrive,
 // so published magnets keep a live seeder behind them
@@ -65,6 +67,14 @@ impl SeederHandle {
         let guard = self.inner.lock().await;
         match guard.as_ref() {
             Some(seeder) => seeder.seed_in_place(file).await,
+            None => bail!("seeder not started"),
+        }
+    }
+
+    pub async fn seed_bundle(&self, files: Vec<(PathBuf, String)>) -> Result<BundleSeedInfo> {
+        let guard = self.inner.lock().await;
+        match guard.as_ref() {
+            Some(seeder) => seeder.seed_bundle(files).await,
             None => bail!("seeder not started"),
         }
     }

@@ -16,3 +16,4 @@ crates/bakemono-app/sidecars/
 # operator board config + assets (use board.toml.example as a template); shipped by deploy.sh
 board.toml
 /static/
+/target-linux
