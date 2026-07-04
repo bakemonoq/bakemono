@@ -418,6 +418,32 @@ pub async fn post_files_any(
     Ok(rows)
 }
 
+// mod-only: one contributor's own files for a post, without the cross-pubkey dedup post_files_any does.
+// a moderator reviewing this contributor must see their actual torrent, which may or may not resolve -
+// not another contributor's identical bytes standing in for it
+pub async fn post_files_for_pubkey(
+    pool: &PgPool,
+    pubkey: &str,
+    platform: &str,
+    creator_id: &str,
+    post_id: &str,
+) -> Result<Vec<ManifestRow>> {
+    let rows = sqlx::query_as::<_, ManifestRow>(
+        "SELECT * FROM (
+             SELECT DISTINCT ON (file_hash) * FROM manifests
+             WHERE pubkey = $1 AND platform = $2 AND creator_id = $3 AND post_id = $4
+             ORDER BY file_hash, created_at DESC
+         ) t ORDER BY file_index",
+    )
+    .bind(pubkey)
+    .bind(platform)
+    .bind(creator_id)
+    .bind(post_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 // every file a contributor uploaded, deduped by hash, ordered so posts stay contiguous
 pub async fn pubkey_files(pool: &PgPool, pubkey: &str) -> Result<Vec<ManifestRow>> {
     let rows = sqlx::query_as::<_, ManifestRow>(

@@ -1654,7 +1654,7 @@ async fn mod_queue_group(
                     li {
                         div.rowmain {
                             div.rowtitle {
-                                a href=(format!("/mod/post/{}/{}/{}", platform, creator_id, post.post_id)) {
+                                a href=(format!("/mod/post/{}/{}/{}?pk={}", platform, creator_id, post.post_id, pubkey)) {
                                     (post.post_title.clone().unwrap_or_else(|| post.post_id.clone()))
                                 }
                             }
@@ -1990,17 +1990,32 @@ async fn mod_pubkey_view(
 }
 
 // mod-only: one post's files at any status, with a banner and one-click ban or unban
+#[derive(serde::Deserialize)]
+struct PostViewQuery {
+    #[serde(default)]
+    pk: Option<String>,
+}
+
 async fn mod_post_view(
     State(state): State<AppState>,
     Path((platform, creator_id, post_id)): Path<(String, String, String)>,
+    Query(q): Query<PostViewQuery>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(denied) = require_mod(&headers) {
         return denied;
     }
-    let files = db::post_files_any(&state.pool, &platform, &creator_id, &post_id)
-        .await
-        .unwrap_or_default();
+    // reviewing from the queue carries the contributor, so show their own manifest with no cross-pubkey
+    // dedup; a content-oriented entry (reports, author view) has no pubkey and keeps the servable pick
+    let reviewing = q.pk.as_deref().filter(|s| !s.is_empty());
+    let files = match reviewing {
+        Some(pk) => db::post_files_for_pubkey(&state.pool, pk, &platform, &creator_id, &post_id)
+            .await
+            .unwrap_or_default(),
+        None => db::post_files_any(&state.pool, &platform, &creator_id, &post_id)
+            .await
+            .unwrap_or_default(),
+    };
     let visible = db::post_is_visible(&state.pool, &platform, &creator_id, &post_id)
         .await
         .unwrap_or(false);
@@ -2021,6 +2036,7 @@ async fn mod_post_view(
             p.muted {
                 @if let Some(c) = &creator { "by " a href=(format!("/c/{platform}/{creator_id}")) { (c) } " - " }
                 span.chip.platform { (pretty_platform(&platform)) }
+                @if let Some(pk) = reviewing { " - contributor " code { (npub(pk)) } }
             }
             @if visible {
                 div.statusbar.ok { "public - this post is live" }
