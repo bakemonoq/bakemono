@@ -806,8 +806,10 @@ pub async fn adjacent_posts(
     let row = sqlx::query_as::<_, AdjacentRow>(
         "SELECT prev_id, prev_title, next_id, next_title FROM (
              SELECT post_id,
-                    LEAD(post_id) OVER w AS prev_id, LEAD(t) OVER w AS prev_title,
-                    LAG(post_id)  OVER w AS next_id, LAG(t)  OVER w AS next_title
+                    -- window is newest-first, so the left/prev button steps to a newer post (LAG) and the
+                    -- right/next button to an older one (LEAD)
+                    LAG(post_id)  OVER w AS prev_id, LAG(t)  OVER w AS prev_title,
+                    LEAD(post_id) OVER w AS next_id, LEAD(t) OVER w AS next_title
              FROM (
                  SELECT post_id, MAX(post_title) AS t, MAX(posted_at) AS pa, MAX(created_at) AS ca
                  FROM visible_manifests
