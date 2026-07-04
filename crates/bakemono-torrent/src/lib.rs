@@ -3,7 +3,7 @@ pub use post_torrent::{build_bundle, BundleFile, BundleTorrent};
 mod scrape;
 pub use scrape::scrape_seeders;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -279,6 +279,17 @@ impl Gateway {
                 ));
             }
         };
+        // a bundle serves many files under one infohash. the first request adds it with only_files=[i];
+        // a later request for a different file finds it already managed, and add_torrent ignores the new
+        // selection, so that file never downloads and its stream hangs. union the request into the live
+        // selection. only_files() None means every file is already selected
+        if let Some(current) = handle.only_files() {
+            if !selected.iter().all(|i| current.contains(i)) {
+                let mut want: HashSet<usize> = current.into_iter().collect();
+                want.extend(selected.iter().copied());
+                self.session.update_only_files(&handle, &want).await?;
+            }
+        }
         // reject an oversized file once metadata is known, before streaming, so a single torrent cannot
         // blow past the cache budget (eviction can't reclaim an in-flight download)
         if self.max_file_bytes > 0 {
@@ -997,5 +1008,86 @@ mod tests {
             .count();
         assert_eq!(dirs, 1);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // a post bundle is one infohash with many files; the browser opens them in sequence. the second open
+    // finds the torrent already managed, and add_torrent ignores its only_files, so without widening the
+    // live selection the file never downloads and its stream hangs. dial a complete seeder and drain both
+    #[tokio::test]
+    async fn gateway_serves_every_file_in_a_bundle() {
+        use tokio::io::AsyncReadExt;
+        let root = std::env::temp_dir().join(format!("gw-bundle-{}", std::process::id()));
+        let bdir = root.join("seed").join("b");
+        std::fs::create_dir_all(&bdir).unwrap();
+        // piece-aligned so file 1 lives entirely in pieces file 0 never touches: only_files=[0] must not
+        // drag file 1's pieces in incidentally, or the test can't tell the fix from librqbit's picker
+        std::fs::write(bdir.join("0aaa"), vec![1u8; 1 << 20]).unwrap();
+        std::fs::write(bdir.join("1bbb"), vec![2u8; 2 << 20]).unwrap();
+        let built = build_bundle(
+            "b",
+            vec![
+                BundleFile { rel: "0aaa".into(), path: bdir.join("0aaa") },
+                BundleFile { rel: "1bbb".into(), path: bdir.join("1bbb") },
+            ],
+            1 << 20,
+        )
+        .unwrap();
+        let magnet = synth_magnet(&built.info_hash, &[]);
+
+        let seed_port = 46691u16;
+        let seed = Session::new_with_opts(
+            root.join("seed"),
+            SessionOptions {
+                disable_dht: true,
+                listen_port_range: Some(seed_port..seed_port + 1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let sh = seed
+            .add_torrent(
+                AddTorrent::from_bytes(built.torrent),
+                Some(AddTorrentOptions {
+                    output_folder: Some(bdir.to_string_lossy().into_owned()),
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        sh.wait_until_initialized().await.unwrap();
+        let s = sh.stats();
+        assert_eq!(s.progress_bytes, s.total_bytes, "seeder must hold the whole bundle");
+
+        let gw = Gateway::new(
+            root.join("gw"),
+            Some(46692),
+            vec![(std::net::Ipv4Addr::LOCALHOST, seed_port).into()],
+            1 << 30,
+        )
+        .await
+        .unwrap();
+
+        // drain file 0 fully first (as a browser loads the first image), so the torrent finishes its
+        // selection before file 1 is ever requested - the exact order that strands later bundle files
+        let mut f0 = gw.open(&magnet, 0).await.expect("file 0 opens");
+        let mut b0 = Vec::new();
+        tokio::time::timeout(Duration::from_secs(30), f0.stream.read_to_end(&mut b0))
+            .await
+            .expect("file 0 must not hang")
+            .unwrap();
+        let mut f1 = gw.open(&magnet, 1).await.expect("file 1 opens");
+        let mut b1 = Vec::new();
+        tokio::time::timeout(Duration::from_secs(30), f1.stream.read_to_end(&mut b1))
+            .await
+            .expect("file 1 must not hang")
+            .unwrap();
+
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(b0.len(), 1 << 20);
+        assert_eq!(b1.len(), 2 << 20, "second bundle file must stream, not hang");
     }
 }
