@@ -135,6 +135,17 @@ pub fn event_sidecar_path(media: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+// the key the pipeline seeds a post bundle under (platform:creator_id:post_id), read straight from a
+// sidecar so reseed rebuilds byte-identical bundles to what the scrape published
+pub fn post_key(sidecar: &Path) -> Option<String> {
+    let raw = fs::read(sidecar).ok()?;
+    let meta: Value = serde_json::from_slice(&raw).ok()?;
+    let platform = string_at(&meta, &["category"]).unwrap_or_else(|| "patreon".to_string());
+    let creator_id = string_at(&meta, &["creator", "id"])?;
+    let post_id = string_at(&meta, &["id"])?;
+    Some(format!("{platform}:{creator_id}:{post_id}"))
+}
+
 fn string_at(value: &Value, path: &[&str]) -> Option<String> {
     let mut cursor = value;
     for key in path {

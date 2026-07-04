@@ -92,16 +92,12 @@ impl ContentSource for AppContentSource {
             .collect()
     }
 
-    // group a post's files (gallery-dl prefixes each filename with the numeric post id) so reseed rebuilds
-    // the same one-bundle-per-post torrents the scrape published
+    // group a post's files by the same platform:creator_id:post_id the pipeline used, so reseed rebuilds
+    // byte-identical bundles (same infohash) to what the scrape published
     fn seedable_bundles(&self, content_dir: &Path) -> Vec<Vec<PathBuf>> {
         let mut by_post: std::collections::BTreeMap<String, Vec<PathBuf>> = Default::default();
-        for (media, _sidecar) in gather_pairs(content_dir).unwrap_or_default() {
-            let key = media
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.chars().take_while(|c| c.is_ascii_digit()).collect::<String>())
-                .filter(|d| !d.is_empty())
+        for (media, sidecar) in gather_pairs(content_dir).unwrap_or_default() {
+            let key = crate::scrape::post_key(&sidecar)
                 .unwrap_or_else(|| media.to_string_lossy().into_owned());
             by_post.entry(key).or_default().push(media);
         }
