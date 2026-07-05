@@ -344,6 +344,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bakemono-core",
+ "bakemono-scraper",
  "bakemono-torrent",
  "base64 0.22.1",
  "chrono",

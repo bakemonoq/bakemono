@@ -6,6 +6,8 @@ mod instance;
 mod kubo;
 mod ratelimit;
 mod sanitize;
+mod scrape;
+mod thumb;
 mod trusted_proxy;
 mod verifier;
 mod web;
@@ -24,15 +26,15 @@ async fn main() -> Result<()> {
         // no-arg default stays `serve` so existing docker entrypoints keep working
         None | Some("serve") => serve().await,
         Some("add") => cmd_add(args.collect()).await,
-        Some(other) => bail!("unknown command `{other}` (expected serve or add)"),
+        Some("ingest") => cmd_ingest(args.next()).await,
+        Some("scrape") => cmd_scrape(args.collect()).await,
+        Some("source") => cmd_source(args.collect()).await,
+        Some(other) => bail!("unknown command `{other}` (expected serve, add, ingest, scrape or source)"),
     }
 }
 
 async fn serve() -> Result<()> {
-    let database_url = env_or(
-        "DATABASE_URL",
-        "postgres://postgres:postgres@127.0.0.1:5432/bakemono?sslmode=disable",
-    );
+    let database_url = database_url();
     let relays = relays();
     let bind = env_or("BAKEMONO_BIND", "127.0.0.1:3000");
     let signer = instance::load();
@@ -62,6 +64,9 @@ async fn serve() -> Result<()> {
 
     tokio::spawn(verifier::run(pool.clone(), gateway.clone()));
 
+    let kubo = Arc::new(kubo::Kubo::from_env());
+    tokio::spawn(scrape::run_scheduler(pool.clone(), kubo.clone()));
+
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!("board on http://{bind}");
     let state = web::AppState {
@@ -69,7 +74,7 @@ async fn serve() -> Result<()> {
         relays,
         signer,
         gateway,
-        kubo: Arc::new(kubo::Kubo::from_env()),
+        kubo,
         cold_limiter: Arc::new(ratelimit::ColdLimiter::from_env()),
     };
     axum::serve(
@@ -85,11 +90,7 @@ async fn cmd_add(paths: Vec<String>) -> Result<()> {
     if paths.is_empty() {
         bail!("usage: bakemono-board add <file>...");
     }
-    let database_url = env_or(
-        "DATABASE_URL",
-        "postgres://postgres:postgres@127.0.0.1:5432/bakemono?sslmode=disable",
-    );
-    let pool = db::connect(&database_url).await?;
+    let pool = db::connect(&database_url()).await?;
     let kubo = kubo::Kubo::from_env();
     for path in paths {
         let bytes = tokio::fs::read(&path).await?;
@@ -98,28 +99,89 @@ async fn cmd_add(paths: Vec<String>) -> Result<()> {
             hex::encode(Sha256::digest(&bytes))
         };
         let size = bytes.len() as i64;
-        let mime = sniff_mime(&bytes);
+        let mime = scrape::sniff_mime(&bytes);
         let filename = std::path::Path::new(&path)
             .file_name()
             .and_then(|n| n.to_str())
             .map(str::to_owned);
         let cid = kubo.add(bytes, &path).await?;
-        db::insert_file(&pool, &cid, &sha256, size, mime, filename.as_deref()).await?;
+        db::insert_file(&pool, &cid, &sha256, size, mime, filename.as_deref(), None).await?;
         println!("{cid}  {path}");
     }
     Ok(())
 }
 
-fn sniff_mime(bytes: &[u8]) -> &'static str {
-    match bytes {
-        [0xFF, 0xD8, 0xFF, ..] => "image/jpeg",
-        [0x89, b'P', b'N', b'G', ..] => "image/png",
-        [b'G', b'I', b'F', b'8', ..] => "image/gif",
-        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => "image/webp",
-        [_, _, _, _, b'f', b't', b'y', b'p', ..] => "video/mp4",
-        [0x1A, 0x45, 0xDF, 0xA3, ..] => "video/webm",
-        _ => "application/octet-stream",
+async fn cmd_ingest(dir: Option<String>) -> Result<()> {
+    let Some(dir) = dir else {
+        bail!("usage: bakemono-board ingest <dir>");
+    };
+    let pool = db::connect(&database_url()).await?;
+    let kubo = kubo::Kubo::from_env();
+    let stats = scrape::ingest_dir(&pool, &kubo, std::path::Path::new(&dir)).await?;
+    println!("{} files across {} posts ({} skipped)", stats.files, stats.posts, stats.skipped);
+    Ok(())
+}
+
+// one-off headless scrape: url, then optional cookies file and item limit in any order
+async fn cmd_scrape(args: Vec<String>) -> Result<()> {
+    let mut url = None;
+    let mut cookies = None;
+    let mut limit = None;
+    for arg in args {
+        if let Ok(n) = arg.parse::<u32>() {
+            limit = Some(n);
+        } else if std::path::Path::new(&arg).is_file() {
+            cookies = Some(std::fs::read_to_string(&arg)?);
+        } else if url.is_none() {
+            url = Some(arg);
+        } else {
+            bail!("unexpected argument `{arg}`");
+        }
     }
+    let Some(url) = url else {
+        bail!("usage: bakemono-board scrape <url> [cookies.txt] [limit]");
+    };
+    let pool = db::connect(&database_url()).await?;
+    let kubo = kubo::Kubo::from_env();
+    let stats = scrape::scrape_source(&pool, &kubo, &url, cookies.as_deref(), limit).await?;
+    println!("{} files across {} posts ({} skipped)", stats.files, stats.posts, stats.skipped);
+    Ok(())
+}
+
+// the scheduler's work list: `source add <url> [cookies.txt]` / `source ls`
+async fn cmd_source(args: Vec<String>) -> Result<()> {
+    let pool = db::connect(&database_url()).await?;
+    let mut args = args.into_iter();
+    match args.next().as_deref() {
+        Some("add") => {
+            let Some(url) = args.next() else {
+                bail!("usage: bakemono-board source add <url> [cookies.txt]");
+            };
+            let cookies = match args.next() {
+                Some(path) => Some(std::fs::read_to_string(&path)?),
+                None => None,
+            };
+            db::add_source(&pool, &url, cookies.as_deref()).await?;
+            println!("added {url}");
+        }
+        Some("ls") | None => {
+            for (url, enabled, scraped_at, error) in db::list_sources(&pool).await? {
+                let status = if enabled { "on " } else { "off" };
+                let scraped = scraped_at.unwrap_or_else(|| "never".into());
+                let error = error.map(|e| format!("  ERR {e}")).unwrap_or_default();
+                println!("{status}  {scraped}  {url}{error}");
+            }
+        }
+        Some(other) => bail!("unknown source command `{other}` (expected add or ls)"),
+    }
+    Ok(())
+}
+
+fn database_url() -> String {
+    env_or(
+        "DATABASE_URL",
+        "postgres://postgres:postgres@127.0.0.1:5432/bakemono?sslmode=disable",
+    )
 }
 
 // stdout logs so `docker logs` shows the gateway/indexer; librqbit's own chatter is pinned to warn by

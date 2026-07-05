@@ -1249,8 +1249,8 @@ async fn ipfs_file(
     if cid.is_empty() || !cid.chars().all(|c| c.is_ascii_alphanumeric()) {
         return (StatusCode::BAD_REQUEST, "bad cid").into_response();
     }
-    let meta = match db::serveable_file(&state.pool, &cid).await {
-        Ok(Some(meta)) => meta,
+    let mime = match db::serveable_file(&state.pool, &cid).await {
+        Ok(Some(mime)) => mime,
         Ok(None) => return (StatusCode::NOT_FOUND, "unknown cid").into_response(),
         Err(e) => {
             tracing::error!("file lookup failed: {e:#}");
@@ -1268,7 +1268,7 @@ async fn ipfs_file(
     }
     let mut builder = Response::builder()
         .status(status)
-        .header(header::CONTENT_TYPE, meta.mime)
+        .header(header::CONTENT_TYPE, mime)
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable");
     for name in [header::CONTENT_LENGTH, header::CONTENT_RANGE] {

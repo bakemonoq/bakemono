@@ -15,6 +15,9 @@ pub struct ScrapeRequest {
     pub cookies: Option<Cookies>,
     pub limit: Option<u32>,
     pub quiet: bool,
+    // gallery-dl skips items recorded here without touching the files, so a re-scrape stays
+    // incremental even after staged media is pruned
+    pub archive: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +69,7 @@ impl ScrapeRequest {
             cookies: None,
             limit: None,
             quiet: false,
+            archive: None,
         }
     }
 }
@@ -341,6 +345,10 @@ fn build_args(request: &ScrapeRequest) -> Vec<String> {
     if let Some(limit) = request.limit {
         args.push("--range".to_string());
         args.push(format!("1-{limit}"));
+    }
+    if let Some(archive) = &request.archive {
+        args.push("--download-archive".to_string());
+        args.push(archive.to_string_lossy().into_owned());
     }
     match &request.cookies {
         Some(Cookies::File(path)) => {

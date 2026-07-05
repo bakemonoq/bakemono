@@ -9,15 +9,19 @@ COPY . .
 RUN cargo build --release -p bakemono-board
 
 FROM debian:bookworm-slim
+# ffmpeg thumbnails the scrape worker's media; gallery-dl (pipx, isolated) does the fetching
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates libssl3 \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get install -y --no-install-recommends ca-certificates libssl3 ffmpeg pipx \
+    && rm -rf /var/lib/apt/lists/* \
+    && PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx install gallery-dl yt-dlp
 COPY --from=builder /src/target/release/bakemono-board /usr/local/bin/bakemono-board
 ENV BAKEMONO_BIND=0.0.0.0:3000
 # BT peer port the gateway listens on, so NAT'd seeders can dial in; keep in sync with BAKEMONO_GATEWAY_PORT
 ENV BAKEMONO_GATEWAY_PORT=4240
 # persistent on-disk cache; mount a volume here so downloads survive container recreation
 ENV BAKEMONO_GATEWAY_DIR=/cache
+# scrape staging + gallery-dl download archive; mount a volume so re-scrapes stay incremental
+ENV BAKEMONO_SCRAPE_DIR=/scrape
 EXPOSE 3000
 EXPOSE 4240
 EXPOSE 4240/udp

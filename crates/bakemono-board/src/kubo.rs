@@ -16,14 +16,27 @@ impl Kubo {
         }
     }
 
-    // pin=true: everything added is archive content; unpinned blocks are GC fodder
     pub async fn add(&self, bytes: Vec<u8>, label: &str) -> Result<String> {
+        self.add_part(reqwest::multipart::Part::bytes(bytes), label).await
+    }
+
+    // streams from disk so multi-GB videos never sit in memory
+    pub async fn add_path(&self, path: &std::path::Path) -> Result<String> {
+        let file = tokio::fs::File::open(path)
+            .await
+            .with_context(|| format!("opening {}", path.display()))?;
+        let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+        self.add_part(reqwest::multipart::Part::stream(body), &path.to_string_lossy())
+            .await
+    }
+
+    // pin=true: everything added is archive content; unpinned blocks are GC fodder
+    async fn add_part(&self, part: reqwest::multipart::Part, label: &str) -> Result<String> {
         let url = format!(
             "{}/api/v0/add?cid-version={ADD_CID_VERSION}&raw-leaves={ADD_RAW_LEAVES}&hash={ADD_HASH}&chunker={ADD_CHUNKER}&pin=true",
             self.api
         );
-        let form = reqwest::multipart::Form::new()
-            .part("file", reqwest::multipart::Part::bytes(bytes));
+        let form = reqwest::multipart::Form::new().part("file", part);
         let resp = self
             .http
             .post(&url)

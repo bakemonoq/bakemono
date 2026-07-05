@@ -1306,21 +1306,17 @@ pub struct ManifestRow {
     pub status: String,
 }
 
-pub struct FileMeta {
-    pub mime: String,
-    pub size: i64,
-}
-
-// denylist beats catalog: a revoked cid must not serve even while a stale row still names it
-pub async fn serveable_file(pool: &PgPool, cid: &str) -> Result<Option<FileMeta>> {
-    let row: Option<(String, i64)> = sqlx::query_as(
-        "SELECT mime, size FROM files
+// denylist beats catalog: a revoked cid must not serve even while a stale row still names it.
+// returns the mime the board recorded at ingest, never what kubo guesses
+pub async fn serveable_file(pool: &PgPool, cid: &str) -> Result<Option<String>> {
+    let mime = sqlx::query_scalar(
+        "SELECT mime FROM files
          WHERE cid = $1 AND NOT EXISTS (SELECT 1 FROM denylist d WHERE d.cid = $1)",
     )
     .bind(cid)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(mime, size)| FileMeta { mime, size }))
+    Ok(mime)
 }
 
 pub async fn insert_file(
@@ -1330,25 +1326,116 @@ pub async fn insert_file(
     size: i64,
     mime: &str,
     filename: Option<&str>,
+    thumb_cid: Option<&str>,
 ) -> Result<()> {
     sqlx::query(
-        "INSERT INTO files (cid, sha256, size, mime, filename) VALUES ($1,$2,$3,$4,$5)
-         ON CONFLICT (cid) DO NOTHING",
+        "INSERT INTO files (cid, sha256, size, mime, filename, thumb_cid) VALUES ($1,$2,$3,$4,$5,$6)
+         ON CONFLICT (cid) DO UPDATE SET thumb_cid = COALESCE(files.thumb_cid, EXCLUDED.thumb_cid)",
     )
     .bind(cid)
     .bind(sha256)
     .bind(size)
     .bind(mime)
     .bind(filename)
+    .bind(thumb_cid)
     .execute(pool)
     .await?;
     Ok(())
 }
 
-pub async fn deny_cid(pool: &PgPool, cid: &str, reason: &str) -> Result<()> {
-    sqlx::query("INSERT INTO denylist (cid, reason) VALUES ($1,$2) ON CONFLICT (cid) DO NOTHING")
-        .bind(cid)
-        .bind(reason)
+pub async fn upsert_creator(pool: &PgPool, platform: &str, creator_id: &str, name: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO creators (platform, creator_id, creator) VALUES ($1,$2,$3)
+         ON CONFLICT (platform, creator_id) DO UPDATE SET creator = EXCLUDED.creator",
+    )
+    .bind(platform)
+    .bind(creator_id)
+    .bind(name)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn upsert_post(pool: &PgPool, meta: &crate::scrape::PostMeta) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO posts (platform, creator_id, post_id, title, body, posted_at, tier)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)
+         ON CONFLICT (platform, creator_id, post_id) DO UPDATE SET
+             title = EXCLUDED.title,
+             body = EXCLUDED.body,
+             posted_at = EXCLUDED.posted_at,
+             tier = EXCLUDED.tier",
+    )
+    .bind(&meta.platform)
+    .bind(&meta.creator_id)
+    .bind(&meta.post_id)
+    .bind(&meta.title)
+    .bind(&meta.body)
+    .bind(&meta.posted_at)
+    .bind(&meta.tier)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn upsert_post_file(pool: &PgPool, meta: &crate::scrape::PostMeta, cid: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO post_files (platform, creator_id, post_id, file_index, cid)
+         VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (platform, creator_id, post_id, file_index) DO UPDATE SET cid = EXCLUDED.cid",
+    )
+    .bind(&meta.platform)
+    .bind(&meta.creator_id)
+    .bind(&meta.post_id)
+    .bind(meta.file_index)
+    .bind(cid)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub struct Source {
+    pub url: String,
+    pub cookies: Option<String>,
+}
+
+pub async fn add_source(pool: &PgPool, url: &str, cookies: Option<&str>) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO sources (url, cookies) VALUES ($1,$2)
+         ON CONFLICT (url) DO UPDATE SET cookies = COALESCE(EXCLUDED.cookies, sources.cookies), enabled = TRUE",
+    )
+    .bind(url)
+    .bind(cookies)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_sources(pool: &PgPool) -> Result<Vec<(String, bool, Option<String>, Option<String>)>> {
+    let rows = sqlx::query_as(
+        "SELECT url, enabled, last_scraped_at::text, last_error FROM sources ORDER BY url",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+pub async fn due_sources(pool: &PgPool, older_than_secs: i64) -> Result<Vec<Source>> {
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT url, cookies FROM sources
+         WHERE enabled AND (last_scraped_at IS NULL OR last_scraped_at < now() - make_interval(secs => $1))
+         ORDER BY last_scraped_at NULLS FIRST",
+    )
+    .bind(older_than_secs as f64)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(url, cookies)| Source { url, cookies }).collect())
+}
+
+pub async fn mark_scraped(pool: &PgPool, url: &str, error: Option<&str>) -> Result<()> {
+    sqlx::query("UPDATE sources SET last_scraped_at = now(), last_error = $2 WHERE url = $1")
+        .bind(url)
+        .bind(error)
         .execute(pool)
         .await?;
     Ok(())
@@ -1489,21 +1576,60 @@ WHERE m.status = 'approved'
           (t.target_type = 'creator' AND t.target = m.platform || ':' || m.creator_id)
   );
 
--- new-stack catalog (IPFS manifest architecture); grows creators/posts tables as the migration lands
+-- new-stack catalog (IPFS manifest architecture)
 CREATE TABLE IF NOT EXISTS files (
-    cid      TEXT PRIMARY KEY,
-    sha256   TEXT NOT NULL,
-    size     BIGINT NOT NULL,
-    mime     TEXT NOT NULL,
-    filename TEXT,
-    added_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    cid       TEXT PRIMARY KEY,
+    sha256    TEXT NOT NULL,
+    size      BIGINT NOT NULL,
+    mime      TEXT NOT NULL,
+    filename  TEXT,
+    thumb_cid TEXT,
+    added_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE files ADD COLUMN IF NOT EXISTS thumb_cid TEXT;
 CREATE INDEX IF NOT EXISTS files_sha256 ON files (sha256);
 
 CREATE TABLE IF NOT EXISTS denylist (
     cid      TEXT PRIMARY KEY,
     reason   TEXT NOT NULL,
     added_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS creators (
+    platform   TEXT NOT NULL,
+    creator_id TEXT NOT NULL,
+    creator    TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (platform, creator_id)
+);
+
+CREATE TABLE IF NOT EXISTS posts (
+    platform   TEXT NOT NULL,
+    creator_id TEXT NOT NULL,
+    post_id    TEXT NOT NULL,
+    title      TEXT NOT NULL DEFAULT '',
+    body       TEXT NOT NULL DEFAULT '',
+    posted_at  TEXT,
+    tier       TEXT,
+    PRIMARY KEY (platform, creator_id, post_id)
+);
+
+CREATE TABLE IF NOT EXISTS post_files (
+    platform   TEXT NOT NULL,
+    creator_id TEXT NOT NULL,
+    post_id    TEXT NOT NULL,
+    file_index INTEGER NOT NULL,
+    cid        TEXT NOT NULL,
+    PRIMARY KEY (platform, creator_id, post_id, file_index)
+);
+CREATE INDEX IF NOT EXISTS post_files_cid ON post_files (cid);
+
+-- what the scrape scheduler works through; cookies are operational state, never in the manifest
+CREATE TABLE IF NOT EXISTS sources (
+    url             TEXT PRIMARY KEY,
+    cookies         TEXT,
+    enabled         BOOLEAN NOT NULL DEFAULT TRUE,
+    last_scraped_at TIMESTAMPTZ,
+    last_error      TEXT
 );
 ";
 

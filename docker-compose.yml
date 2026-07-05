@@ -57,15 +57,19 @@ services:
       BAKEMONO_CONTACT: ${BAKEMONO_CONTACT:-}
       BAKEMONO_KUBO_API: ${BAKEMONO_KUBO_API:-http://kubo:5001}
       BAKEMONO_KUBO_GATEWAY: ${BAKEMONO_KUBO_GATEWAY:-http://kubo:8080}
+      # seconds between scrape passes over enabled sources; 0 disables the scheduler
+      BAKEMONO_SCRAPE_INTERVAL_SECS: ${BAKEMONO_SCRAPE_INTERVAL_SECS:-21600}
     ports:
       - "3000:3000"
       - "${BAKEMONO_GATEWAY_PORT:-4240}:${BAKEMONO_GATEWAY_PORT:-4240}"
       - "${BAKEMONO_GATEWAY_PORT:-4240}:${BAKEMONO_GATEWAY_PORT:-4240}/udp"
     volumes:
       - bakemono-cache:/cache
+      - bakemono-scrape:/scrape
     depends_on:
       - postgres
       - relay
+      - kubo
     restart: unless-stopped
 
 volumes:
@@ -73,3 +77,4 @@ volumes:
   bakemono-relay:
   bakemono-cache:
   bakemono-ipfs:
+  bakemono-scrape:

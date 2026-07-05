@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 bakemono-core = { path = "../bakemono-core" }
+bakemono-scraper = { path = "../bakemono-scraper" }
 bakemono-torrent = { path = "../bakemono-torrent" }
 nostr-sdk.workspace = true
 rustls.workspace = true
