@@ -1353,6 +1353,7 @@ fn render(title: &str, body: Markup) -> Html<String> {
                                 a href="/creators" { (PreEscaped(ICON_CREATORS)) span { "Creators" } }
                                 a href="/posts" { (PreEscaped(ICON_POSTS)) span { "Posts" } }
                                 a href="/contribute" { (PreEscaped(ICON_CONTRIBUTE)) span { "Contribute" } }
+                                a href="/keepers" { (PreEscaped(ICON_KEEPERS)) span { "Keepers" } }
                             }
                         }
                     }
