@@ -1306,6 +1306,54 @@ pub struct ManifestRow {
     pub status: String,
 }
 
+pub struct FileMeta {
+    pub mime: String,
+    pub size: i64,
+}
+
+// denylist beats catalog: a revoked cid must not serve even while a stale row still names it
+pub async fn serveable_file(pool: &PgPool, cid: &str) -> Result<Option<FileMeta>> {
+    let row: Option<(String, i64)> = sqlx::query_as(
+        "SELECT mime, size FROM files
+         WHERE cid = $1 AND NOT EXISTS (SELECT 1 FROM denylist d WHERE d.cid = $1)",
+    )
+    .bind(cid)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(mime, size)| FileMeta { mime, size }))
+}
+
+pub async fn insert_file(
+    pool: &PgPool,
+    cid: &str,
+    sha256: &str,
+    size: i64,
+    mime: &str,
+    filename: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO files (cid, sha256, size, mime, filename) VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT (cid) DO NOTHING",
+    )
+    .bind(cid)
+    .bind(sha256)
+    .bind(size)
+    .bind(mime)
+    .bind(filename)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn deny_cid(pool: &PgPool, cid: &str, reason: &str) -> Result<()> {
+    sqlx::query("INSERT INTO denylist (cid, reason) VALUES ($1,$2) ON CONFLICT (cid) DO NOTHING")
+        .bind(cid)
+        .bind(reason)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS manifests (
     event_id   TEXT PRIMARY KEY,
@@ -1440,6 +1488,23 @@ WHERE m.status = 'approved'
           (t.target_type = 'post' AND t.target = m.platform || ':' || m.creator_id || ':' || m.post_id) OR
           (t.target_type = 'creator' AND t.target = m.platform || ':' || m.creator_id)
   );
+
+-- new-stack catalog (IPFS manifest architecture); grows creators/posts tables as the migration lands
+CREATE TABLE IF NOT EXISTS files (
+    cid      TEXT PRIMARY KEY,
+    sha256   TEXT NOT NULL,
+    size     BIGINT NOT NULL,
+    mime     TEXT NOT NULL,
+    filename TEXT,
+    added_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS files_sha256 ON files (sha256);
+
+CREATE TABLE IF NOT EXISTS denylist (
+    cid      TEXT PRIMARY KEY,
+    reason   TEXT NOT NULL,
+    added_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 ";
 
 const INSERT: &str = "

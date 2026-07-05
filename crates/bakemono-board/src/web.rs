@@ -32,6 +32,7 @@ pub struct AppState {
     pub relays: Vec<String>,
     pub signer: Option<Keys>,
     pub gateway: Arc<bakemono_torrent::Gateway>,
+    pub kubo: Arc<crate::kubo::Kubo>,
     pub cold_limiter: Arc<crate::ratelimit::ColdLimiter>,
 }
 
@@ -74,6 +75,7 @@ pub fn router(state: AppState) -> Router {
         .route("/mod/author/{platform}/{creator_id}", get(mod_author_view))
         .route("/t/{infohash}/meta", get(gateway_meta))
         .route("/t/{infohash}/f/{file_index}", get(gateway_file))
+        .route("/f/{cid}", get(ipfs_file))
         .with_state(state)
 }
 
@@ -1234,6 +1236,54 @@ async fn gateway_file(
             private_if(stream_file(file, &headers, verify).await, private)
         }
         Err(e) => (StatusCode::BAD_GATEWAY, format!("swarm error: {e:#}")).into_response(),
+    }
+}
+
+// the new-stack gateway: catalog + denylist gate, then proxy the local kubo gateway.
+// kubo runs NoFetch, so only blocks this board already pinned can ever leave this route
+async fn ipfs_file(
+    State(state): State<AppState>,
+    Path(cid): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if cid.is_empty() || !cid.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return (StatusCode::BAD_REQUEST, "bad cid").into_response();
+    }
+    let meta = match db::serveable_file(&state.pool, &cid).await {
+        Ok(Some(meta)) => meta,
+        Ok(None) => return (StatusCode::NOT_FOUND, "unknown cid").into_response(),
+        Err(e) => {
+            tracing::error!("file lookup failed: {e:#}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+    let upstream = match state.kubo.fetch(&cid, range).await {
+        Ok(resp) => resp,
+        Err(e) => return (StatusCode::BAD_GATEWAY, format!("kubo error: {e:#}")).into_response(),
+    };
+    let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    if status != StatusCode::OK && status != StatusCode::PARTIAL_CONTENT {
+        return (StatusCode::BAD_GATEWAY, format!("kubo gateway status {status}")).into_response();
+    }
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, meta.mime)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable");
+    for name in [header::CONTENT_LENGTH, header::CONTENT_RANGE] {
+        if let Some(value) = upstream.headers().get(name.as_str()) {
+            if let Ok(value) = axum::http::HeaderValue::from_bytes(value.as_bytes()) {
+                builder = builder.header(name, value);
+            }
+        }
+    }
+    match builder.body(Body::from_stream(upstream.bytes_stream())) {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::error!("ipfs proxy response build failed: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 

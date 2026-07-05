@@ -4,8 +4,22 @@ services:
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: bakemono
+    ports:
+      - "127.0.0.1:5432:5432"
     volumes:
       - bakemono-pg:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  kubo:
+    image: ipfs/kubo:latest
+    ports:
+      - "4001:4001"
+      - "4001:4001/udp"
+      - "127.0.0.1:5001:5001"
+      # host 8081: the container gateway is 8080, taken on the host by the relay mapping
+      - "127.0.0.1:8081:8080"
+    volumes:
+      - bakemono-ipfs:/data/ipfs
     restart: unless-stopped
 
   relay:
@@ -41,6 +55,8 @@ services:
       # DMCA and general contact shown on /info
       BAKEMONO_DMCA_CONTACT: ${BAKEMONO_DMCA_CONTACT:-}
       BAKEMONO_CONTACT: ${BAKEMONO_CONTACT:-}
+      BAKEMONO_KUBO_API: ${BAKEMONO_KUBO_API:-http://kubo:5001}
+      BAKEMONO_KUBO_GATEWAY: ${BAKEMONO_KUBO_GATEWAY:-http://kubo:8080}
     ports:
       - "3000:3000"
       - "${BAKEMONO_GATEWAY_PORT:-4240}:${BAKEMONO_GATEWAY_PORT:-4240}"
@@ -56,3 +72,4 @@ volumes:
   bakemono-pg:
   bakemono-relay:
   bakemono-cache:
+  bakemono-ipfs:

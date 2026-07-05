@@ -3,6 +3,7 @@ mod db;
 mod health;
 mod indexer;
 mod instance;
+mod kubo;
 mod ratelimit;
 mod sanitize;
 mod trusted_proxy;
@@ -12,12 +13,22 @@ mod web;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        // no-arg default stays `serve` so existing docker entrypoints keep working
+        None | Some("serve") => serve().await,
+        Some("add") => cmd_add(args.collect()).await,
+        Some(other) => bail!("unknown command `{other}` (expected serve or add)"),
+    }
+}
+
+async fn serve() -> Result<()> {
     let database_url = env_or(
         "DATABASE_URL",
         "postgres://postgres:postgres@127.0.0.1:5432/bakemono?sslmode=disable",
@@ -58,6 +69,7 @@ async fn main() -> Result<()> {
         relays,
         signer,
         gateway,
+        kubo: Arc::new(kubo::Kubo::from_env()),
         cold_limiter: Arc::new(ratelimit::ColdLimiter::from_env()),
     };
     axum::serve(
@@ -66,6 +78,48 @@ async fn main() -> Result<()> {
     )
     .await?;
     Ok(())
+}
+
+// hand-feed one file into the new-stack catalog; superseded by `ingest` once the scrape worker lands
+async fn cmd_add(paths: Vec<String>) -> Result<()> {
+    if paths.is_empty() {
+        bail!("usage: bakemono-board add <file>...");
+    }
+    let database_url = env_or(
+        "DATABASE_URL",
+        "postgres://postgres:postgres@127.0.0.1:5432/bakemono?sslmode=disable",
+    );
+    let pool = db::connect(&database_url).await?;
+    let kubo = kubo::Kubo::from_env();
+    for path in paths {
+        let bytes = tokio::fs::read(&path).await?;
+        let sha256 = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(&bytes))
+        };
+        let size = bytes.len() as i64;
+        let mime = sniff_mime(&bytes);
+        let filename = std::path::Path::new(&path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_owned);
+        let cid = kubo.add(bytes, &path).await?;
+        db::insert_file(&pool, &cid, &sha256, size, mime, filename.as_deref()).await?;
+        println!("{cid}  {path}");
+    }
+    Ok(())
+}
+
+fn sniff_mime(bytes: &[u8]) -> &'static str {
+    match bytes {
+        [0xFF, 0xD8, 0xFF, ..] => "image/jpeg",
+        [0x89, b'P', b'N', b'G', ..] => "image/png",
+        [b'G', b'I', b'F', b'8', ..] => "image/gif",
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => "image/webp",
+        [_, _, _, _, b'f', b't', b'y', b'p', ..] => "video/mp4",
+        [0x1A, 0x45, 0xDF, 0xA3, ..] => "video/webm",
+        _ => "application/octet-stream",
+    }
 }
 
 // stdout logs so `docker logs` shows the gateway/indexer; librqbit's own chatter is pinned to warn by
