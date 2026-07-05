@@ -1441,6 +1441,111 @@ pub async fn mark_scraped(pool: &PgPool, url: &str, error: Option<&str>) -> Resu
     Ok(())
 }
 
+pub struct HeadRow {
+    pub version: i64,
+    pub head_cid: String,
+    pub root_cid: String,
+}
+
+pub async fn last_head(pool: &PgPool) -> Result<Option<HeadRow>> {
+    let row: Option<(i64, String, String)> = sqlx::query_as(
+        "SELECT version, head_cid, root_cid FROM manifest_heads ORDER BY version DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(version, head_cid, root_cid)| HeadRow { version, head_cid, root_cid }))
+}
+
+pub async fn record_head(
+    pool: &PgPool,
+    version: i64,
+    head_cid: &str,
+    root_cid: &str,
+    head_json: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO manifest_heads (version, head_cid, root_cid, head_json) VALUES ($1,$2,$3,$4)",
+    )
+    .bind(version)
+    .bind(head_cid)
+    .bind(root_cid)
+    .bind(head_json)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn latest_head_json(pool: &PgPool) -> Result<Option<String>> {
+    let json = sqlx::query_scalar(
+        "SELECT head_json FROM manifest_heads ORDER BY version DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(json)
+}
+
+// everything the manifest needs about one creator, denylisted content already excluded
+pub async fn shard_rows(
+    pool: &PgPool,
+    platform: &str,
+    creator_id: &str,
+) -> Result<Vec<ShardRow>> {
+    let rows: Vec<ShardRow> = sqlx::query_as(
+        "SELECT p.post_id, p.title, p.body, p.posted_at, p.tier,
+                pf.file_index, f.cid, f.sha256, f.size, f.mime, f.filename,
+                CASE WHEN EXISTS (SELECT 1 FROM denylist d WHERE d.cid = f.thumb_cid)
+                     THEN NULL ELSE f.thumb_cid END AS thumb_cid
+         FROM posts p
+         JOIN post_files pf ON (pf.platform, pf.creator_id, pf.post_id) = (p.platform, p.creator_id, p.post_id)
+         JOIN files f ON f.cid = pf.cid
+         WHERE p.platform = $1 AND p.creator_id = $2
+           AND NOT EXISTS (SELECT 1 FROM denylist d WHERE d.cid = f.cid)
+         ORDER BY p.posted_at DESC NULLS LAST, p.post_id DESC, pf.file_index",
+    )
+    .bind(platform)
+    .bind(creator_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+#[derive(sqlx::FromRow)]
+pub struct ShardRow {
+    pub post_id: String,
+    pub title: String,
+    pub body: String,
+    pub posted_at: Option<String>,
+    pub tier: Option<String>,
+    #[allow(dead_code)]
+    pub file_index: i32,
+    pub cid: String,
+    pub sha256: String,
+    pub size: i64,
+    pub mime: String,
+    pub filename: Option<String>,
+    pub thumb_cid: Option<String>,
+}
+
+pub async fn all_creators(pool: &PgPool) -> Result<Vec<(String, String, String)>> {
+    let rows = sqlx::query_as(
+        "SELECT platform, creator_id, creator FROM creators ORDER BY platform, creator_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+pub async fn revoked_entries(pool: &PgPool) -> Result<Vec<(String, Option<String>, String, String)>> {
+    let rows = sqlx::query_as(
+        "SELECT d.cid, f.sha256, d.reason, to_char(d.added_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+         FROM denylist d LEFT JOIN files f ON f.cid = d.cid
+         ORDER BY d.added_at",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS manifests (
     event_id   TEXT PRIMARY KEY,
@@ -1630,6 +1735,15 @@ CREATE TABLE IF NOT EXISTS sources (
     enabled         BOOLEAN NOT NULL DEFAULT TRUE,
     last_scraped_at TIMESTAMPTZ,
     last_error      TEXT
+);
+
+-- every published manifest version; head_json is served verbatim at /head.json
+CREATE TABLE IF NOT EXISTS manifest_heads (
+    version      BIGINT PRIMARY KEY,
+    head_cid     TEXT NOT NULL,
+    root_cid     TEXT NOT NULL,
+    head_json    TEXT NOT NULL,
+    published_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ";
 

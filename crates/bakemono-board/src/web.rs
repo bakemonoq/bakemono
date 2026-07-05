@@ -76,6 +76,7 @@ pub fn router(state: AppState) -> Router {
         .route("/t/{infohash}/meta", get(gateway_meta))
         .route("/t/{infohash}/f/{file_index}", get(gateway_file))
         .route("/f/{cid}", get(ipfs_file))
+        .route("/head.json", get(head_json))
         .with_state(state)
 }
 
@@ -1282,6 +1283,22 @@ async fn ipfs_file(
         Ok(resp) => resp,
         Err(e) => {
             tracing::error!("ipfs proxy response build failed: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+// the signed pointer to the current manifest version, served verbatim as published
+async fn head_json(State(pool): State<PgPool>) -> Response {
+    match db::latest_head_json(&pool).await {
+        Ok(Some(json)) => (
+            [(header::CONTENT_TYPE, "application/json"), (header::CACHE_CONTROL, "no-cache")],
+            json,
+        )
+            .into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "no manifest published yet").into_response(),
+        Err(e) => {
+            tracing::error!("head lookup failed: {e:#}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }

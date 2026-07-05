@@ -31,12 +31,14 @@ pub async fn run_scheduler(pool: PgPool, kubo: Arc<Kubo>) {
                 Vec::new()
             }
         };
+        let mut ingested = 0;
         for source in due {
             tracing::info!(url = %source.url, "scrape starting");
             let result = scrape_source(&pool, &kubo, &source.url, source.cookies.as_deref(), None).await;
             let error = match &result {
                 Ok(stats) => {
                     tracing::info!(url = %source.url, files = stats.files, posts = stats.posts, "scrape done");
+                    ingested += stats.files;
                     None
                 }
                 Err(e) => {
@@ -46,6 +48,11 @@ pub async fn run_scheduler(pool: PgPool, kubo: Arc<Kubo>) {
             };
             if let Err(e) = db::mark_scraped(&pool, &source.url, error.as_deref()).await {
                 tracing::error!("recording scrape result: {e:#}");
+            }
+        }
+        if ingested > 0 {
+            if let Err(e) = crate::publish::publish_if_changed(&pool, &kubo).await {
+                tracing::error!("manifest publish failed: {e:#}");
             }
         }
         tokio::time::sleep(Duration::from_secs(60)).await;

@@ -4,6 +4,7 @@ mod health;
 mod indexer;
 mod instance;
 mod kubo;
+mod publish;
 mod ratelimit;
 mod sanitize;
 mod scrape;
@@ -108,7 +109,7 @@ async fn cmd_add(paths: Vec<String>) -> Result<()> {
         db::insert_file(&pool, &cid, &sha256, size, mime, filename.as_deref(), None).await?;
         println!("{cid}  {path}");
     }
-    Ok(())
+    publish_and_report(&pool, &kubo).await
 }
 
 async fn cmd_ingest(dir: Option<String>) -> Result<()> {
@@ -119,7 +120,7 @@ async fn cmd_ingest(dir: Option<String>) -> Result<()> {
     let kubo = kubo::Kubo::from_env();
     let stats = scrape::ingest_dir(&pool, &kubo, std::path::Path::new(&dir)).await?;
     println!("{} files across {} posts ({} skipped)", stats.files, stats.posts, stats.skipped);
-    Ok(())
+    publish_and_report(&pool, &kubo).await
 }
 
 // one-off headless scrape: url, then optional cookies file and item limit in any order
@@ -145,7 +146,19 @@ async fn cmd_scrape(args: Vec<String>) -> Result<()> {
     let kubo = kubo::Kubo::from_env();
     let stats = scrape::scrape_source(&pool, &kubo, &url, cookies.as_deref(), limit).await?;
     println!("{} files across {} posts ({} skipped)", stats.files, stats.posts, stats.skipped);
+    publish_and_report(&pool, &kubo).await
+}
+
+async fn publish_and_report(pool: &sqlx::postgres::PgPool, kubo: &kubo::Kubo) -> Result<()> {
+    match publish::publish_if_changed(pool, kubo).await? {
+        Some(head) => println!("manifest v{} published, head {}", head.version, head_cid_of(pool).await?),
+        None => println!("manifest unchanged"),
+    }
     Ok(())
+}
+
+async fn head_cid_of(pool: &sqlx::postgres::PgPool) -> Result<String> {
+    Ok(db::last_head(pool).await?.map(|h| h.head_cid).unwrap_or_default())
 }
 
 // the scheduler's work list: `source add <url> [cookies.txt]` / `source ls`

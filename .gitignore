@@ -17,3 +17,4 @@ crates/bakemono-app/sidecars/
 board.toml
 /static/
 /target-linux
+board.key
