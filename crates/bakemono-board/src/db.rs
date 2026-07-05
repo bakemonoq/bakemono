@@ -1441,6 +1441,23 @@ pub async fn mark_scraped(pool: &PgPool, url: &str, error: Option<&str>) -> Resu
     Ok(())
 }
 
+pub async fn deny_cid(pool: &PgPool, cid: &str, reason: &str) -> Result<()> {
+    sqlx::query("INSERT INTO denylist (cid, reason) VALUES ($1,$2) ON CONFLICT (cid) DO NOTHING")
+        .bind(cid)
+        .bind(reason)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn thumb_of(pool: &PgPool, cid: &str) -> Result<Option<String>> {
+    let thumb = sqlx::query_scalar("SELECT thumb_cid FROM files WHERE cid = $1")
+        .bind(cid)
+        .fetch_optional(pool)
+        .await?;
+    Ok(thumb.flatten())
+}
+
 pub struct HeadRow {
     pub version: i64,
     pub head_cid: String,

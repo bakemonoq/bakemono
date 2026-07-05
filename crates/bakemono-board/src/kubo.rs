@@ -55,6 +55,24 @@ impl Kubo {
             .with_context(|| format!("kubo add returned no Hash for {label}"))
     }
 
+    // unpin only marks; bytes leave disk when kubo's GC runs (--enable-gc or `ipfs repo gc`)
+    pub async fn unpin(&self, cid: &str) -> Result<()> {
+        let resp = self
+            .http
+            .post(format!("{}/api/v0/pin/rm?arg={cid}", self.api))
+            .send()
+            .await
+            .with_context(|| format!("kubo api unreachable at {}", self.api))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            if !body.contains("not pinned") {
+                bail!("kubo unpin {cid} failed: {status} {body}");
+            }
+        }
+        Ok(())
+    }
+
     pub async fn fetch(&self, cid: &str, range: Option<&str>) -> Result<reqwest::Response> {
         let mut req = self.http.get(format!("{}/ipfs/{cid}", self.gateway));
         if let Some(range) = range {

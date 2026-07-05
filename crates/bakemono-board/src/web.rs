@@ -65,6 +65,7 @@ pub fn router(state: AppState) -> Router {
         .route("/mod/ban-contributor", post(mod_ban_contributor))
         .route("/mod/queue/{pubkey}/{platform}/{creator_id}", get(mod_queue_group))
         .route("/mod/takedown", post(mod_takedown))
+        .route("/mod/deny-cid", post(mod_deny_cid))
         .route("/mod/untakedown", post(mod_untakedown))
         .route("/report", post(submit_report))
         .route("/mod/report-dismiss", post(mod_report_dismiss))
@@ -1283,6 +1284,36 @@ async fn ipfs_file(
         Ok(resp) => resp,
         Err(e) => {
             tracing::error!("ipfs proxy response build failed: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct DenyCidForm {
+    cid: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+// new-stack takedown by CID: denylist + unpin + republish with the revoked entry
+async fn mod_deny_cid(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<DenyCidForm>,
+) -> Response {
+    if let Err(denied) = require_mod(&headers) {
+        return denied;
+    }
+    let cid = form.cid.trim();
+    if cid.is_empty() || !cid.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return (StatusCode::BAD_REQUEST, "bad cid").into_response();
+    }
+    let reason = form.reason.as_deref().map(str::trim).filter(|r| !r.is_empty()).unwrap_or("unspecified");
+    match crate::publish::revoke_cid(&state.pool, &state.kubo, cid, reason).await {
+        Ok(()) => Redirect::to("/mod").into_response(),
+        Err(e) => {
+            tracing::error!("deny-cid failed: {e:#}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }

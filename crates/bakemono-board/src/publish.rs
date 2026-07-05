@@ -55,6 +55,24 @@ pub async fn publish_if_changed(pool: &PgPool, kubo: &Kubo) -> Result<Option<Hea
     Ok(Some(head))
 }
 
+// the whole new-stack takedown: denylist (gateway stops serving), unpin (GC frees bytes,
+// followers drop it on pinset sync once cluster lands), republish (peers see it in revoked)
+pub async fn revoke_cid(pool: &PgPool, kubo: &Kubo, cid: &str, reason: &str) -> Result<()> {
+    // the preview of revoked content goes with it
+    if let Some(thumb) = db::thumb_of(pool, cid).await? {
+        db::deny_cid(pool, &thumb, reason).await?;
+        if let Err(e) = kubo.unpin(&thumb).await {
+            tracing::warn!("unpin thumb {thumb}: {e:#}");
+        }
+    }
+    db::deny_cid(pool, cid, reason).await?;
+    if let Err(e) = kubo.unpin(cid).await {
+        tracing::warn!("unpin {cid}: {e:#}");
+    }
+    publish_if_changed(pool, kubo).await?;
+    Ok(())
+}
+
 async fn build_shard(
     pool: &PgPool,
     platform: &str,
