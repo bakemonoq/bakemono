@@ -123,15 +123,97 @@ pub async fn scrape_feed(
     request.cookies = Some(Cookies::File(cookie_file.path.clone()));
     request.options = scrape_options(platform);
 
-    // partial errors (a single gated post, a dead CDN link) are normal for a big feed; ingest what
-    // downloaded regardless. a hard failure still leaves files on disk for the next round to sweep
+    // ingest each file the moment gallery-dl finishes downloading it, streaming paths over a channel
+    // to a concurrent consumer. content shows up as it downloads, and a restart mid-scrape only loses
+    // the one file in flight - everything already ingested is safe in the catalog
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
     let scraper = scraper_for(platform);
-    if let Err(e) = scraper.scrape_streaming(&request, CancellationToken::new(), |_| {}).await {
-        tracing::warn!(platform, "feed scrape reported errors: {e:#}");
+    let scrape = async {
+        let r = scraper
+            .scrape_streaming(&request, CancellationToken::new(), move |p| {
+                let _ = tx.send(p);
+            })
+            .await;
+        if let Err(e) = r {
+            // partial errors (a gated post, a dead CDN link) are normal for a big feed
+            tracing::warn!(platform, "feed scrape reported errors: {e:#}");
+        }
+    };
+    let consume = async {
+        let mut acc = Accum::default();
+        while let Some(media) = rx.recv().await {
+            if is_sidecar(&media) || is_thumb(&media) {
+                continue;
+            }
+            let sidecar = sidecar_path(&media);
+            // the metadata sidecar is written right after gallery-dl prints the media path; give it a
+            // moment, and if it never lands leave the file for the final sweep
+            if !wait_for_sidecar(&sidecar).await {
+                continue;
+            }
+            match ingest_pair(pool, kubo, &media, &sidecar).await {
+                Ok(meta) => {
+                    acc.record(&meta);
+                    let _ = std::fs::remove_file(&media);
+                    let _ = std::fs::remove_file(&sidecar);
+                }
+                Err(e) => {
+                    tracing::warn!("skipping {}: {e:#}", media.display());
+                    acc.stats.skipped += 1;
+                }
+            }
+        }
+        acc
+    };
+    let (_, mut acc) = tokio::join!(scrape, consume);
+
+    // final sweep: files whose sidecar was slow, plus orphans a prior interrupted run left behind
+    let (sweep_stats, sweep_creators) = ingest_staging(pool, kubo, &staging).await?;
+    acc.merge_sweep(sweep_stats, sweep_creators);
+    Ok(acc.finish())
+}
+
+async fn wait_for_sidecar(sidecar: &Path) -> bool {
+    for _ in 0..10 {
+        if sidecar.is_file() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    // sweep the whole staging dir (also recovers files a prior interrupted run left behind), ingest
-    // each, and delete it so disk stays bounded and daily rounds only carry new posts
-    ingest_staging(pool, kubo, &staging).await
+    sidecar.is_file()
+}
+
+// accumulates ingest stats and the distinct creators seen across a scrape
+#[derive(Default)]
+struct Accum {
+    stats: IngestStats,
+    posts_seen: HashSet<String>,
+    creators: std::collections::BTreeMap<String, CreatorSeen>,
+}
+
+impl Accum {
+    fn record(&mut self, meta: &PostMeta) {
+        self.stats.files += 1;
+        if self.posts_seen.insert(meta.post_key()) {
+            self.stats.posts += 1;
+        }
+        self.creators.entry(meta.creator_id.clone()).or_insert_with(|| {
+            (meta.creator_id.clone(), meta.creator.clone(), meta.creator_url.clone().unwrap_or_default())
+        });
+    }
+
+    fn merge_sweep(&mut self, stats: IngestStats, creators: Vec<CreatorSeen>) {
+        self.stats.files += stats.files;
+        self.stats.posts += stats.posts;
+        self.stats.skipped += stats.skipped;
+        for c in creators {
+            self.creators.entry(c.0.clone()).or_insert(c);
+        }
+    }
+
+    fn finish(self) -> (IngestStats, Vec<CreatorSeen>) {
+        (self.stats, self.creators.into_values().collect())
+    }
 }
 
 // one-off operator scrape of a specific URL with a raw cookies.txt; batch ingest, keeps files
