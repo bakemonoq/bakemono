@@ -1337,7 +1337,6 @@ fn render(title: &str, body: Markup) -> Html<String> {
                     meta name="viewport" content="width=device-width, initial-scale=1";
                     meta name="referrer" content="no-referrer";
                     title { (tab) }
-                    link rel="alternate" type="application/rss+xml" title="seed feed" href="/feed.xml";
                     link rel="stylesheet" href=(concat!("/style.css?v=", env!("CARGO_PKG_VERSION")));
                     // operator accent override; the base sheet stays static and cacheable
                     @if let Some(accent) = &cfg.accent {
