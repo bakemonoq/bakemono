@@ -98,6 +98,31 @@ impl Scraper {
         Ok(String::from_utf8_lossy(&output).trim().to_string())
     }
 
+    // resolve the first feed item without downloading: a cookie that authenticates yields at least
+    // one media URL on stdout, a dead one prints nothing (gallery-dl exits 0 either way, so the
+    // signal is stdout content, not the exit code). Ok(true) = live with reachable content
+    pub async fn probe(&self, url: &str, cookies: Option<&Path>) -> Result<bool, Error> {
+        let mut args = vec![
+            "--get-urls".to_string(),
+            "--range".to_string(),
+            "1-1".to_string(),
+        ];
+        if let Some(path) = cookies {
+            args.push("--cookies".to_string());
+            args.push(path.to_string_lossy().into_owned());
+        }
+        args.push(url.to_string());
+        let mut cmd = tokio::process::Command::new(&self.binary);
+        cmd.args(&args).stdout(Stdio::piped()).stderr(Stdio::null());
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000);
+        let output = cmd.output().await.map_err(|source| Error::Spawn {
+            binary: self.binary.to_string_lossy().into_owned(),
+            source,
+        })?;
+        Ok(!output.stdout.iter().all(u8::is_ascii_whitespace))
+    }
+
     pub fn scrape(&self, request: &ScrapeRequest) -> Result<ScrapeOutcome, Error> {
         std::fs::create_dir_all(&request.dest).map_err(|source| Error::Io {
             path: request.dest.clone(),

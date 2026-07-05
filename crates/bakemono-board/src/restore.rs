@@ -62,6 +62,7 @@ async fn restore_shard(pool: &PgPool, kubo: &Kubo, shard: &Shard) -> Result<()> 
                 body: post.body.clone(),
                 posted_at: post.posted_at.clone(),
                 tier: post.tier.clone().unwrap_or_else(|| "unknown".into()),
+                creator_url: None,
             };
             db::insert_file(
                 pool,

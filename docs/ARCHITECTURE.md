@@ -81,14 +81,14 @@ peer board       -> GET /head.json, verify sig, import shards, apply revoked
 
 ## Contributor cookies
 
-The archive stays current by scraping on behalf of many subscribers, not one operator account. The lifecycle is built around never holding a usable credential at rest:
+The archive stays current by scraping on behalf of many subscribers, not one operator account. Enumeration is gallery-dl's job: each supported platform has a "your subscriptions" feed extractor (Patreon `/home`, Fanbox `/home/supporting`, Boosty `/`) that, given the cookie, walks every creator the cookie reaches and paginates the full history. We do not hand-write per-platform discovery; adding a platform is a feed URL plus a cookie name. The lifecycle is built around never holding a usable credential at rest:
 
-- **Submission.** `/contribute` takes a platform + a session cookie value. While it holds the plaintext, the board hits the platform's API to (a) confirm the cookie authenticates and (b) enumerate the creators it can reach. A rejected cookie is reported and nothing is stored.
+- **Submission.** `/contribute` takes a platform + a session cookie value. While it holds the plaintext, the board runs a one-item feed probe with gallery-dl: a live cookie yields content, a dead one yields nothing and is rejected. Nothing is stored on rejection.
 - **Encryption.** If the contributor opts into daily import, the token is sealed - a fresh AES-256-GCM key per cookie, RSA-4096-OAEP-wrapped - and only the ciphertext, the wrapped key, and the nonce are stored. The RSA private key never lives on the server, so a database dump yields nothing decryptable. Without opt-in, the token is used for one import and discarded.
-- **First import.** Runs immediately in the background using the plaintext already in hand, so contributed content appears without waiting for a keyed round.
-- **Daily round.** `bakemono autoimport` reads the RSA private key from stdin (piped over SSH from the operator's machine, never written to disk), decrypts each live cookie in memory, refreshes its creator list (adding new subscriptions, deactivating dropped ones), scrapes new posts, and re-seals nothing. A cookie the platform rejects is marked dead. Operators who accept keeping the key on the box can set `BAKEMONO_COOKIE_PRIVKEY` and let `serve` run the round on a schedule instead.
+- **First import.** Runs immediately in the background using the plaintext already in hand: gallery-dl scrapes the whole subscription feed, the board ingests each file and derives the creator set from the sidecar metadata.
+- **Daily round.** `bakemono autoimport` reads the RSA private key from stdin (piped over SSH from the operator's machine, never written to disk), decrypts each live cookie in memory, re-scrapes its feed (gallery-dl's download archive keeps it to new posts), and re-seals nothing. A cookie the platform rejects is marked dead. Operators who accept keeping the key on the box can set `BAKEMONO_COOKIE_PRIVKEY` and let `serve` run the round on a schedule instead.
 
-Cookies are operational state: they live only in postgres, never in the manifest, never replicated to keepers.
+Only platforms with a subscription-feed extractor in gallery-dl fit this model (Patreon, Fanbox, Boosty). Platforms that expose only per-creator scraping cannot enumerate a cookie's subscriptions and are out of scope. Cookies are operational state: they live only in postgres, never in the manifest, never replicated to keepers.
 
 ## Moderation and takedowns
 

@@ -671,7 +671,7 @@ fn contribute_body(error: Option<&str>) -> Markup {
             label { "Platform"
                 select name="platform" {
                     @for p in crate::platform::live_platforms() {
-                        option value=(p.0) { (p.1) }
+                        option value=(p.id) { (p.label) }
                     }
                 }
             }
@@ -686,7 +686,7 @@ fn contribute_body(error: Option<&str>) -> Markup {
         p { "Sign in to the site, open your browser's developer tools (F12), go to Application/Storage -> Cookies -> the site, and copy the value of:" }
         ul.list {
             @for p in crate::platform::live_platforms() {
-                li { (p.1) ": " code { (p.2) } }
+                li { (p.label) ": " code { (p.cookie_name) } }
             }
         }
         p.muted { "The value is used to fetch your paid posts, then discarded unless you opted into daily import. Encryption is RSA-4096; the key that could decrypt stored cookies is kept offline, so a database breach cannot expose them. Everything is at your own risk" }
@@ -716,36 +716,33 @@ async fn contribute_submit(
         return render("contribute", contribute_body(Some("Pick a platform and paste a cookie value"))).into_response();
     }
 
-    // discover now, while we still hold the plaintext: this both validates the cookie and loads the
-    // creator list. anything past here treats the cookie as a live secret to protect
-    let discovered = match crate::platform::discover(platform, token).await {
-        Ok(Some(list)) => list,
-        Ok(None) => return render("contribute", contribute_body(Some("That cookie was rejected by the site - make sure you are signed in and copied the whole value"))).into_response(),
-        Err(e) => return render("contribute", contribute_body(Some(&format!("Could not verify the cookie: {e}")))).into_response(),
-    };
+    // validate while we still hold the plaintext: a quick feed probe tells live from dead. anything
+    // past here treats the cookie as a live secret to protect
+    if !crate::scrape::probe_cookie(platform, token).await {
+        return render("contribute", contribute_body(Some("That cookie was rejected by the site - make sure you are signed in and copied the whole value"))).into_response();
+    }
 
     let allow_autoimport = form.allow_autoimport.is_some();
     let allow_debug = form.allow_debug.is_some();
-    let rows: Vec<(String, String, String)> =
-        discovered.iter().map(|d| (d.id.clone(), d.name.clone(), d.url.clone())).collect();
 
-    // persist the sealed cookie only if the contributor opted into daily import
-    if allow_autoimport || allow_debug {
-        match seal_and_store(&state, &pubkey, platform, token, allow_autoimport, allow_debug, &rows).await {
-            Ok(cookie_id) => spawn_first_import(&state, cookie_id, platform, token),
+    // persist the sealed cookie only if the contributor opted into daily import; either way the
+    // first import runs now in the background off the plaintext, no private key needed
+    let stored = if allow_autoimport || allow_debug {
+        match seal_and_store(&state, &pubkey, platform, token, allow_autoimport, allow_debug).await {
+            Ok(id) => Some(id),
             Err(e) => {
                 tracing::error!("storing cookie failed: {e:#}");
                 return (StatusCode::INTERNAL_SERVER_ERROR, "could not store the cookie").into_response();
             }
         }
     } else {
-        // one-shot import without persistence: hold the plaintext only in the spawned task
-        spawn_oneshot_import(&state, platform.to_string(), token.to_string(), rows);
-    }
+        None
+    };
+    spawn_import(&state, stored, platform.to_string(), token.to_string());
 
     render("contribute", html! {
         h1 { "Thank you" }
-        p { "Found " (discovered.len()) @if discovered.len() == 1 { " creator" } @else { " creators" } " you can reach. Importing their posts now - they will appear in the archive shortly" }
+        p { "Your cookie checks out. Importing everything you are subscribed to now - it will appear in the archive shortly" }
         @if allow_autoimport { p.muted { "Your cookie is stored encrypted and new posts will be imported daily" } }
         @else { p.muted { "Your cookie was not stored; this was a one-time import" } }
         p { a href="/" { "Back to the board" } }
@@ -759,43 +756,29 @@ async fn seal_and_store(
     token: &str,
     allow_autoimport: bool,
     allow_debug: bool,
-    rows: &[(String, String, String)],
 ) -> anyhow::Result<i64> {
     let sealed = crate::crypto::seal(pubkey, token.as_bytes())?;
     let fp = crate::crypto::fingerprint(platform, token);
-    let id = db::upsert_cookie(&state.pool, platform, &fp, &sealed, allow_autoimport, allow_debug).await?;
-    db::set_cookie_creators(&state.pool, id, platform, rows).await?;
-    Ok(id)
+    db::upsert_cookie(&state.pool, platform, &fp, &sealed, allow_autoimport, allow_debug).await
 }
 
-fn spawn_first_import(state: &AppState, cookie_id: i64, platform: &str, token: &str) {
-    let (pool, kubo, platform, token) =
-        (state.pool.clone(), state.kubo.clone(), platform.to_string(), token.to_string());
-    tokio::spawn(async move {
-        let files = crate::scrape::scrape_cookie_creators(&pool, &kubo, cookie_id, &platform, &token).await;
-        if files > 0 {
-            if let Err(e) = crate::publish::publish_if_changed(&pool, &kubo).await {
-                tracing::error!("publish after first import failed: {e:#}");
-            }
-        }
-    });
-}
-
-fn spawn_oneshot_import(state: &AppState, platform: String, token: String, rows: Vec<(String, String, String)>) {
+// scrape the whole feed with the plaintext; the token lives only in this task. if the cookie was
+// stored, record which creators it reached for the mod page
+fn spawn_import(state: &AppState, cookie_id: Option<i64>, platform: String, token: String) {
     let (pool, kubo) = (state.pool.clone(), state.kubo.clone());
     tokio::spawn(async move {
-        let Some(cookie_txt) = crate::platform::netscape_cookie(&platform, &token) else { return };
-        let mut files = 0;
-        for (_, name, url) in &rows {
-            match crate::scrape::scrape_source(&pool, &kubo, url, Some(&cookie_txt), None).await {
-                Ok(s) => files += s.files,
-                Err(e) => tracing::error!(creator = %name, "one-shot scrape failed: {e:#}"),
+        match crate::scrape::scrape_feed(&pool, &kubo, &platform, &token).await {
+            Ok((stats, creators)) => {
+                if let Some(id) = cookie_id {
+                    db::set_cookie_creators(&pool, id, &platform, &creators).await.ok();
+                }
+                if stats.files > 0 {
+                    if let Err(e) = crate::publish::publish_if_changed(&pool, &kubo).await {
+                        tracing::error!("publish after import failed: {e:#}");
+                    }
+                }
             }
-        }
-        if files > 0 {
-            if let Err(e) = crate::publish::publish_if_changed(&pool, &kubo).await {
-                tracing::error!("publish after one-shot import failed: {e:#}");
-            }
+            Err(e) => tracing::error!(platform, "import failed: {e:#}"),
         }
     });
 }

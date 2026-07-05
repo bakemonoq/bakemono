@@ -1,151 +1,70 @@
-use anyhow::{bail, Context, Result};
-use serde_json::Value;
+// every platform is now just a gallery-dl feed entry point plus the session cookie it needs.
+// gallery-dl enumerates the whole subscription feed from the cookie and downloads it; we no longer
+// hand-write per-platform discovery. only platforms with a "your subscriptions" feed extractor in
+// gallery-dl can work this way (Patreon, Fanbox, Boosty). others expose only per-creator scraping.
+pub struct Platform {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub cookie_name: &'static str,
+    pub cookie_domain: &'static str,
+    pub feed_url: &'static str,
+    pub live: bool,
+}
 
-const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36";
-
-// the two platforms in scope. tuple: (id, label, session cookie name, cookie domain, live).
-// `live` gates the contribute form: a platform is live only once its discovery is verified against a
-// real cookie. scraping a known creator is gallery-dl's job and works for many sites, but the form
-// needs discovery (cookie -> reachable creators), which is hand-written per platform
-pub const PLATFORMS: &[(&str, &str, &str, &str, bool)] = &[
-    ("patreon", "Patreon", "session_id", "patreon.com", true),
-    ("fanbox", "Fanbox", "FANBOXSESSID", "fanbox.cc", false),
+pub const PLATFORMS: &[Platform] = &[
+    Platform {
+        id: "patreon",
+        label: "Patreon",
+        cookie_name: "session_id",
+        cookie_domain: "patreon.com",
+        feed_url: "https://www.patreon.com/home",
+        live: true,
+    },
+    Platform {
+        id: "fanbox",
+        label: "Fanbox",
+        cookie_name: "FANBOXSESSID",
+        cookie_domain: "fanbox.cc",
+        feed_url: "https://fanbox.cc/home/supporting",
+        live: true,
+    },
+    Platform {
+        id: "boosty",
+        label: "Boosty",
+        cookie_name: "auth",
+        cookie_domain: "boosty.to",
+        feed_url: "https://boosty.to/",
+        live: true,
+    },
 ];
 
-pub fn is_live(platform: &str) -> bool {
-    PLATFORMS.iter().any(|p| p.0 == platform && p.4)
+fn find(id: &str) -> Option<&'static Platform> {
+    PLATFORMS.iter().find(|p| p.id == id)
 }
 
-// what the contribute form offers, in order
-pub fn live_platforms() -> impl Iterator<Item = &'static (&'static str, &'static str, &'static str, &'static str, bool)> {
-    PLATFORMS.iter().filter(|p| p.4)
+pub fn is_live(id: &str) -> bool {
+    find(id).is_some_and(|p| p.live)
 }
 
-pub fn label(platform: &str) -> &str {
-    PLATFORMS.iter().find(|p| p.0 == platform).map(|p| p.1).unwrap_or(platform)
+pub fn live_platforms() -> impl Iterator<Item = &'static Platform> {
+    PLATFORMS.iter().filter(|p| p.live)
 }
 
-fn spec(platform: &str) -> Option<(&'static str, &'static str)> {
-    PLATFORMS.iter().find(|p| p.0 == platform).map(|p| (p.2, p.3))
+pub fn label(id: &str) -> &str {
+    find(id).map(|p| p.label).unwrap_or(id)
+}
+
+pub fn feed_url(id: &str) -> Option<&'static str> {
+    find(id).map(|p| p.feed_url)
 }
 
 // a Netscape cookies.txt gallery-dl can read, holding just the session cookie
-pub fn netscape_cookie(platform: &str, token: &str) -> Option<String> {
-    let (name, domain) = spec(platform)?;
+pub fn netscape_cookie(id: &str, token: &str) -> Option<String> {
+    let p = find(id)?;
     Some(format!(
-        "# Netscape HTTP Cookie File\n.{domain}\tTRUE\t/\tTRUE\t9999999999\t{name}\t{token}\n"
+        "# Netscape HTTP Cookie File\n.{}\tTRUE\t/\tTRUE\t9999999999\t{}\t{}\n",
+        p.cookie_domain, p.cookie_name, token
     ))
-}
-
-pub struct Discovered {
-    pub id: String,
-    pub name: String,
-    pub url: String,
-}
-
-// Ok(Some(list)) = cookie is live (list may be empty); Ok(None) = cookie rejected (dead);
-// Err = transport/unsupported, status unchanged
-pub async fn discover(platform: &str, token: &str) -> Result<Option<Vec<Discovered>>> {
-    match platform {
-        "patreon" => discover_patreon(token).await,
-        "fanbox" => discover_fanbox(token).await,
-        other => bail!("auto-discovery for {} is not available yet", label(other)),
-    }
-}
-
-async fn discover_patreon(token: &str) -> Result<Option<Vec<Discovered>>> {
-    let client = client()?;
-    let cookie = format!("session_id={token}");
-
-    // authenticate first: no data.id means the cookie is dead, distinct from a live cookie with no pledges
-    let me = client
-        .get("https://www.patreon.com/api/current_user?json-api-version=1.0")
-        .header("Cookie", &cookie)
-        .send()
-        .await
-        .context("reaching patreon")?;
-    if me.status() == 401 || me.status() == 403 {
-        return Ok(None);
-    }
-    if !me.status().is_success() {
-        bail!("patreon returned {}", me.status());
-    }
-    let me: Value = me.json().await.context("patreon response not JSON")?;
-    if me["data"]["id"].as_str().is_none() {
-        return Ok(None);
-    }
-
-    // pledges is the authoritative subscription list; memberships.campaign catches the newer shape.
-    // merge and dedup, since which one is populated varies by account and api version
-    let mut out: Vec<Discovered> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for url in [
-        "https://www.patreon.com/api/pledges?include=campaign&fields[campaign]=name,url,vanity&json-api-version=1.0",
-        "https://www.patreon.com/api/current_user?include=memberships.campaign&fields[campaign]=name,url,vanity&json-api-version=1.0",
-    ] {
-        let Ok(resp) = client.get(url).header("Cookie", &cookie).send().await else {
-            continue;
-        };
-        if !resp.status().is_success() {
-            continue;
-        }
-        let Ok(body) = resp.json::<Value>().await else { continue };
-        for item in body["included"].as_array().into_iter().flatten() {
-            if item["type"] != "campaign" {
-                continue;
-            }
-            let id = item["id"].as_str().unwrap_or_default().to_string();
-            if id.is_empty() || !seen.insert(id.clone()) {
-                continue;
-            }
-            let attrs = &item["attributes"];
-            let name = attrs["name"].as_str().unwrap_or_default().to_string();
-            let url = attrs["url"]
-                .as_str()
-                .map(str::to_owned)
-                .or_else(|| attrs["vanity"].as_str().map(|v| format!("https://www.patreon.com/{v}")))
-                .unwrap_or_else(|| format!("https://www.patreon.com/user?u={id}"));
-            out.push(Discovered { id, name, url });
-        }
-    }
-    Ok(Some(out))
-}
-
-async fn discover_fanbox(token: &str) -> Result<Option<Vec<Discovered>>> {
-    let resp = client()?
-        .get("https://api.fanbox.cc/plan.listSupporting")
-        .header("Cookie", format!("FANBOXSESSID={token}"))
-        .header("Origin", "https://www.fanbox.cc")
-        .send()
-        .await
-        .context("reaching fanbox")?;
-    if resp.status() == 401 {
-        return Ok(None);
-    }
-    if !resp.status().is_success() {
-        bail!("fanbox returned {}", resp.status());
-    }
-    let body: Value = resp.json().await.context("fanbox response not JSON")?;
-    let Some(plans) = body["body"].as_array() else {
-        return Ok(None);
-    };
-    let mut out = Vec::new();
-    for plan in plans {
-        let id = plan["creatorId"].as_str().unwrap_or_default().to_string();
-        let name = plan["user"]["name"].as_str().unwrap_or_default().to_string();
-        if !id.is_empty() {
-            out.push(Discovered { url: format!("https://{id}.fanbox.cc"), id, name });
-        }
-    }
-    Ok(Some(out))
-}
-
-fn client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .user_agent(UA)
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .context("building http client")
 }
 
 #[cfg(test)]
@@ -160,8 +79,10 @@ mod tests {
         assert!(netscape_cookie("nope", "x").is_none());
     }
 
-    #[tokio::test]
-    async fn unsupported_platform_errors() {
-        assert!(discover("gumroad", "x").await.is_err());
+    #[test]
+    fn every_live_platform_has_a_feed() {
+        for p in live_platforms() {
+            assert!(p.feed_url.starts_with("https://"), "{}", p.id);
+        }
     }
 }

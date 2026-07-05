@@ -43,8 +43,8 @@ pub async fn run_scheduler(pool: PgPool, kubo: Arc<Kubo>) {
     }
 }
 
-// one keyed round: decrypt every live cookie, refresh its creator list, scrape new posts. the
-// plaintext token exists only in this function's stack and is dropped as each cookie finishes
+// one keyed round: decrypt every live cookie, scrape its whole subscription feed, ingest new posts.
+// the plaintext token exists only in this function's stack and is dropped as each cookie finishes
 pub async fn autoimport_round(pool: &PgPool, kubo: &Kubo, privkey_pem: &str) -> Result<()> {
     let cookies = db::autoimport_cookies(pool).await?;
     tracing::info!(count = cookies.len(), "autoimport round starting");
@@ -57,22 +57,21 @@ pub async fn autoimport_round(pool: &PgPool, kubo: &Kubo, privkey_pem: &str) -> 
                 continue;
             }
         };
-        match crate::platform::discover(&cookie.platform, &token).await {
-            Ok(None) => {
-                db::mark_cookie(pool, cookie.id, "dead", Some("cookie rejected")).await?;
-                continue;
-            }
-            Ok(Some(creators)) => {
-                let rows: Vec<(String, String, String)> =
-                    creators.into_iter().map(|c| (c.id, c.name, c.url)).collect();
-                db::set_cookie_creators(pool, cookie.id, &cookie.platform, &rows).await?;
+        if !probe_cookie(&cookie.platform, &token).await {
+            db::mark_cookie(pool, cookie.id, "dead", Some("cookie rejected by the platform")).await?;
+            continue;
+        }
+        match scrape_feed(pool, kubo, &cookie.platform, &token).await {
+            Ok((stats, creators)) => {
+                db::set_cookie_creators(pool, cookie.id, &cookie.platform, &creators).await.ok();
                 db::mark_cookie(pool, cookie.id, "live", None).await?;
+                ingested += stats.files;
             }
             Err(e) => {
-                db::mark_cookie(pool, cookie.id, "live", Some(&format!("discovery: {e:#}"))).await?;
+                tracing::error!(cookie = cookie.id, "feed scrape failed: {e:#}");
+                db::mark_cookie(pool, cookie.id, "live", Some(&format!("{e:#}"))).await?;
             }
         }
-        ingested += scrape_cookie_creators(pool, kubo, cookie.id, &cookie.platform, &token).await;
     }
     if ingested > 0 {
         crate::publish::publish_if_changed(pool, kubo).await?;
@@ -81,31 +80,57 @@ pub async fn autoimport_round(pool: &PgPool, kubo: &Kubo, privkey_pem: &str) -> 
     Ok(())
 }
 
-// scrape every active creator this cookie reaches with the given plaintext token
-pub async fn scrape_cookie_creators(
-    pool: &PgPool,
-    kubo: &Kubo,
-    cookie_id: i64,
-    platform: &str,
-    token: &str,
-) -> usize {
-    let Some(cookie_txt) = crate::platform::netscape_cookie(platform, token) else {
-        return 0;
-    };
-    let creators = db::active_cookie_creators(pool, cookie_id).await.unwrap_or_default();
-    let mut files = 0;
-    for (name, url) in creators {
-        match scrape_source(pool, kubo, &url, Some(&cookie_txt), None).await {
-            Ok(stats) => {
-                tracing::info!(creator = %name, files = stats.files, "scraped");
-                files += stats.files;
-            }
-            Err(e) => tracing::error!(creator = %name, "scrape failed: {e:#}"),
-        }
+// does this cookie still authenticate? a live cookie lets gallery-dl read the first feed item, a
+// dead one hits a login wall. unified across platforms, no per-platform API code
+pub async fn probe_cookie(platform: &str, token: &str) -> bool {
+    let staging = staging_dir();
+    if std::fs::create_dir_all(&staging).is_err() {
+        return false;
     }
-    files
+    let (Some(feed_url), Some(cookie_txt)) =
+        (crate::platform::feed_url(platform), crate::platform::netscape_cookie(platform, token))
+    else {
+        return false;
+    };
+    let Ok(cookie_file) = CookieFile::write(&staging, &cookie_txt) else {
+        return false;
+    };
+    scraper().probe(feed_url, Some(&cookie_file.path)).await.unwrap_or(false)
 }
 
+pub type CreatorSeen = (String, String, String);
+
+// scrape the platform's whole subscription feed with the cookie. gallery-dl enumerates every
+// creator the cookie can reach and paginates the full history; we ingest and derive the creator
+// set from the sidecars. returns ingest stats and the distinct creators seen
+pub async fn scrape_feed(
+    pool: &PgPool,
+    kubo: &Kubo,
+    platform: &str,
+    token: &str,
+) -> Result<(IngestStats, Vec<CreatorSeen>)> {
+    let staging = staging_dir();
+    std::fs::create_dir_all(&staging).with_context(|| format!("creating {}", staging.display()))?;
+    let feed_url = crate::platform::feed_url(platform).context("platform has no feed")?;
+    let cookie_txt = crate::platform::netscape_cookie(platform, token).context("no cookie name")?;
+    let cookie_file = CookieFile::write(&staging, &cookie_txt)?;
+
+    let mut request = ScrapeRequest::new(feed_url, staging.clone());
+    request.archive = Some(staging.join("archive.sqlite3"));
+    request.cookies = Some(Cookies::File(cookie_file.path.clone()));
+
+    // partial errors (a single gated post, a dead CDN link) are normal for a big feed; ingest what
+    // downloaded regardless. a hard failure still leaves files on disk for the next round to sweep
+    let scraper = scraper();
+    if let Err(e) = scraper.scrape_streaming(&request, CancellationToken::new(), |_| {}).await {
+        tracing::warn!(platform, "feed scrape reported errors: {e:#}");
+    }
+    // sweep the whole staging dir (also recovers files a prior interrupted run left behind), ingest
+    // each, and delete it so disk stays bounded and daily rounds only carry new posts
+    ingest_staging(pool, kubo, &staging).await
+}
+
+// one-off operator scrape of a specific URL with a raw cookies.txt; batch ingest, keeps files
 pub async fn scrape_source(
     pool: &PgPool,
     kubo: &Kubo,
@@ -137,16 +162,23 @@ pub async fn scrape_source(
         })
         .await?;
 
-    // only what this run downloaded; --download-archive keeps re-runs from re-printing old items
     let printed = std::mem::take(&mut *printed.lock().expect("printed paths"));
-    ingest_files(pool, kubo, &printed).await
+    let (stats, _) = ingest_paths(pool, kubo, &printed, false).await;
+    Ok(stats)
 }
 
-// import a directory of already-scraped media + gallery-dl sidecars (bootstrap dumps, old staging)
+// ingest every media+sidecar pair under a directory, deleting each after it lands in the archive
+async fn ingest_staging(pool: &PgPool, kubo: &Kubo, dir: &Path) -> Result<(IngestStats, Vec<CreatorSeen>)> {
+    let mut files = Vec::new();
+    walk(dir, &mut files)?;
+    Ok(ingest_paths(pool, kubo, &files, true).await)
+}
+
+// import a directory of already-scraped media + gallery-dl sidecars (bootstrap dumps); keeps files
 pub async fn ingest_dir(pool: &PgPool, kubo: &Kubo, dir: &Path) -> Result<IngestStats> {
     let mut files = Vec::new();
     walk(dir, &mut files)?;
-    ingest_files(pool, kubo, &files).await
+    Ok(ingest_paths(pool, kubo, &files, false).await.0)
 }
 
 #[derive(Default)]
@@ -156,10 +188,18 @@ pub struct IngestStats {
     pub skipped: usize,
 }
 
-async fn ingest_files(pool: &PgPool, kubo: &Kubo, files: &[PathBuf]) -> Result<IngestStats> {
+// ingest each media+sidecar pair; when `delete`, remove each file once it is safely in the archive
+// so the staging dir stays bounded. also returns the distinct creators seen, keyed platform+id
+async fn ingest_paths(
+    pool: &PgPool,
+    kubo: &Kubo,
+    files: &[PathBuf],
+    delete: bool,
+) -> (IngestStats, Vec<CreatorSeen>) {
     let present: HashSet<&PathBuf> = files.iter().collect();
     let mut stats = IngestStats::default();
     let mut posts_seen = HashSet::new();
+    let mut creators: std::collections::BTreeMap<(String, String), CreatorSeen> = Default::default();
     for media in files {
         if is_sidecar(media) || is_thumb(media) {
             continue;
@@ -175,6 +215,15 @@ async fn ingest_files(pool: &PgPool, kubo: &Kubo, files: &[PathBuf]) -> Result<I
                 if posts_seen.insert(meta.post_key()) {
                     stats.posts += 1;
                 }
+                creators
+                    .entry((meta.platform.clone(), meta.creator_id.clone()))
+                    .or_insert_with(|| {
+                        (meta.creator_id.clone(), meta.creator.clone(), meta.creator_url.clone().unwrap_or_default())
+                    });
+                if delete {
+                    let _ = std::fs::remove_file(media);
+                    let _ = std::fs::remove_file(&sidecar);
+                }
             }
             Err(e) => {
                 tracing::warn!("skipping {}: {e:#}", media.display());
@@ -182,7 +231,7 @@ async fn ingest_files(pool: &PgPool, kubo: &Kubo, files: &[PathBuf]) -> Result<I
             }
         }
     }
-    Ok(stats)
+    (stats, creators.into_values().collect())
 }
 
 async fn ingest_pair(pool: &PgPool, kubo: &Kubo, media: &Path, sidecar: &Path) -> Result<PostMeta> {
@@ -228,6 +277,7 @@ pub struct PostMeta {
     pub body: String,
     pub posted_at: Option<String>,
     pub tier: String,
+    pub creator_url: Option<String>,
 }
 
 impl PostMeta {
@@ -256,6 +306,8 @@ fn post_meta(sidecar: &Path) -> Result<PostMeta> {
         body: string_at(&meta, &["content"]).unwrap_or_default(),
         posted_at: string_at(&meta, &["published_at"]).or_else(|| string_at(&meta, &["date"])),
         tier: tier_of(&meta),
+        creator_url: string_at(&meta, &["creator", "url"])
+            .or_else(|| string_at(&meta, &["creator", "vanity"]).map(|v| format!("https://www.patreon.com/{v}"))),
     })
 }
 

@@ -485,15 +485,6 @@ pub async fn autoimport_cookies(pool: &PgPool) -> Result<Vec<SealedCookie>> {
         .collect())
 }
 
-pub async fn active_cookie_creators(pool: &PgPool, cookie_id: i64) -> Result<Vec<(String, String)>> {
-    let rows = sqlx::query_as(
-        "SELECT creator, url FROM cookie_creators WHERE cookie_id = $1 AND active ORDER BY creator",
-    )
-    .bind(cookie_id)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows)
-}
 
 pub async fn mark_cookie(pool: &PgPool, cookie_id: i64, status: &str, error: Option<&str>) -> Result<()> {
     let ok_clause = if status == "live" { ", last_ok_at = now()" } else { "" };
