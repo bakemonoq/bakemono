@@ -499,6 +499,19 @@ impl Drop for CookieFile {
 mod tests {
     use super::*;
 
+    #[test]
+    fn rotate_session_swaps_only_the_token() {
+        let p = "http://Morbo_pool-custom_type-high_session-8ab1019500a0feb3_sesstime-90:PASS@proxy.suborbit.al:1337";
+        let out = rotate_session(p);
+        assert!(out.starts_with("http://Morbo_pool-custom_type-high_session-"));
+        assert!(out.ends_with("_sesstime-90:PASS@proxy.suborbit.al:1337"));
+        assert!(!out.contains("8ab1019500a0feb3"));
+        // two rotations differ (fresh random token each time)
+        assert_ne!(rotate_session(p), rotate_session(p));
+        // a url without the marker is returned untouched
+        assert_eq!(rotate_session("http://u:p@host:1"), "http://u:p@host:1");
+    }
+
     const SIDECAR: &str = r#"{
       "id": 161883250,
       "num": 2,
