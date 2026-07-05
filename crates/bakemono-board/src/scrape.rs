@@ -121,7 +121,7 @@ pub async fn scrape_feed(
     let mut request = ScrapeRequest::new(feed_url, staging.clone());
     request.archive = Some(staging.join("archive.sqlite3"));
     request.cookies = Some(Cookies::File(cookie_file.path.clone()));
-    request.proxy = platform_proxy(platform);
+    request.options = scrape_options(platform);
 
     // partial errors (a single gated post, a dead CDN link) are normal for a big feed; ingest what
     // downloaded regardless. a hard failure still leaves files on disk for the next round to sweep
@@ -434,14 +434,32 @@ fn scraper_for(platform: &str) -> Scraper {
     scraper()
 }
 
-// residential proxy per platform, with a fresh sticky session each scrape so we rotate IPs across
-// rounds. the env value carries a `session-<token>` segment we replace with random hex
-fn platform_proxy(platform: &str) -> Option<String> {
-    if platform != "fanbox" {
-        return None;
-    }
-    let template = std::env::var("BAKEMONO_FANBOX_PROXY").ok().filter(|s| !s.is_empty())?;
-    Some(rotate_session(&template))
+// two global scrape proxies: BAKEMONO_SCRAPE_PROXY carries the api, _MEDIA_PROXY the bulk media
+// (defaults to the api proxy). they apply to every platform's scrape so the box IP is never exposed
+// to a source, and the tiny api can ride an expensive proxy while media takes a cheap one. session
+// rotation only applies to a proxy that actually carries a `session-<token>` segment
+fn scrape_proxy() -> Option<String> {
+    std::env::var("BAKEMONO_SCRAPE_PROXY").ok().filter(|s| !s.trim().is_empty())
+}
+
+// proxy for the probe (api only, no downloads)
+fn platform_proxy(_platform: &str) -> Option<String> {
+    scrape_proxy().map(|t| rotate_session(&t))
+}
+
+fn scrape_options(platform: &str) -> Vec<String> {
+    let Some(api) = scrape_proxy() else {
+        return Vec::new();
+    };
+    let media = std::env::var("BAKEMONO_SCRAPE_MEDIA_PROXY")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| api.clone());
+    // a fresh session for each so the api and media legs ride different IPs
+    vec![
+        format!("extractor.{platform}.proxy={}", rotate_session(&api)),
+        format!("downloader.http.proxy={}", rotate_session(&media)),
+    ]
 }
 
 fn rotate_session(proxy: &str) -> String {

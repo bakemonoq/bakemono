@@ -20,6 +20,8 @@ pub struct ScrapeRequest {
     pub archive: Option<PathBuf>,
     // upstream proxy for the whole run (Fanbox needs a residential one to clear Cloudflare)
     pub proxy: Option<String>,
+    // raw `-o key=value` gallery-dl config overrides, e.g. a per-component proxy split
+    pub options: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +75,7 @@ impl ScrapeRequest {
             quiet: false,
             archive: None,
             proxy: None,
+            options: Vec::new(),
         }
     }
 }
@@ -385,6 +388,10 @@ fn build_args(request: &ScrapeRequest) -> Vec<String> {
     if let Some(proxy) = &request.proxy {
         args.push("--proxy".to_string());
         args.push(proxy.clone());
+    }
+    for opt in &request.options {
+        args.push("-o".to_string());
+        args.push(opt.clone());
     }
     match &request.cookies {
         Some(Cookies::File(path)) => {
