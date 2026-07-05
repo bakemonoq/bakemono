@@ -20,21 +20,25 @@ pub const PLATFORMS: &[Platform] = &[
         feed_url: "https://www.patreon.com/home",
         live: true,
     },
+    // pixiv fronts api.fanbox.cc with a Cloudflare managed challenge that detects automation; only a
+    // stealth real-browser (through a residential proxy) passes it, which gallery-dl cannot do. kept
+    // here so a future stealth-browser scraper can flip it back on
     Platform {
         id: "fanbox",
         label: "Fanbox",
         cookie_name: "FANBOXSESSID",
         cookie_domain: "fanbox.cc",
         feed_url: "https://fanbox.cc/home/supporting",
-        live: true,
+        live: false,
     },
+    // untested against real credentials and likely Cloudflare-gated like Fanbox; enable once verified
     Platform {
         id: "boosty",
         label: "Boosty",
         cookie_name: "auth",
         cookie_domain: "boosty.to",
         feed_url: "https://boosty.to/",
-        live: true,
+        live: false,
     },
 ];
 
