@@ -3,19 +3,22 @@ use serde_json::Value;
 
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36";
 
-// the platforms the contribute form offers; the tuple is (id, label, session cookie name, cookie domain)
-pub const PLATFORMS: &[(&str, &str, &str, &str)] = &[
-    ("patreon", "Patreon", "session_id", "patreon.com"),
-    ("fanbox", "Fanbox", "FANBOXSESSID", "fanbox.cc"),
-    ("boosty", "Boosty", "auth", "boosty.to"),
-    ("gumroad", "Gumroad", "_gumroad_app_session", "gumroad.com"),
-    ("subscribestar", "SubscribeStar", "_personalization_id", "subscribestar.adult"),
-    ("fantia", "Fantia", "_session_id", "fantia.jp"),
-    ("afdian", "Afdian", "auth_token", "afdian.com"),
+// the two platforms in scope. tuple: (id, label, session cookie name, cookie domain, live).
+// `live` gates the contribute form: a platform is live only once its discovery is verified against a
+// real cookie. scraping a known creator is gallery-dl's job and works for many sites, but the form
+// needs discovery (cookie -> reachable creators), which is hand-written per platform
+pub const PLATFORMS: &[(&str, &str, &str, &str, bool)] = &[
+    ("patreon", "Patreon", "session_id", "patreon.com", true),
+    ("fanbox", "Fanbox", "FANBOXSESSID", "fanbox.cc", false),
 ];
 
-pub fn is_known(platform: &str) -> bool {
-    PLATFORMS.iter().any(|p| p.0 == platform)
+pub fn is_live(platform: &str) -> bool {
+    PLATFORMS.iter().any(|p| p.0 == platform && p.4)
+}
+
+// what the contribute form offers, in order
+pub fn live_platforms() -> impl Iterator<Item = &'static (&'static str, &'static str, &'static str, &'static str, bool)> {
+    PLATFORMS.iter().filter(|p| p.4)
 }
 
 pub fn label(platform: &str) -> &str {

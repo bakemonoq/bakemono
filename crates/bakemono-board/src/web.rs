@@ -670,7 +670,7 @@ fn contribute_body(error: Option<&str>) -> Markup {
         form.contribform method="post" action="/contribute" {
             label { "Platform"
                 select name="platform" {
-                    @for p in crate::platform::PLATFORMS {
+                    @for p in crate::platform::live_platforms() {
                         option value=(p.0) { (p.1) }
                     }
                 }
@@ -685,7 +685,7 @@ fn contribute_body(error: Option<&str>) -> Markup {
         h3 { "Where the cookie is" }
         p { "Sign in to the site, open your browser's developer tools (F12), go to Application/Storage -> Cookies -> the site, and copy the value of:" }
         ul.list {
-            @for p in crate::platform::PLATFORMS {
+            @for p in crate::platform::live_platforms() {
                 li { (p.1) ": " code { (p.2) } }
             }
         }
@@ -712,7 +712,7 @@ async fn contribute_submit(
     };
     let platform = form.platform.trim();
     let token = form.token.trim();
-    if !crate::platform::is_known(platform) || token.is_empty() {
+    if !crate::platform::is_live(platform) || token.is_empty() {
         return render("contribute", contribute_body(Some("Pick a platform and paste a cookie value"))).into_response();
     }
 
