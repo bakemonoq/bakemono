@@ -290,16 +290,25 @@ impl PostMeta {
     }
 }
 
+// gallery-dl's per-platform sidecars differ (Patreon nests creator.{id,full_name}; Fanbox uses
+// creatorId + user.name). read each field through a fallback chain so any supported platform maps
 fn post_meta(sidecar: &Path) -> Result<PostMeta> {
     let raw = std::fs::read(sidecar).with_context(|| format!("reading {}", sidecar.display()))?;
     let meta: Value =
         serde_json::from_slice(&raw).with_context(|| format!("parsing {}", sidecar.display()))?;
+    let platform = string_at(&meta, &["category"]).unwrap_or_else(|| "patreon".to_string());
+    let creator_id = string_at(&meta, &["creator", "id"]) // patreon
+        .or_else(|| string_at(&meta, &["creatorId"])) // fanbox
+        .or_else(|| string_at(&meta, &["user", "userId"])) // fanbox numeric
+        .context("sidecar has no creator id")?;
     Ok(PostMeta {
-        platform: string_at(&meta, &["category"]).unwrap_or_else(|| "patreon".to_string()),
         creator: string_at(&meta, &["creator", "full_name"])
             .or_else(|| string_at(&meta, &["creator", "vanity"]))
-            .unwrap_or_else(|| "unknown".to_string()),
-        creator_id: string_at(&meta, &["creator", "id"]).context("sidecar missing creator.id")?,
+            .or_else(|| string_at(&meta, &["user", "name"])) // fanbox
+            .unwrap_or_else(|| creator_id.clone()),
+        creator_url: creator_url(&meta, &platform, &creator_id),
+        creator_id,
+        platform,
         post_id: string_at(&meta, &["id"]).context("sidecar missing id")?,
         file_index: meta
             .get("num")
@@ -307,12 +316,23 @@ fn post_meta(sidecar: &Path) -> Result<PostMeta> {
             .map(|n| n.saturating_sub(1) as i32)
             .unwrap_or(0),
         title: string_at(&meta, &["title"]).map(|t| t.trim().to_string()).unwrap_or_default(),
-        body: string_at(&meta, &["content"]).unwrap_or_default(),
-        posted_at: string_at(&meta, &["published_at"]).or_else(|| string_at(&meta, &["date"])),
+        body: string_at(&meta, &["content"]).or_else(|| string_at(&meta, &["text"])).unwrap_or_default(),
+        posted_at: string_at(&meta, &["published_at"])
+            .or_else(|| string_at(&meta, &["publishedDatetime"]))
+            .or_else(|| string_at(&meta, &["date"])),
         tier: tier_of(&meta),
-        creator_url: string_at(&meta, &["creator", "url"])
-            .or_else(|| string_at(&meta, &["creator", "vanity"]).map(|v| format!("https://www.patreon.com/{v}"))),
     })
+}
+
+fn creator_url(meta: &Value, platform: &str, creator_id: &str) -> Option<String> {
+    if let Some(url) = string_at(meta, &["creator", "url"]) {
+        return Some(url);
+    }
+    match platform {
+        "patreon" => string_at(meta, &["creator", "vanity"]).map(|v| format!("https://www.patreon.com/{v}")),
+        "fanbox" => string_at(meta, &["creatorId"]).map(|c| format!("https://{c}.fanbox.cc")),
+        _ => Some(format!("https://{creator_id}")),
+    }
 }
 
 // one streaming pass: sha256 + byte count + a 12-byte header sniff, never buffering the whole file
@@ -359,12 +379,14 @@ pub fn sniff_mime(bytes: &[u8]) -> &'static str {
 }
 
 fn tier_of(meta: &Value) -> String {
-    match meta.get("is_paid").and_then(Value::as_bool) {
-        Some(true) => "subscriber",
-        Some(false) => "free",
-        None => "unknown",
+    // patreon: is_paid bool; fanbox: feeRequired (0 = free tier)
+    if let Some(paid) = meta.get("is_paid").and_then(Value::as_bool) {
+        return if paid { "subscriber" } else { "free" }.to_string();
     }
-    .to_string()
+    if let Some(fee) = meta.get("feeRequired").and_then(Value::as_u64) {
+        return if fee > 0 { "subscriber" } else { "free" }.to_string();
+    }
+    "unknown".to_string()
 }
 
 fn string_at(value: &Value, path: &[&str]) -> Option<String> {
@@ -557,6 +579,37 @@ mod tests {
         assert_eq!(meta.file_index, 1);
         assert_eq!(meta.tier, "subscriber");
         assert_eq!(meta.title, "Lana's Special Delivery");
+    }
+
+    const FANBOX_SIDECAR: &str = r#"{
+      "id": "12036006",
+      "num": 1,
+      "category": "fanbox",
+      "title": "Marche Lorraine w/Puppet",
+      "publishedDatetime": "2026-06-30T07:45:02+09:00",
+      "feeRequired": 500,
+      "text": "body text",
+      "creatorId": "anna-anon",
+      "user": {"userId": "37736420", "name": "Anna Anon"}
+    }"#;
+
+    #[test]
+    fn maps_fanbox_sidecar() {
+        let dir = std::env::temp_dir().join(format!("bakemono-fbmeta-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sidecar = dir.join("x.mp4.json");
+        std::fs::write(&sidecar, FANBOX_SIDECAR).unwrap();
+        let meta = post_meta(&sidecar).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(meta.platform, "fanbox");
+        assert_eq!(meta.creator, "Anna Anon");
+        assert_eq!(meta.creator_id, "anna-anon");
+        assert_eq!(meta.post_id, "12036006");
+        assert_eq!(meta.file_index, 0);
+        assert_eq!(meta.tier, "subscriber");
+        assert_eq!(meta.body, "body text");
+        assert_eq!(meta.creator_url.as_deref(), Some("https://anna-anon.fanbox.cc"));
     }
 
     #[test]
