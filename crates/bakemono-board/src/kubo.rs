@@ -4,6 +4,8 @@ use bakemono_core::manifest::{ADD_CHUNKER, ADD_CID_VERSION, ADD_HASH, ADD_RAW_LE
 pub struct Kubo {
     api: String,
     gateway: String,
+    // ipfs-cluster REST API; set = the fleet pinset is authoritative, unset = single-node board
+    cluster: Option<String>,
     http: reqwest::Client,
 }
 
@@ -12,8 +14,44 @@ impl Kubo {
         Self {
             api: env_or("BAKEMONO_KUBO_API", "http://127.0.0.1:5001"),
             gateway: env_or("BAKEMONO_KUBO_GATEWAY", "http://127.0.0.1:8080"),
+            cluster: std::env::var("BAKEMONO_CLUSTER_API").ok().filter(|s| !s.is_empty()),
             http: reqwest::Client::new(),
         }
+    }
+
+    // register a CID in the cluster pinset so the fleet and followers replicate it. the board's
+    // own kubo already holds it (add pins locally), so this is a no-op without a cluster
+    pub async fn pin_archive(&self, cid: &str, label: &str) -> Result<()> {
+        let Some(cluster) = &self.cluster else {
+            return Ok(());
+        };
+        let resp = self
+            .http
+            .post(format!("{cluster}/pins/{cid}"))
+            .query(&[("name", label)])
+            .send()
+            .await
+            .with_context(|| format!("cluster api unreachable at {cluster}"))?;
+        if !resp.status().is_success() {
+            bail!("cluster pin {cid} failed: {} {}", resp.status(), resp.text().await.unwrap_or_default());
+        }
+        Ok(())
+    }
+
+    // drop from the pinset (fleet + followers unpin on sync) and from the local node
+    pub async fn unpin_archive(&self, cid: &str) -> Result<()> {
+        if let Some(cluster) = &self.cluster {
+            let resp = self
+                .http
+                .delete(format!("{cluster}/pins/{cid}"))
+                .send()
+                .await
+                .with_context(|| format!("cluster api unreachable at {cluster}"))?;
+            if !resp.status().is_success() && resp.status() != reqwest::StatusCode::NOT_FOUND {
+                bail!("cluster unpin {cid} failed: {}", resp.status());
+            }
+        }
+        self.unpin(cid).await
     }
 
     pub async fn add(&self, bytes: Vec<u8>, label: &str) -> Result<String> {

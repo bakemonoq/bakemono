@@ -144,6 +144,10 @@ async fn ingest_pair(pool: &PgPool, kubo: &Kubo, media: &Path, sidecar: &Path) -
         let media = media.to_path_buf();
         tokio::task::spawn_blocking(move || hash_media(&media)).await??
     };
+    // revoked bytes must not re-enter the archive through a re-scrape
+    if let Some(reason) = db::sha_denied(pool, &sha256).await? {
+        anyhow::bail!("revoked content ({reason}), refusing to re-ingest");
+    }
     // a thumb is archive content in its own right: it gets a catalog row so /f/{cid} serves it,
     // and later the pinset and shard entries carry it alongside the full file
     let thumb_cid = match thumb::generate(media, &mime).await {
@@ -152,11 +156,13 @@ async fn ingest_pair(pool: &PgPool, kubo: &Kubo, media: &Path, sidecar: &Path) -
             let thumb_size = bytes.len() as i64;
             let cid = kubo.add(bytes, "thumb").await?;
             db::insert_file(pool, &cid, &thumb_sha, thumb_size, "image/jpeg", None, None).await?;
+            kubo.pin_archive(&cid, &format!("thumb {}", meta.post_key())).await?;
             Some(cid)
         }
         None => None,
     };
     let cid = kubo.add_path(media).await?;
+    kubo.pin_archive(&cid, &meta.post_key()).await?;
     let filename = media.file_name().and_then(|n| n.to_str());
     db::insert_file(pool, &cid, &sha256, size as i64, &mime, filename, thumb_cid.as_deref()).await?;
     db::upsert_creator(pool, &meta.platform, &meta.creator_id, &meta.creator).await?;
@@ -178,7 +184,7 @@ pub struct PostMeta {
 }
 
 impl PostMeta {
-    fn post_key(&self) -> String {
+    pub fn post_key(&self) -> String {
         format!("{}:{}:{}", self.platform, self.creator_id, self.post_id)
     }
 }

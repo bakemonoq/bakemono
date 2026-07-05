@@ -22,6 +22,27 @@ services:
       - bakemono-ipfs:/data/ipfs
     restart: unless-stopped
 
+  cluster:
+    image: ipfs/ipfs-cluster:latest
+    depends_on:
+      - kubo
+    environment:
+      CLUSTER_PEERNAME: ${CLUSTER_PEERNAME:-board}
+      # 32-byte hex; the libp2p network fence all cluster peers and followers must share.
+      # the default is a fixed dev value - set your own for anything reachable from outside
+      CLUSTER_SECRET: ${CLUSTER_SECRET:-a9b7ce34c1064c2c0c4f2b26e0d8ac532e2f5b9c6a1de08fbf1cf4a530d76301}
+      CLUSTER_IPFSHTTP_NODEMULTIADDRESS: /dns4/kubo/tcp/5001
+      CLUSTER_CRDT_TRUSTEDPEERS: ${CLUSTER_TRUSTED_PEERS:-*}
+      CLUSTER_RESTAPI_HTTPLISTENMULTIADDRESS: /ip4/0.0.0.0/tcp/9094
+      CLUSTER_LISTENMULTIADDRESS: /ip4/0.0.0.0/tcp/9096
+      CLUSTER_MONITORPINGINTERVAL: 2s
+    ports:
+      - "127.0.0.1:9094:9094"
+      - "9096:9096"
+    volumes:
+      - bakemono-cluster:/data/ipfs-cluster
+    restart: unless-stopped
+
   relay:
     image: scsibug/nostr-rs-relay:latest
     ports:
@@ -57,6 +78,7 @@ services:
       BAKEMONO_CONTACT: ${BAKEMONO_CONTACT:-}
       BAKEMONO_KUBO_API: ${BAKEMONO_KUBO_API:-http://kubo:5001}
       BAKEMONO_KUBO_GATEWAY: ${BAKEMONO_KUBO_GATEWAY:-http://kubo:8080}
+      BAKEMONO_CLUSTER_API: ${BAKEMONO_CLUSTER_API:-http://cluster:9094}
       # seconds between scrape passes over enabled sources; 0 disables the scheduler
       BAKEMONO_SCRAPE_INTERVAL_SECS: ${BAKEMONO_SCRAPE_INTERVAL_SECS:-21600}
       # ed25519 board key (hex) that signs manifest heads; unset generates into the key file below
@@ -81,3 +103,4 @@ volumes:
   bakemono-cache:
   bakemono-ipfs:
   bakemono-scrape:
+  bakemono-cluster:

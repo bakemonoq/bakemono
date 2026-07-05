@@ -560,7 +560,7 @@ pub async fn post_files(
     // dedup by file hash (latest event per identical content), then order for display
     let rows = sqlx::query_as::<_, ManifestRow>(
         "SELECT * FROM (
-             SELECT DISTINCT ON (file_hash) * FROM visible_manifests
+             SELECT DISTINCT ON (file_hash) * FROM visible_content
              WHERE platform = $1 AND creator_id = $2 AND post_id = $3
              ORDER BY file_hash, created_at DESC
          ) t ORDER BY file_index",
@@ -866,7 +866,7 @@ impl SortField {
 // the services present in the catalog, to populate the source filter
 pub async fn platforms(pool: &PgPool) -> Result<Vec<String>> {
     let rows = sqlx::query_scalar::<_, String>(
-        "SELECT DISTINCT platform FROM visible_manifests ORDER BY platform",
+        "SELECT DISTINCT platform FROM visible_content ORDER BY platform",
     )
     .fetch_all(pool)
     .await?;
@@ -890,7 +890,7 @@ pub async fn list_posts(
                     platform, creator_id, post_id, creator, post_title, posted_at, created_at,
                     mime, thumb,
                     COUNT(*) OVER (PARTITION BY platform, creator_id, post_id) AS files
-             FROM visible_manifests
+             FROM visible_content
              WHERE ($1 = '' OR post_title ILIKE '%' || $1 || '%' OR creator ILIKE '%' || $1 || '%')
                AND ($4 = '' OR platform = $4)
              ORDER BY platform, creator_id, post_id, (thumb IS NULL), file_index
@@ -926,7 +926,7 @@ pub async fn list_creators(
              SELECT platform, creator_id, MAX(creator) AS creator,
                     COUNT(DISTINCT post_id) AS posts, COUNT(DISTINCT file_hash) AS files,
                     MAX(created_at) AS last_at
-             FROM visible_manifests
+             FROM visible_content
              WHERE ($1 = '' OR creator ILIKE '%' || $1 || '%')
                AND ($4 = '' OR platform = $4)
              GROUP BY platform, creator_id
@@ -935,7 +935,7 @@ pub async fn list_creators(
              SELECT platform, creator_id, SUM(views) AS views FROM post_views GROUP BY platform, creator_id
          ) v USING (platform, creator_id)
          LEFT JOIN LATERAL (
-             SELECT thumb, mime FROM visible_manifests vm
+             SELECT thumb, mime FROM visible_content vm
              WHERE vm.platform = c.platform AND vm.creator_id = c.creator_id
              ORDER BY (thumb IS NULL), created_at DESC LIMIT 1
          ) cov ON true
@@ -966,7 +966,7 @@ pub async fn creator_posts(
                     platform, creator_id, post_id, creator, post_title, posted_at, created_at,
                     mime, thumb, infohash,
                     COUNT(*) OVER (PARTITION BY platform, creator_id, post_id) AS files
-             FROM visible_manifests
+             FROM visible_content
              WHERE platform = $1 AND creator_id = $2
              ORDER BY platform, creator_id, post_id, (thumb IS NULL), file_index
          ) t
@@ -999,7 +999,7 @@ pub async fn adjacent_posts(
                     LEAD(post_id) OVER w AS next_id, LEAD(t) OVER w AS next_title
              FROM (
                  SELECT post_id, MAX(post_title) AS t, MAX(posted_at) AS pa, MAX(created_at) AS ca
-                 FROM visible_manifests
+                 FROM visible_content
                  WHERE platform = $1 AND creator_id = $2
                  GROUP BY post_id
              ) g
@@ -1016,7 +1016,7 @@ pub async fn adjacent_posts(
 
 pub async fn random_post(pool: &PgPool) -> Result<Option<(String, String, String)>> {
     let row = sqlx::query_as::<_, (String, String, String)>(
-        "SELECT platform, creator_id, post_id FROM visible_manifests ORDER BY random() LIMIT 1",
+        "SELECT platform, creator_id, post_id FROM visible_content ORDER BY random() LIMIT 1",
     )
     .fetch_optional(pool)
     .await?;
@@ -1139,7 +1139,7 @@ pub async fn post_is_visible(
 ) -> Result<bool> {
     let row: (bool,) = sqlx::query_as(
         "SELECT EXISTS(
-             SELECT 1 FROM visible_manifests WHERE platform = $1 AND creator_id = $2 AND post_id = $3
+             SELECT 1 FROM visible_content WHERE platform = $1 AND creator_id = $2 AND post_id = $3
          )",
     )
     .bind(platform)
@@ -1304,6 +1304,9 @@ pub struct ManifestRow {
     pub infohash: Option<String>,
     pub bundle_index: i32,
     pub status: String,
+    // present only for new-stack rows out of visible_content; old-stack queries lack the column
+    #[sqlx(default)]
+    pub cid: Option<String>,
 }
 
 // denylist beats catalog: a revoked cid must not serve even while a stale row still names it.
@@ -1441,13 +1444,47 @@ pub async fn mark_scraped(pool: &PgPool, url: &str, error: Option<&str>) -> Resu
     Ok(())
 }
 
+// sha256 rides along so a later re-scrape of the same bytes is refused before anything re-pins;
+// the CID alone dies with the files row on restore, the byte hash does not
 pub async fn deny_cid(pool: &PgPool, cid: &str, reason: &str) -> Result<()> {
-    sqlx::query("INSERT INTO denylist (cid, reason) VALUES ($1,$2) ON CONFLICT (cid) DO NOTHING")
-        .bind(cid)
-        .bind(reason)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "INSERT INTO denylist (cid, reason, sha256)
+         VALUES ($1, $2, (SELECT sha256 FROM files WHERE cid = $1))
+         ON CONFLICT (cid) DO NOTHING",
+    )
+    .bind(cid)
+    .bind(reason)
+    .execute(pool)
+    .await?;
     Ok(())
+}
+
+pub async fn deny_restored(
+    pool: &PgPool,
+    cid: &str,
+    reason: &str,
+    sha256: Option<&str>,
+    revoked_at: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO denylist (cid, reason, sha256, added_at) VALUES ($1,$2,$3,$4::timestamptz)
+         ON CONFLICT (cid) DO NOTHING",
+    )
+    .bind(cid)
+    .bind(reason)
+    .bind(sha256)
+    .bind(revoked_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn sha_denied(pool: &PgPool, sha256: &str) -> Result<Option<String>> {
+    let reason = sqlx::query_scalar("SELECT reason FROM denylist WHERE sha256 = $1 LIMIT 1")
+        .bind(sha256)
+        .fetch_optional(pool)
+        .await?;
+    Ok(reason)
 }
 
 pub async fn thumb_of(pool: &PgPool, cid: &str) -> Result<Option<String>> {
@@ -1554,9 +1591,8 @@ pub async fn all_creators(pool: &PgPool) -> Result<Vec<(String, String, String)>
 
 pub async fn revoked_entries(pool: &PgPool) -> Result<Vec<(String, Option<String>, String, String)>> {
     let rows = sqlx::query_as(
-        "SELECT d.cid, f.sha256, d.reason, to_char(d.added_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
-         FROM denylist d LEFT JOIN files f ON f.cid = d.cid
-         ORDER BY d.added_at",
+        "SELECT cid, sha256, reason, to_char(added_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+         FROM denylist ORDER BY added_at, cid",
     )
     .fetch_all(pool)
     .await?;
@@ -1588,7 +1624,8 @@ CREATE TABLE IF NOT EXISTS manifests (
     bundle_index INTEGER NOT NULL DEFAULT 0
 );
 ALTER TABLE manifests ADD COLUMN IF NOT EXISTS bundle_index INTEGER NOT NULL DEFAULT 0;
--- drop the view first so the seeded-thumb columns it expanded via m.* can be dropped below
+-- drop the views first so the seeded-thumb columns they expanded via m.* can be dropped below
+DROP VIEW IF EXISTS visible_content;
 DROP VIEW IF EXISTS visible_manifests;
 -- inline preview lives in the event now; retire the seeded-thumb columns
 ALTER TABLE manifests ADD COLUMN IF NOT EXISTS thumb TEXT;
@@ -1714,8 +1751,11 @@ CREATE INDEX IF NOT EXISTS files_sha256 ON files (sha256);
 CREATE TABLE IF NOT EXISTS denylist (
     cid      TEXT PRIMARY KEY,
     reason   TEXT NOT NULL,
+    sha256   TEXT,
     added_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE denylist ADD COLUMN IF NOT EXISTS sha256 TEXT;
+CREATE INDEX IF NOT EXISTS denylist_sha256 ON denylist (sha256);
 
 CREATE TABLE IF NOT EXISTS creators (
     platform   TEXT NOT NULL,
@@ -1762,6 +1802,29 @@ CREATE TABLE IF NOT EXISTS manifest_heads (
     head_json    TEXT NOT NULL,
     published_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- what the browse UI reads: old-stack manifests and the new IPFS catalog as one surface.
+-- collapses to just the new mapping once the Nostr/BT stack is deleted
+CREATE OR REPLACE VIEW visible_content AS
+SELECT m.event_id, m.pubkey, m.created_at, m.d_tag, m.file_hash, m.size, m.mime, m.magnet,
+       m.platform, m.creator, m.creator_id, m.post_id, m.file_index, m.filename, m.post_title,
+       m.posted_at, m.tier, m.content, m.thumb, m.infohash, m.bundle_index, m.status,
+       NULL::text AS cid
+FROM visible_manifests m
+UNION ALL
+SELECT 'cid:' || f.cid, '', EXTRACT(EPOCH FROM f.added_at)::bigint,
+       p.platform || ':' || p.creator_id || ':' || p.post_id || ':' || pf.file_index,
+       f.sha256, f.size, f.mime, '',
+       p.platform, c.creator, p.creator_id, p.post_id, pf.file_index, f.filename,
+       NULLIF(p.title, ''), p.posted_at, p.tier, p.body,
+       CASE WHEN f.thumb_cid IS NOT NULL THEN '/f/' || f.thumb_cid END,
+       NULL, 0, 'approved',
+       f.cid
+FROM post_files pf
+JOIN posts p ON (p.platform, p.creator_id, p.post_id) = (pf.platform, pf.creator_id, pf.post_id)
+JOIN creators c ON (c.platform, c.creator_id) = (p.platform, p.creator_id)
+JOIN files f ON f.cid = pf.cid
+WHERE NOT EXISTS (SELECT 1 FROM denylist d WHERE d.cid = f.cid);
 ";
 
 const INSERT: &str = "

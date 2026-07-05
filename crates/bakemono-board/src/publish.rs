@@ -21,6 +21,7 @@ pub async fn publish_if_changed(pool: &PgPool, kubo: &Kubo) -> Result<Option<Hea
         let posts = shard.posts.len() as u64;
         let bytes: u64 = shard.posts.iter().flat_map(|p| &p.files).map(|f| f.size).sum();
         let cid = kubo.add(shard.to_json()?, &shard.key()).await?;
+        kubo.pin_archive(&cid, &format!("shard {}", shard.key())).await?;
         root.shards.insert(shard.key(), ShardRef { cid, posts, bytes });
     }
     for (cid, sha256, reason, revoked_at) in db::revoked_entries(pool).await? {
@@ -46,6 +47,8 @@ pub async fn publish_if_changed(pool: &PgPool, kubo: &Kubo) -> Result<Option<Hea
         .context("signing head")?;
     let head_json = head.to_json()?;
     let head_cid = kubo.add(head_json.clone(), "manifest head").await?;
+    kubo.pin_archive(&root_cid, &format!("root v{version}")).await?;
+    kubo.pin_archive(&head_cid, &format!("head v{version}")).await?;
     db::record_head(pool, version, &head_cid, &root_cid, &String::from_utf8(head_json)?).await?;
     tracing::info!(
         version,
@@ -61,12 +64,12 @@ pub async fn revoke_cid(pool: &PgPool, kubo: &Kubo, cid: &str, reason: &str) -> 
     // the preview of revoked content goes with it
     if let Some(thumb) = db::thumb_of(pool, cid).await? {
         db::deny_cid(pool, &thumb, reason).await?;
-        if let Err(e) = kubo.unpin(&thumb).await {
+        if let Err(e) = kubo.unpin_archive(&thumb).await {
             tracing::warn!("unpin thumb {thumb}: {e:#}");
         }
     }
     db::deny_cid(pool, cid, reason).await?;
-    if let Err(e) = kubo.unpin(cid).await {
+    if let Err(e) = kubo.unpin_archive(cid).await {
         tracing::warn!("unpin {cid}: {e:#}");
     }
     publish_if_changed(pool, kubo).await?;

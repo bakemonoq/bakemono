@@ -1062,9 +1062,13 @@ fn carousel(files: &[db::ManifestRow]) -> Markup {
     let items: Vec<String> = files
         .iter()
         .filter_map(|f| {
-            let ih = f.infohash.as_deref()?;
+            let url = match (&f.cid, f.infohash.as_deref()) {
+                (Some(cid), _) => format!("/f/{cid}"),
+                (None, Some(ih)) => format!("/t/{ih}/f/{}", f.bundle_index),
+                (None, None) => return None,
+            };
             let video = f.mime.starts_with("video/");
-            Some(format!("{{\"u\":\"/t/{ih}/f/{}\",\"v\":{video}}}", f.bundle_index))
+            Some(format!("{{\"u\":\"{url}\",\"v\":{video}}}"))
         })
         .collect();
     if items.is_empty() {
@@ -3549,6 +3553,7 @@ mod tests {
             infohash: None,
             bundle_index: 0,
             status: "approved".into(),
+            cid: None,
         }
     }
 }

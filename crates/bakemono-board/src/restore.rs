@@ -28,17 +28,21 @@ pub async fn restore(pool: &PgPool, kubo: &Kubo, head_cid: &str) -> Result<()> {
         .with_context(|| format!("parsing shard {key}"))?;
         restore_shard(pool, kubo, &shard).await?;
         kubo.pin(&shard_ref.cid).await?;
+        kubo.pin_archive(&shard_ref.cid, &format!("shard {key}")).await?;
         tracing::info!(shard = key, posts = shard.posts.len(), "shard restored");
     }
 
     for entry in &root.revoked {
         if let Some(cid) = &entry.cid {
-            db::deny_cid(pool, cid, &entry.reason).await?;
+            db::deny_restored(pool, cid, &entry.reason, entry.sha256.as_deref(), &entry.revoked_at)
+                .await?;
         }
     }
 
     kubo.pin(&head.root).await?;
     kubo.pin(head_cid).await?;
+    kubo.pin_archive(&head.root, &format!("root v{}", head.version)).await?;
+    kubo.pin_archive(head_cid, &format!("head v{}", head.version)).await?;
     db::record_head(pool, head.version as i64, head_cid, &head.root, &raw).await?;
     tracing::info!(version = head.version, "restore complete");
     Ok(())
@@ -72,12 +76,14 @@ async fn restore_shard(pool: &PgPool, kubo: &Kubo, shard: &Shard) -> Result<()> 
             db::upsert_post(pool, &meta).await?;
             db::upsert_post_file(pool, &meta, &file.cid).await?;
             kubo.pin(&file.cid).await?;
+            kubo.pin_archive(&file.cid, &meta.post_key()).await?;
             // the manifest carries no byte facts about thumbs, so take them from the bytes
             if let Some(thumb) = &file.thumb {
                 let bytes = kubo.cat(thumb).await.with_context(|| format!("fetching thumb {thumb}"))?;
                 let sha = hex::encode(Sha256::digest(&bytes));
                 db::insert_file(pool, thumb, &sha, bytes.len() as i64, "image/jpeg", None, None).await?;
                 kubo.pin(thumb).await?;
+                kubo.pin_archive(thumb, &format!("thumb {}", meta.post_key())).await?;
             }
         }
     }
