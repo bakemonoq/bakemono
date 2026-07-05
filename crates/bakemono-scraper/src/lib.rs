@@ -18,6 +18,8 @@ pub struct ScrapeRequest {
     // gallery-dl skips items recorded here without touching the files, so a re-scrape stays
     // incremental even after staged media is pruned
     pub archive: Option<PathBuf>,
+    // upstream proxy for the whole run (Fanbox needs a residential one to clear Cloudflare)
+    pub proxy: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +72,7 @@ impl ScrapeRequest {
             limit: None,
             quiet: false,
             archive: None,
+            proxy: None,
         }
     }
 }
@@ -101,12 +104,16 @@ impl Scraper {
     // resolve the first feed item without downloading: a cookie that authenticates yields at least
     // one media URL on stdout, a dead one prints nothing (gallery-dl exits 0 either way, so the
     // signal is stdout content, not the exit code). Ok(true) = live with reachable content
-    pub async fn probe(&self, url: &str, cookies: Option<&Path>) -> Result<bool, Error> {
+    pub async fn probe(&self, url: &str, cookies: Option<&Path>, proxy: Option<&str>) -> Result<bool, Error> {
         let mut args = vec![
             "--get-urls".to_string(),
             "--range".to_string(),
             "1-1".to_string(),
         ];
+        if let Some(proxy) = proxy {
+            args.push("--proxy".to_string());
+            args.push(proxy.to_string());
+        }
         if let Some(path) = cookies {
             args.push("--cookies".to_string());
             args.push(path.to_string_lossy().into_owned());
@@ -374,6 +381,10 @@ fn build_args(request: &ScrapeRequest) -> Vec<String> {
     if let Some(archive) = &request.archive {
         args.push("--download-archive".to_string());
         args.push(archive.to_string_lossy().into_owned());
+    }
+    if let Some(proxy) = &request.proxy {
+        args.push("--proxy".to_string());
+        args.push(proxy.clone());
     }
     match &request.cookies {
         Some(Cookies::File(path)) => {

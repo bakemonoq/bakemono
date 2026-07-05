@@ -61,6 +61,9 @@ services:
       BAKEMONO_BOARD_KEY_FILE: /data/board.key
       # seconds between scrape passes over enabled sources; 0 disables the scheduler
       BAKEMONO_SCRAPE_INTERVAL_SECS: ${BAKEMONO_SCRAPE_INTERVAL_SECS:-21600}
+      # residential proxy for Fanbox (its session-<token> segment is rotated per scrape); enables
+      # the Fanbox option in /contribute when set
+      BAKEMONO_FANBOX_PROXY: ${BAKEMONO_FANBOX_PROXY:-}
       # mod password (HTTP Basic auth); leave unset to disable /mod
       BAKEMONO_MOD_TOKEN: ${BAKEMONO_MOD_TOKEN:-}
       # board title shown in the header, browser tab and /info; unset keeps the default wordmark

@@ -95,7 +95,10 @@ pub async fn probe_cookie(platform: &str, token: &str) -> bool {
     let Ok(cookie_file) = CookieFile::write(&staging, &cookie_txt) else {
         return false;
     };
-    scraper().probe(feed_url, Some(&cookie_file.path)).await.unwrap_or(false)
+    scraper_for(platform)
+        .probe(feed_url, Some(&cookie_file.path), platform_proxy(platform).as_deref())
+        .await
+        .unwrap_or(false)
 }
 
 pub type CreatorSeen = (String, String, String);
@@ -118,10 +121,11 @@ pub async fn scrape_feed(
     let mut request = ScrapeRequest::new(feed_url, staging.clone());
     request.archive = Some(staging.join("archive.sqlite3"));
     request.cookies = Some(Cookies::File(cookie_file.path.clone()));
+    request.proxy = platform_proxy(platform);
 
     // partial errors (a single gated post, a dead CDN link) are normal for a big feed; ingest what
     // downloaded regardless. a hard failure still leaves files on disk for the next round to sweep
-    let scraper = scraper();
+    let scraper = scraper_for(platform);
     if let Err(e) = scraper.scrape_streaming(&request, CancellationToken::new(), |_| {}).await {
         tracing::warn!(platform, "feed scrape reported errors: {e:#}");
     }
@@ -415,6 +419,48 @@ fn scraper() -> Scraper {
     match std::env::var_os("BAKEMONO_GALLERY_DL").filter(|s| !s.is_empty()) {
         Some(bin) => Scraper::with_binary(bin),
         None => Scraper::new(),
+    }
+}
+
+// Fanbox needs the curl_cffi fork (firefox impersonation clears Cloudflare); everything else uses
+// stock gallery-dl
+fn scraper_for(platform: &str) -> Scraper {
+    if platform == "fanbox" {
+        if let Some(bin) = std::env::var_os("BAKEMONO_GALLERY_DL_FANBOX").filter(|s| !s.is_empty()) {
+            return Scraper::with_binary(bin);
+        }
+        return Scraper::with_binary("gallery-dl-fanbox");
+    }
+    scraper()
+}
+
+// residential proxy per platform, with a fresh sticky session each scrape so we rotate IPs across
+// rounds. the env value carries a `session-<token>` segment we replace with random hex
+fn platform_proxy(platform: &str) -> Option<String> {
+    if platform != "fanbox" {
+        return None;
+    }
+    let template = std::env::var("BAKEMONO_FANBOX_PROXY").ok().filter(|s| !s.is_empty())?;
+    Some(rotate_session(&template))
+}
+
+fn rotate_session(proxy: &str) -> String {
+    let mut token = String::with_capacity(16);
+    let mut buf = [0u8; 8];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut buf);
+    for b in buf {
+        token.push_str(&format!("{b:02x}"));
+    }
+    // replace the value after `session-` up to the next `_` or `:`
+    if let Some(start) = proxy.find("session-") {
+        let after = start + "session-".len();
+        let end = proxy[after..]
+            .find(['_', ':'])
+            .map(|i| after + i)
+            .unwrap_or(proxy.len());
+        format!("{}{}{}", &proxy[..after], token, &proxy[end..])
+    } else {
+        proxy.to_string()
     }
 }
 

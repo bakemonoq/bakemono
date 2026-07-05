@@ -20,16 +20,15 @@ pub const PLATFORMS: &[Platform] = &[
         feed_url: "https://www.patreon.com/home",
         live: true,
     },
-    // pixiv fronts api.fanbox.cc with a Cloudflare managed challenge that detects automation; only a
-    // stealth real-browser (through a residential proxy) passes it, which gallery-dl cannot do. kept
-    // here so a future stealth-browser scraper can flip it back on
+    // api.fanbox.cc is behind Cloudflare; the curl_cffi fork (firefox impersonation) clears it from a
+    // residential IP, so Fanbox needs BAKEMONO_FANBOX_PROXY set (runtime_ready gates it)
     Platform {
         id: "fanbox",
         label: "Fanbox",
         cookie_name: "FANBOXSESSID",
         cookie_domain: "fanbox.cc",
         feed_url: "https://fanbox.cc/home/supporting",
-        live: false,
+        live: true,
     },
     // untested against real credentials and likely Cloudflare-gated like Fanbox; enable once verified
     Platform {
@@ -47,11 +46,19 @@ fn find(id: &str) -> Option<&'static Platform> {
 }
 
 pub fn is_live(id: &str) -> bool {
-    find(id).is_some_and(|p| p.live)
+    find(id).is_some_and(|p| p.live && runtime_ready(p.id))
+}
+
+// a platform can be code-ready (live) but need runtime config before it actually works
+fn runtime_ready(id: &str) -> bool {
+    match id {
+        "fanbox" => std::env::var("BAKEMONO_FANBOX_PROXY").is_ok_and(|v| !v.trim().is_empty()),
+        _ => true,
+    }
 }
 
 pub fn live_platforms() -> impl Iterator<Item = &'static Platform> {
-    PLATFORMS.iter().filter(|p| p.live)
+    PLATFORMS.iter().filter(|p| p.live && runtime_ready(p.id))
 }
 
 pub fn label(id: &str) -> &str {
