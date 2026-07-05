@@ -6,6 +6,7 @@ mod instance;
 mod kubo;
 mod publish;
 mod ratelimit;
+mod restore;
 mod sanitize;
 mod scrape;
 mod thumb;
@@ -30,7 +31,10 @@ async fn main() -> Result<()> {
         Some("ingest") => cmd_ingest(args.next()).await,
         Some("scrape") => cmd_scrape(args.collect()).await,
         Some("source") => cmd_source(args.collect()).await,
-        Some(other) => bail!("unknown command `{other}` (expected serve, add, ingest, scrape or source)"),
+        Some("restore") => cmd_restore(args.next()).await,
+        Some(other) => {
+            bail!("unknown command `{other}` (expected serve, add, ingest, scrape, source or restore)")
+        }
     }
 }
 
@@ -147,6 +151,15 @@ async fn cmd_scrape(args: Vec<String>) -> Result<()> {
     let stats = scrape::scrape_source(&pool, &kubo, &url, cookies.as_deref(), limit).await?;
     println!("{} files across {} posts ({} skipped)", stats.files, stats.posts, stats.skipped);
     publish_and_report(&pool, &kubo).await
+}
+
+async fn cmd_restore(head_cid: Option<String>) -> Result<()> {
+    let Some(head_cid) = head_cid else {
+        bail!("usage: bakemono-board restore <head-cid>");
+    };
+    let pool = db::connect(&database_url()).await?;
+    let kubo = kubo::Kubo::from_env();
+    restore::restore(&pool, &kubo, head_cid.trim()).await
 }
 
 async fn publish_and_report(pool: &sqlx::postgres::PgPool, kubo: &kubo::Kubo) -> Result<()> {

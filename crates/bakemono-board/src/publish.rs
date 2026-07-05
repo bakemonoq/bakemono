@@ -109,6 +109,10 @@ async fn build_shard(
     Ok(shard)
 }
 
+pub fn board_pubkey() -> Result<String> {
+    Ok(board_key()?.public_hex())
+}
+
 // env wins (docker); otherwise a key file, generated on first use. the pubkey is the board's
 // identity, so losing this file ends the board's ability to publish - back it up offline
 fn board_key() -> Result<BoardKey> {

@@ -55,6 +55,35 @@ impl Kubo {
             .with_context(|| format!("kubo add returned no Hash for {label}"))
     }
 
+    // RPC cat, not the gateway: restore must fetch from the network even where the
+    // public-facing gateway runs NoFetch
+    pub async fn cat(&self, cid: &str) -> Result<Vec<u8>> {
+        let resp = self
+            .http
+            .post(format!("{}/api/v0/cat?arg={cid}", self.api))
+            .send()
+            .await
+            .with_context(|| format!("kubo api unreachable at {}", self.api))?;
+        if !resp.status().is_success() {
+            bail!("kubo cat {cid} failed: {} {}", resp.status(), resp.text().await.unwrap_or_default());
+        }
+        Ok(resp.bytes().await?.to_vec())
+    }
+
+    // recursive pin; blocks until the node holds every block, fetching from peers as needed
+    pub async fn pin(&self, cid: &str) -> Result<()> {
+        let resp = self
+            .http
+            .post(format!("{}/api/v0/pin/add?arg={cid}", self.api))
+            .send()
+            .await
+            .with_context(|| format!("kubo api unreachable at {}", self.api))?;
+        if !resp.status().is_success() {
+            bail!("kubo pin {cid} failed: {} {}", resp.status(), resp.text().await.unwrap_or_default());
+        }
+        Ok(())
+    }
+
     // unpin only marks; bytes leave disk when kubo's GC runs (--enable-gc or `ipfs repo gc`)
     pub async fn unpin(&self, cid: &str) -> Result<()> {
         let resp = self
