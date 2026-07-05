@@ -192,6 +192,17 @@ pub async fn creator_posts(
     Ok(rows)
 }
 
+pub async fn creator_post_count(pool: &PgPool, platform: &str, creator_id: &str) -> Result<i64> {
+    let n = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT post_id) FROM visible_content WHERE platform = $1 AND creator_id = $2",
+    )
+    .bind(platform)
+    .bind(creator_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
+}
+
 // the older and newer post by the same creator, ordered by post date, for prev/next links on a post page.
 // prev is older (further back in time), next is newer
 pub async fn adjacent_posts(

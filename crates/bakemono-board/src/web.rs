@@ -54,7 +54,7 @@ pub fn router(state: AppState) -> Router {
 }
 
 // how many cards a browse page shows; one extra is fetched to detect a next page without a count query
-const PAGE: i64 = 60;
+const PAGE: i64 = 36;
 
 async fn home(State(pool): State<PgPool>) -> Html<String> {
     // 12 keeps Recent to two rows on a wide screen
@@ -510,15 +510,21 @@ fn qs_encode(s: &str) -> String {
 async fn creator_page(
     State(pool): State<PgPool>,
     Path((platform, creator_id)): Path<(String, String)>,
+    Query(query): Query<BrowseQuery>,
     headers: HeaderMap,
 ) -> Html<String> {
-    let posts = db::creator_posts(&pool, &platform, &creator_id, 300, 0)
+    let page = query.page.unwrap_or(0).max(0);
+    let mut posts = db::creator_posts(&pool, &platform, &creator_id, PAGE + 1, page * PAGE)
         .await
         .unwrap_or_default();
+    let has_next = posts.len() as i64 > PAGE;
+    posts.truncate(PAGE as usize);
+    let total = db::creator_post_count(&pool, &platform, &creator_id).await.unwrap_or(0);
     let name = posts
         .first()
         .map(|p| p.creator.clone())
         .unwrap_or_else(|| creator_id.clone());
+    let base = format!("/c/{platform}/{creator_id}");
     render(
         &name,
         html! {
@@ -526,11 +532,12 @@ async fn creator_page(
             div.creatorhead {
                 h1 { (name) }
                 span.chip.platform { (pretty_platform(&platform)) }
-                span.muted { (posts.len()) @if posts.len() == 1 { " post" } @else { " posts" } }
+                span.muted { (total) @if total == 1 { " post" } @else { " posts" } }
             }
             @if is_mod(&headers) { (mod_bar_creator(&platform, &creator_id)) }
             @if posts.is_empty() { p.muted { "Nothing here yet" } }
             (posts_grid(&posts))
+            (pager(&base, "", "", db::SortField::Created, true, None, page, has_next, false))
         },
     )
 }
