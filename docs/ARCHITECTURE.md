@@ -22,8 +22,8 @@ The board's postgres is derived state - a query index built from the manifest, n
 
 End-to-end flow of one file, from source to a viewer's browser.
 
-1. **Adopt.** The operator adds a creator to the scrape list, with session cookies for the source platform (their own subscription, or cookies a contributor handed over).
-2. **Scrape.** The board's scrape worker invokes gallery-dl / yt-dlp server-side. Files land in a staging directory with source metadata sidecars. Because the board fetched the bytes from the source itself, provenance is first-party: there is no substituted-file problem and no per-file verification queue.
+1. **Contribute.** A subscriber pastes their source-platform session cookie into the `/contribute` form. The board validates it against the platform and discovers which creators it can reach, all while it still holds the plaintext (see "Contributor cookies" below).
+2. **Scrape.** The board's scrape worker invokes gallery-dl / yt-dlp server-side against each reachable creator. Files land in a staging directory with source metadata sidecars. Because the board fetched the bytes from the source itself, provenance is first-party: there is no substituted-file problem and no per-file verification queue.
 3. **Add.** Each file is hashed (sha256), thumbnailed (ffmpeg, ~400px JPEG), and added to the local Kubo with the frozen parameters from `PROTOCOL.md`, yielding a CID. Metadata rows land in postgres.
 4. **Publish.** The publisher rebuilds the shards whose content changed, writes a new root, signs a new head (version+1, prev = old head), updates the pointer (head.json + DNSLink), and updates the cluster pinset: new CIDs in, revoked CIDs out.
 5. **Replicate.** Cluster peers and followers see the pinset change and fetch the new CIDs from the board's node (and from each other). Within minutes the file exists on every keeper.
@@ -79,11 +79,22 @@ viewer's browser -> board web UI + /f/{cid} over plain HTTP (Range, immutable ca
 peer board       -> GET /head.json, verify sig, import shards, apply revoked
 ```
 
+## Contributor cookies
+
+The archive stays current by scraping on behalf of many subscribers, not one operator account. The lifecycle is built around never holding a usable credential at rest:
+
+- **Submission.** `/contribute` takes a platform + a session cookie value. While it holds the plaintext, the board hits the platform's API to (a) confirm the cookie authenticates and (b) enumerate the creators it can reach. A rejected cookie is reported and nothing is stored.
+- **Encryption.** If the contributor opts into daily import, the token is sealed - a fresh AES-256-GCM key per cookie, RSA-4096-OAEP-wrapped - and only the ciphertext, the wrapped key, and the nonce are stored. The RSA private key never lives on the server, so a database dump yields nothing decryptable. Without opt-in, the token is used for one import and discarded.
+- **First import.** Runs immediately in the background using the plaintext already in hand, so contributed content appears without waiting for a keyed round.
+- **Daily round.** `bakemono autoimport` reads the RSA private key from stdin (piped over SSH from the operator's machine, never written to disk), decrypts each live cookie in memory, refreshes its creator list (adding new subscriptions, deactivating dropped ones), scrapes new posts, and re-seals nothing. A cookie the platform rejects is marked dead. Operators who accept keeping the key on the box can set `BAKEMONO_COOKIE_PRIVKEY` and let `serve` run the round on a schedule instead.
+
+Cookies are operational state: they live only in postgres, never in the manifest, never replicated to keepers.
+
 ## Moderation and takedowns
 
 Moderation happens in the manifest, not in the network. Two decisions exist:
 
-1. **What gets in.** The only ingestion path is the board's own scrape worker, so admission control is source-level: which platforms, which creators. There is no upload endpoint, no per-file review queue, no first-seen-contributor gating - those defended against untrusted writers, and there are none.
+1. **What gets in.** Ingestion is the board's own scrape worker driven by contributor cookies, so admission control is source-level: which platforms, which creators. There is no file upload endpoint, no per-file review queue, no first-seen-contributor gating - those defended against untrusted writers, and there are none.
 2. **What comes out.** A takedown removes the entry from its shard, appends the target to `revoked` with a reason, publishes a new version, and drops the CIDs from the pinset. From there it is automatic: the fleet and every follower unpin, periodic GC frees the bytes, and the gateway denylist blocks serving the CID regardless. Full semantics in `PROTOCOL.md`.
 
 Three surfaces, by reach:

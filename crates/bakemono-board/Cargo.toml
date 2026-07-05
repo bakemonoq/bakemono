@@ -24,7 +24,10 @@ tracing-subscriber.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 hex.workspace = true
-reqwest = { version = "0.13", default-features = false, features = ["multipart", "stream", "query"] }
+rand.workspace = true
+rsa.workspace = true
+aes-gcm.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["multipart", "stream", "query", "json", "rustls"] }
 toml = "0.8"
 base64 = "0.22"
 sha2 = "0.10"

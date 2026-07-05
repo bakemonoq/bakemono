@@ -1,6 +1,8 @@
 mod config;
+mod crypto;
 mod db;
 mod kubo;
+mod platform;
 mod publish;
 mod restore;
 mod sanitize;
@@ -22,10 +24,11 @@ async fn main() -> Result<()> {
         Some("add") => cmd_add(args.collect()).await,
         Some("ingest") => cmd_ingest(args.next()).await,
         Some("scrape") => cmd_scrape(args.collect()).await,
-        Some("source") => cmd_source(args.collect()).await,
         Some("restore") => cmd_restore(args.next()).await,
+        Some("keygen") => cmd_keygen(args.next()).await,
+        Some("autoimport") => cmd_autoimport().await,
         Some(other) => {
-            bail!("unknown command `{other}` (expected serve, add, ingest, scrape, source or restore)")
+            bail!("unknown command `{other}` (expected serve, add, ingest, scrape, restore, keygen or autoimport)")
         }
     }
 }
@@ -108,33 +111,38 @@ async fn cmd_scrape(args: Vec<String>) -> Result<()> {
     publish_and_report(&pool, &kubo).await
 }
 
-// the scheduler's work list: `source add <url> [cookies.txt]` / `source ls`
-async fn cmd_source(args: Vec<String>) -> Result<()> {
-    let pool = db::connect(&database_url()).await?;
-    let mut args = args.into_iter();
-    match args.next().as_deref() {
-        Some("add") => {
-            let Some(url) = args.next() else {
-                bail!("usage: bakemono source add <url> [cookies.txt]");
-            };
-            let cookies = match args.next() {
-                Some(path) => Some(std::fs::read_to_string(&path)?),
-                None => None,
-            };
-            db::add_source(&pool, &url, cookies.as_deref()).await?;
-            println!("added {url}");
-        }
-        Some("ls") | None => {
-            for (url, enabled, scraped_at, error) in db::list_sources(&pool).await? {
-                let status = if enabled { "on " } else { "off" };
-                let scraped = scraped_at.unwrap_or_else(|| "never".into());
-                let error = error.map(|e| format!("  ERR {e}")).unwrap_or_default();
-                println!("{status}  {scraped}  {url}{error}");
-            }
-        }
-        Some(other) => bail!("unknown source command `{other}` (expected add or ls)"),
+// generate the cookie encryption keypair. the public PEM goes in BAKEMONO_COOKIE_PUBKEY on the
+// server; the private PEM must be moved OFFLINE and only piped into `autoimport` per round
+async fn cmd_keygen(dir: Option<String>) -> Result<()> {
+    let dir = dir.unwrap_or_else(|| ".".into());
+    let (pub_pem, priv_pem) = crypto::generate_keypair()?;
+    let pub_path = std::path::Path::new(&dir).join("cookie-public.pem");
+    let priv_path = std::path::Path::new(&dir).join("cookie-private.pem");
+    std::fs::write(&pub_path, &pub_pem)?;
+    std::fs::write(&priv_path, &priv_pem)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&priv_path, std::fs::Permissions::from_mode(0o600))?;
     }
+    println!("public key : {}  -> set BAKEMONO_COOKIE_PUBKEY to this on the server", pub_path.display());
+    println!("private key: {}  -> MOVE OFFLINE, never put it on the server", priv_path.display());
     Ok(())
+}
+
+// run one auto-import round with the private key read from stdin, so the key never lands on disk.
+// invoke from an operator machine: ssh box 'docker exec -i bakemono-board bakemono autoimport' < cookie-private.pem
+async fn cmd_autoimport() -> Result<()> {
+    use std::io::Read;
+    let mut privkey = String::new();
+    std::io::stdin().read_to_string(&mut privkey)?;
+    if privkey.trim().is_empty() {
+        bail!("pipe the private key PEM to stdin: bakemono autoimport < cookie-private.pem");
+    }
+    crypto::validate_private_pem(privkey.trim())?;
+    let pool = db::connect(&database_url()).await?;
+    let kubo = kubo::Kubo::from_env();
+    scrape::autoimport_round(&pool, &kubo, privkey.trim()).await
 }
 
 async fn cmd_restore(head_cid: Option<String>) -> Result<()> {

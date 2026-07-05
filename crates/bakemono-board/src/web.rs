@@ -39,6 +39,7 @@ pub fn router(state: AppState) -> Router {
         .route("/search", get(search_index))
         .route("/random", get(random_redirect))
         .route("/keepers", get(keepers))
+        .route("/contribute", get(contribute).post(contribute_submit))
         .route("/info", get(info_page))
         .route("/c/{platform}/{creator_id}", get(creator_page))
         .route("/p/{platform}/{creator_id}/{post_id}", get(post_page))
@@ -651,6 +652,154 @@ fn carousel(files: &[db::ManifestRow]) -> Markup {
     }
 }
 
+async fn contribute() -> Html<String> {
+    if crate::crypto::load_public_pem().is_none() {
+        return render("contribute", html! {
+            h1 { "Contribute" }
+            p.muted { "Contributions are closed on this board right now" }
+        });
+    }
+    render("contribute", contribute_body(None))
+}
+
+fn contribute_body(error: Option<&str>) -> Markup {
+    html! {
+        h1 { "Contribute your subscriptions" }
+        p { "Paste the session cookie from a site you subscribe to. The board pulls every post you can reach and adds it to the archive for everyone. Your cookie is encrypted the moment it arrives and the archive never exposes it" }
+        @if let Some(e) = error { p.err { (e) } }
+        form.contribform method="post" action="/contribute" {
+            label { "Platform"
+                select name="platform" {
+                    @for p in crate::platform::PLATFORMS {
+                        option value=(p.0) { (p.1) }
+                    }
+                }
+            }
+            label { "Session cookie value"
+                input type="text" name="token" placeholder="paste the cookie value only" required autocomplete="off";
+            }
+            label.check { input type="checkbox" name="allow_autoimport" value="1" checked; " Keep importing my new posts every day (stores the cookie encrypted)" }
+            label.check { input type="checkbox" name="allow_debug" value="1"; " Allow the operator to use my session for debugging import problems" }
+            button type="submit" { "Import" }
+        }
+        h3 { "Where the cookie is" }
+        p { "Sign in to the site, open your browser's developer tools (F12), go to Application/Storage -> Cookies -> the site, and copy the value of:" }
+        ul.list {
+            @for p in crate::platform::PLATFORMS {
+                li { (p.1) ": " code { (p.2) } }
+            }
+        }
+        p.muted { "The value is used to fetch your paid posts, then discarded unless you opted into daily import. Encryption is RSA-4096; the key that could decrypt stored cookies is kept offline, so a database breach cannot expose them. Everything is at your own risk" }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ContributeForm {
+    platform: String,
+    token: String,
+    #[serde(default)]
+    allow_autoimport: Option<String>,
+    #[serde(default)]
+    allow_debug: Option<String>,
+}
+
+async fn contribute_submit(
+    State(state): State<AppState>,
+    Form(form): Form<ContributeForm>,
+) -> Response {
+    let Some(pubkey) = crate::crypto::load_public_pem() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "contributions closed").into_response();
+    };
+    let platform = form.platform.trim();
+    let token = form.token.trim();
+    if !crate::platform::is_known(platform) || token.is_empty() {
+        return render("contribute", contribute_body(Some("Pick a platform and paste a cookie value"))).into_response();
+    }
+
+    // discover now, while we still hold the plaintext: this both validates the cookie and loads the
+    // creator list. anything past here treats the cookie as a live secret to protect
+    let discovered = match crate::platform::discover(platform, token).await {
+        Ok(Some(list)) => list,
+        Ok(None) => return render("contribute", contribute_body(Some("That cookie was rejected by the site - make sure you are signed in and copied the whole value"))).into_response(),
+        Err(e) => return render("contribute", contribute_body(Some(&format!("Could not verify the cookie: {e}")))).into_response(),
+    };
+
+    let allow_autoimport = form.allow_autoimport.is_some();
+    let allow_debug = form.allow_debug.is_some();
+    let rows: Vec<(String, String, String)> =
+        discovered.iter().map(|d| (d.id.clone(), d.name.clone(), d.url.clone())).collect();
+
+    // persist the sealed cookie only if the contributor opted into daily import
+    if allow_autoimport || allow_debug {
+        match seal_and_store(&state, &pubkey, platform, token, allow_autoimport, allow_debug, &rows).await {
+            Ok(cookie_id) => spawn_first_import(&state, cookie_id, platform, token),
+            Err(e) => {
+                tracing::error!("storing cookie failed: {e:#}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "could not store the cookie").into_response();
+            }
+        }
+    } else {
+        // one-shot import without persistence: hold the plaintext only in the spawned task
+        spawn_oneshot_import(&state, platform.to_string(), token.to_string(), rows);
+    }
+
+    render("contribute", html! {
+        h1 { "Thank you" }
+        p { "Found " (discovered.len()) @if discovered.len() == 1 { " creator" } @else { " creators" } " you can reach. Importing their posts now - they will appear in the archive shortly" }
+        @if allow_autoimport { p.muted { "Your cookie is stored encrypted and new posts will be imported daily" } }
+        @else { p.muted { "Your cookie was not stored; this was a one-time import" } }
+        p { a href="/" { "Back to the board" } }
+    }).into_response()
+}
+
+async fn seal_and_store(
+    state: &AppState,
+    pubkey: &str,
+    platform: &str,
+    token: &str,
+    allow_autoimport: bool,
+    allow_debug: bool,
+    rows: &[(String, String, String)],
+) -> anyhow::Result<i64> {
+    let sealed = crate::crypto::seal(pubkey, token.as_bytes())?;
+    let fp = crate::crypto::fingerprint(platform, token);
+    let id = db::upsert_cookie(&state.pool, platform, &fp, &sealed, allow_autoimport, allow_debug).await?;
+    db::set_cookie_creators(&state.pool, id, platform, rows).await?;
+    Ok(id)
+}
+
+fn spawn_first_import(state: &AppState, cookie_id: i64, platform: &str, token: &str) {
+    let (pool, kubo, platform, token) =
+        (state.pool.clone(), state.kubo.clone(), platform.to_string(), token.to_string());
+    tokio::spawn(async move {
+        let files = crate::scrape::scrape_cookie_creators(&pool, &kubo, cookie_id, &platform, &token).await;
+        if files > 0 {
+            if let Err(e) = crate::publish::publish_if_changed(&pool, &kubo).await {
+                tracing::error!("publish after first import failed: {e:#}");
+            }
+        }
+    });
+}
+
+fn spawn_oneshot_import(state: &AppState, platform: String, token: String, rows: Vec<(String, String, String)>) {
+    let (pool, kubo) = (state.pool.clone(), state.kubo.clone());
+    tokio::spawn(async move {
+        let Some(cookie_txt) = crate::platform::netscape_cookie(&platform, &token) else { return };
+        let mut files = 0;
+        for (_, name, url) in &rows {
+            match crate::scrape::scrape_source(&pool, &kubo, url, Some(&cookie_txt), None).await {
+                Ok(s) => files += s.files,
+                Err(e) => tracing::error!(creator = %name, "one-shot scrape failed: {e:#}"),
+            }
+        }
+        if files > 0 {
+            if let Err(e) = crate::publish::publish_if_changed(&pool, &kubo).await {
+                tracing::error!("publish after one-shot import failed: {e:#}");
+            }
+        }
+    });
+}
+
 async fn keepers(headers: HeaderMap) -> Html<String> {
     let base = base_url(&headers);
     render(
@@ -750,7 +899,8 @@ async fn mod_page(State(state): State<AppState>, headers: HeaderMap) -> Response
         return denied;
     }
     let denied = db::denylist(&state.pool).await.unwrap_or_default();
-    let sources = db::list_sources(&state.pool).await.unwrap_or_default();
+    let cookies = db::cookie_overview(&state.pool).await.unwrap_or_default();
+    let live = cookies.iter().filter(|c| c.2 == "live").count();
     let page = render(
         "mod",
         html! {
@@ -767,14 +917,16 @@ async fn mod_page(State(state): State<AppState>, headers: HeaderMap) -> Response
             @for d in &denied {
                 p { code { (d.0) } " - " (d.1) " - " (pretty_date(&d.2)) }
             }
-            h3 { "Scrape sources" }
-            @if sources.is_empty() { p.muted { "No sources configured (bakemono source add <url> [cookies])" } }
-            @for (url, enabled, scraped_at, error) in &sources {
+            h3 { "Contributor cookies (" (live) " live / " (cookies.len()) ")" }
+            p.muted { "Tokens are encrypted; run an import round with `bakemono autoimport < cookie-private.pem`" }
+            @if cookies.is_empty() { p.muted { "No cookies submitted yet" } }
+            @for (id, platform, status, creators, last_ok, error) in &cookies {
                 p {
-                    @if *enabled { span.chip { "on" } } @else { span.chip.muted { "off" } }
-                    " " (url)
-                    " - last: " (scraped_at.clone().unwrap_or_else(|| "never".into()))
-                    @if let Some(e) = error { span.muted { " - ERR " (e) } }
+                    @if status == "live" { span.chip { "live" } } @else { span.chip.muted { (status) } }
+                    " #" (id) " " (crate::platform::label(platform))
+                    " - " (creators) " creators"
+                    " - last ok: " (last_ok.clone().unwrap_or_else(|| "never".into()))
+                    @if let Some(e) = error { span.muted { " - " (e) } }
                 }
             }
         },
@@ -1571,6 +1723,12 @@ pre { white-space:pre-wrap; word-break:break-all; background:var(--mantle); bord
 @media (max-width:400px) {
   .grid { grid-template-columns:repeat(2,1fr) }
 }
+.contribform { display:flex; flex-direction:column; gap:.8rem; max-width:560px; margin:1.2rem 0 1.6rem }
+.contribform label { display:flex; flex-direction:column; gap:.3rem; font-weight:600 }
+.contribform label.check { flex-direction:row; align-items:flex-start; gap:.5rem; font-weight:400; color:var(--subtext1) }
+.contribform input[type=text], .contribform select { padding:.5rem .6rem; border-radius:8px; border:1px solid var(--surface2); background:var(--surface0); color:var(--text); font:inherit }
+.contribform button { align-self:flex-start; padding:.5rem 1.2rem; border-radius:8px; border:0; background:var(--accent); color:var(--base); font-weight:600; cursor:pointer }
+p.err { color:var(--red); font-weight:600 }
 ";
 
 // on mobile the search field is collapsed behind an icon; focus it the moment it opens

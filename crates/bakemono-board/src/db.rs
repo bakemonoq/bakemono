@@ -392,51 +392,133 @@ pub async fn upsert_post_file(pool: &PgPool, meta: &crate::scrape::PostMeta, cid
     Ok(())
 }
 
-pub struct Source {
-    pub url: String,
-    pub cookies: Option<String>,
+// store a sealed contributor cookie and remember which creators it can reach. the plaintext token
+// is never persisted; only the RSA-wrapped ciphertext is
+pub async fn upsert_cookie(
+    pool: &PgPool,
+    platform: &str,
+    fingerprint: &str,
+    sealed: &crate::crypto::Sealed,
+    allow_autoimport: bool,
+    allow_debug: bool,
+) -> Result<i64> {
+    let id = sqlx::query_scalar(
+        "INSERT INTO cookies (platform, fingerprint, wrapped_key, nonce, ciphertext,
+                              allow_autoimport, allow_debug, status, last_ok_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'live', now())
+         ON CONFLICT (fingerprint) DO UPDATE SET
+             wrapped_key = EXCLUDED.wrapped_key,
+             nonce = EXCLUDED.nonce,
+             ciphertext = EXCLUDED.ciphertext,
+             allow_autoimport = EXCLUDED.allow_autoimport,
+             allow_debug = EXCLUDED.allow_debug,
+             status = 'live',
+             last_ok_at = now(),
+             last_error = NULL
+         RETURNING id",
+    )
+    .bind(platform)
+    .bind(fingerprint)
+    .bind(&sealed.wrapped_key)
+    .bind(&sealed.nonce)
+    .bind(&sealed.ciphertext)
+    .bind(allow_autoimport)
+    .bind(allow_debug)
+    .fetch_one(pool)
+    .await?;
+    Ok(id)
 }
 
-pub async fn add_source(pool: &PgPool, url: &str, cookies: Option<&str>) -> Result<()> {
-    sqlx::query(
-        "INSERT INTO sources (url, cookies) VALUES ($1,$2)
-         ON CONFLICT (url) DO UPDATE SET cookies = COALESCE(EXCLUDED.cookies, sources.cookies), enabled = TRUE",
-    )
-    .bind(url)
-    .bind(cookies)
-    .execute(pool)
-    .await?;
+// replace a cookie's creator set: mark everything inactive, then reactivate/insert what is current,
+// so a creator the contributor unsubscribed from stops being scraped
+pub async fn set_cookie_creators(
+    pool: &PgPool,
+    cookie_id: i64,
+    platform: &str,
+    creators: &[(String, String, String)],
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("UPDATE cookie_creators SET active = FALSE WHERE cookie_id = $1")
+        .bind(cookie_id)
+        .execute(&mut *tx)
+        .await?;
+    for (id, name, url) in creators {
+        sqlx::query(
+            "INSERT INTO cookie_creators (cookie_id, platform, creator_id, creator, url, active, discovered_at)
+             VALUES ($1,$2,$3,$4,$5,TRUE,now())
+             ON CONFLICT (cookie_id, platform, creator_id) DO UPDATE SET
+                 creator = EXCLUDED.creator, url = EXCLUDED.url, active = TRUE",
+        )
+        .bind(cookie_id)
+        .bind(platform)
+        .bind(id)
+        .bind(name)
+        .bind(url)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
-pub async fn list_sources(pool: &PgPool) -> Result<Vec<(String, bool, Option<String>, Option<String>)>> {
-    let rows = sqlx::query_as(
-        "SELECT url, enabled, last_scraped_at::text, last_error FROM sources ORDER BY url",
+pub struct SealedCookie {
+    pub id: i64,
+    pub platform: String,
+    pub sealed: crate::crypto::Sealed,
+}
+
+// live cookies opted into auto-import, for a keyed round
+pub async fn autoimport_cookies(pool: &PgPool) -> Result<Vec<SealedCookie>> {
+    let rows: Vec<(i64, String, String, String, String)> = sqlx::query_as(
+        "SELECT id, platform, wrapped_key, nonce, ciphertext FROM cookies
+         WHERE status != 'dead' AND allow_autoimport ORDER BY last_ok_at NULLS FIRST",
     )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, platform, wrapped_key, nonce, ciphertext)| SealedCookie {
+            id,
+            platform,
+            sealed: crate::crypto::Sealed { wrapped_key, nonce, ciphertext },
+        })
+        .collect())
+}
+
+pub async fn active_cookie_creators(pool: &PgPool, cookie_id: i64) -> Result<Vec<(String, String)>> {
+    let rows = sqlx::query_as(
+        "SELECT creator, url FROM cookie_creators WHERE cookie_id = $1 AND active ORDER BY creator",
+    )
+    .bind(cookie_id)
     .fetch_all(pool)
     .await?;
     Ok(rows)
 }
 
-pub async fn due_sources(pool: &PgPool, older_than_secs: i64) -> Result<Vec<Source>> {
-    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
-        "SELECT url, cookies FROM sources
-         WHERE enabled AND (last_scraped_at IS NULL OR last_scraped_at < now() - make_interval(secs => $1))
-         ORDER BY last_scraped_at NULLS FIRST",
-    )
-    .bind(older_than_secs as f64)
-    .fetch_all(pool)
+pub async fn mark_cookie(pool: &PgPool, cookie_id: i64, status: &str, error: Option<&str>) -> Result<()> {
+    let ok_clause = if status == "live" { ", last_ok_at = now()" } else { "" };
+    sqlx::query(&format!(
+        "UPDATE cookies SET status = $2, last_checked_at = now(), last_error = $3{ok_clause} WHERE id = $1"
+    ))
+    .bind(cookie_id)
+    .bind(status)
+    .bind(error)
+    .execute(pool)
     .await?;
-    Ok(rows.into_iter().map(|(url, cookies)| Source { url, cookies }).collect())
+    Ok(())
 }
 
-pub async fn mark_scraped(pool: &PgPool, url: &str, error: Option<&str>) -> Result<()> {
-    sqlx::query("UPDATE sources SET last_scraped_at = now(), last_error = $2 WHERE url = $1")
-        .bind(url)
-        .bind(error)
-        .execute(pool)
-        .await?;
-    Ok(())
+// mod-page view: one row per cookie with its live-creator count, no secrets
+pub async fn cookie_overview(pool: &PgPool) -> Result<Vec<(i64, String, String, i64, Option<String>, Option<String>)>> {
+    let rows = sqlx::query_as(
+        "SELECT c.id, c.platform, c.status,
+                (SELECT COUNT(*) FROM cookie_creators cc WHERE cc.cookie_id = c.id AND cc.active),
+                c.last_ok_at::text, c.last_error
+         FROM cookies c ORDER BY c.created_at DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
 }
 
 // sha256 rides along so a later re-scrape of the same bytes is refused before anything re-pins;
@@ -662,6 +744,7 @@ DROP TABLE IF EXISTS verified_content CASCADE;
 DROP TABLE IF EXISTS reports CASCADE;
 DROP TABLE IF EXISTS pubkeys CASCADE;
 DROP TABLE IF EXISTS authors CASCADE;
+DROP TABLE IF EXISTS sources CASCADE;
 
 CREATE TABLE IF NOT EXISTS files (
     cid       TEXT PRIMARY KEY,
@@ -710,13 +793,34 @@ CREATE TABLE IF NOT EXISTS post_files (
 );
 CREATE INDEX IF NOT EXISTS post_files_cid ON post_files (cid);
 
--- what the scrape scheduler works through; cookies are operational state, never in the manifest
-CREATE TABLE IF NOT EXISTS sources (
-    url             TEXT PRIMARY KEY,
-    cookies         TEXT,
-    enabled         BOOLEAN NOT NULL DEFAULT TRUE,
-    last_scraped_at TIMESTAMPTZ,
-    last_error      TEXT
+-- contributor session cookies, stored only as RSA-wrapped ciphertext. the private key lives offline
+-- and touches the box only during an import round, so a database dump reveals no usable tokens
+CREATE TABLE IF NOT EXISTS cookies (
+    id               BIGSERIAL PRIMARY KEY,
+    platform         TEXT NOT NULL,
+    fingerprint      TEXT NOT NULL UNIQUE,
+    wrapped_key      TEXT NOT NULL,
+    nonce            TEXT NOT NULL,
+    ciphertext       TEXT NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'live',
+    allow_autoimport BOOLEAN NOT NULL DEFAULT TRUE,
+    allow_debug      BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_checked_at  TIMESTAMPTZ,
+    last_ok_at       TIMESTAMPTZ,
+    last_error       TEXT
+);
+
+-- creators each cookie can reach, refreshed every round; inactive rows are unsubscribed creators
+CREATE TABLE IF NOT EXISTS cookie_creators (
+    cookie_id     BIGINT NOT NULL REFERENCES cookies(id) ON DELETE CASCADE,
+    platform      TEXT NOT NULL,
+    creator_id    TEXT NOT NULL,
+    creator       TEXT NOT NULL DEFAULT '',
+    url           TEXT NOT NULL,
+    active        BOOLEAN NOT NULL DEFAULT TRUE,
+    discovered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (cookie_id, platform, creator_id)
 );
 
 -- every published manifest version; head_json is served verbatim at /head.json

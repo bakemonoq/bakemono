@@ -16,7 +16,11 @@ The IPFS stack is implemented and the Nostr/BitTorrent code is deleted (crates b
 
 - `bakemono-core` - shared library crate. Manifest types (head / root / shard), canonical JSON, ed25519 signing and verification, frozen `ipfs add` parameter constants. Pure logic, zero I/O. Unit-tested in isolation.
 - `bakemono-scraper` - thin gallery-dl wrapper library (invocation, cookies, streaming output, download archive).
-- `bakemono-board` - the `bakemono` binary. Subcommands: `serve` (web UI + scrape worker + manifest publisher + `/f/{cid}` gateway proxy - the only long-running process), `scrape` (one-off creator scrape without a running board), `ingest` (import a directory of already-scraped files + sidecars), `source` (manage the scrape schedule), `restore` (rebuild postgres and pinset from a head CID). Rust: axum + sqlx + maud + Postgres.
+- `bakemono-board` - the `bakemono` binary. Subcommands: `serve` (web UI + `/contribute` intake + scrape worker + manifest publisher + `/f/{cid}` gateway proxy - the only long-running process), `scrape` (one-off creator scrape with a cookies.txt), `ingest` (import a directory of already-scraped files + sidecars), `keygen` (generate the cookie RSA keypair), `autoimport` (run one keyed import round, private key from stdin), `restore` (rebuild postgres and pinset from a head CID). Rust: axum + sqlx + maud + Postgres.
+
+## Contributor cookies
+
+Content comes from subscribers via the `/contribute` form (platform + session cookie), not an operator account. At submission the board holds the plaintext just long enough to validate the cookie and discover its creators, then seals it (per-cookie AES-256-GCM key, RSA-4096-OAEP-wrapped) if the contributor opted into daily import; only ciphertext is stored. The RSA private key stays offline. `bakemono autoimport` (private key piped to stdin over SSH, never on disk) decrypts live cookies in memory each round, refreshes creators, scrapes new posts. `crypto.rs` = seal/open/keygen; `platform.rs` = per-platform cookie name + Netscape file + subscription discovery (Patreon + Fanbox concrete, others error until implemented). Tables: `cookies` (sealed), `cookie_creators`. `BAKEMONO_COOKIE_PUBKEY` (public PEM, inline or path) enables `/contribute`; `BAKEMONO_COOKIE_PRIVKEY` makes `serve` run rounds itself (less secure convenience).
 
 Alongside on the board host: postgres, Kubo, `ipfs-cluster-service`. Operator keeper hosts run Kubo + `ipfs-cluster-service` (trusted peers); volunteer keepers run Kubo + `ipfs-cluster-follow` and zero Bakemono software.
 
@@ -59,7 +63,7 @@ Alongside on the board host: postgres, Kubo, `ipfs-cluster-service`. Operator ke
 - Moderation is per-board. Admission is source-level (which platforms, which creators); there is no upload endpoint. Removal is the revoked list in the signed manifest: the fleet and followers unpin automatically, gateways denylist, and the hash-linked head chain is a built-in transparency log of every takedown.
 - CSAM and other categorically illegal content is actively moderated at every board. Peer boards apply `csam`-reason revocations unconditionally; boards that refuse get dropped from peers lists.
 - Nodes outside the cluster that pinned a CID independently are beyond anyone's control. Inherent property of open networks; the manifest records intent and scopes enforcement to the trust boundary.
-- Source-platform cookies live only on the scrape host, are used only for retrieval, and are never published, shared, or written into the archive. Contributors who donate cookies do so knowingly, to the operator, not to a network. This is a narrower promise than the old client-side model and is stated plainly wherever cookies are collected.
+- Contributor cookies are sealed with a hybrid RSA-4096 + AES-256-GCM scheme; the private key never lives on the server, so a database dump exposes no usable token. Plaintext exists only transiently (submission validation, and in-memory during a keyed round) and is never published, shared, or written into the archive. The `/contribute` form states this plainly and offers a one-time-import option that stores nothing.
 - The board key's offline backup is the recovery lynchpin: losing it stops future publishes but does not endanger published content or history.
 
 ## Style rules (apply to all files in this repo)

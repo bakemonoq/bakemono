@@ -16,47 +16,94 @@ use crate::db;
 use crate::kubo::Kubo;
 use crate::thumb;
 
-// the serve-mode worker: scrape every due source, one at a time, forever
+// serve only runs auto-import rounds when the operator has accepted keeping the private key on the
+// box (BAKEMONO_COOKIE_PRIVKEY). the secure default keeps the key offline and drives rounds
+// externally with `bakemono autoimport`
 pub async fn run_scheduler(pool: PgPool, kubo: Arc<Kubo>) {
-    let interval = env_secs("BAKEMONO_SCRAPE_INTERVAL_SECS", 21_600);
+    let interval = env_secs("BAKEMONO_SCRAPE_INTERVAL_SECS", 86_400);
+    let privkey = match crate::crypto::load_private_pem() {
+        Ok(Some(pem)) => pem,
+        Ok(None) => {
+            tracing::info!("autoimport scheduler off (no BAKEMONO_COOKIE_PRIVKEY); run `bakemono autoimport` externally");
+            return;
+        }
+        Err(e) => {
+            tracing::error!("bad BAKEMONO_COOKIE_PRIVKEY: {e:#}");
+            return;
+        }
+    };
     if interval == 0 {
-        tracing::info!("scrape scheduler disabled");
         return;
     }
     loop {
-        let due = match db::due_sources(&pool, interval as i64).await {
-            Ok(due) => due,
+        if let Err(e) = autoimport_round(&pool, &kubo, &privkey).await {
+            tracing::error!("autoimport round failed: {e:#}");
+        }
+        tokio::time::sleep(Duration::from_secs(interval)).await;
+    }
+}
+
+// one keyed round: decrypt every live cookie, refresh its creator list, scrape new posts. the
+// plaintext token exists only in this function's stack and is dropped as each cookie finishes
+pub async fn autoimport_round(pool: &PgPool, kubo: &Kubo, privkey_pem: &str) -> Result<()> {
+    let cookies = db::autoimport_cookies(pool).await?;
+    tracing::info!(count = cookies.len(), "autoimport round starting");
+    let mut ingested = 0usize;
+    for cookie in cookies {
+        let token = match crate::crypto::open(privkey_pem, &cookie.sealed) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             Err(e) => {
-                tracing::error!("listing due sources: {e:#}");
-                Vec::new()
+                tracing::error!(cookie = cookie.id, "decrypt failed: {e:#}");
+                continue;
             }
         };
-        let mut ingested = 0;
-        for source in due {
-            tracing::info!(url = %source.url, "scrape starting");
-            let result = scrape_source(&pool, &kubo, &source.url, source.cookies.as_deref(), None).await;
-            let error = match &result {
-                Ok(stats) => {
-                    tracing::info!(url = %source.url, files = stats.files, posts = stats.posts, "scrape done");
-                    ingested += stats.files;
-                    None
-                }
-                Err(e) => {
-                    tracing::error!(url = %source.url, "scrape failed: {e:#}");
-                    Some(format!("{e:#}"))
-                }
-            };
-            if let Err(e) = db::mark_scraped(&pool, &source.url, error.as_deref()).await {
-                tracing::error!("recording scrape result: {e:#}");
+        match crate::platform::discover(&cookie.platform, &token).await {
+            Ok(None) => {
+                db::mark_cookie(pool, cookie.id, "dead", Some("cookie rejected")).await?;
+                continue;
+            }
+            Ok(Some(creators)) => {
+                let rows: Vec<(String, String, String)> =
+                    creators.into_iter().map(|c| (c.id, c.name, c.url)).collect();
+                db::set_cookie_creators(pool, cookie.id, &cookie.platform, &rows).await?;
+                db::mark_cookie(pool, cookie.id, "live", None).await?;
+            }
+            Err(e) => {
+                db::mark_cookie(pool, cookie.id, "live", Some(&format!("discovery: {e:#}"))).await?;
             }
         }
-        if ingested > 0 {
-            if let Err(e) = crate::publish::publish_if_changed(&pool, &kubo).await {
-                tracing::error!("manifest publish failed: {e:#}");
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        ingested += scrape_cookie_creators(pool, kubo, cookie.id, &cookie.platform, &token).await;
     }
+    if ingested > 0 {
+        crate::publish::publish_if_changed(pool, kubo).await?;
+    }
+    tracing::info!(files = ingested, "autoimport round done");
+    Ok(())
+}
+
+// scrape every active creator this cookie reaches with the given plaintext token
+pub async fn scrape_cookie_creators(
+    pool: &PgPool,
+    kubo: &Kubo,
+    cookie_id: i64,
+    platform: &str,
+    token: &str,
+) -> usize {
+    let Some(cookie_txt) = crate::platform::netscape_cookie(platform, token) else {
+        return 0;
+    };
+    let creators = db::active_cookie_creators(pool, cookie_id).await.unwrap_or_default();
+    let mut files = 0;
+    for (name, url) in creators {
+        match scrape_source(pool, kubo, &url, Some(&cookie_txt), None).await {
+            Ok(stats) => {
+                tracing::info!(creator = %name, files = stats.files, "scraped");
+                files += stats.files;
+            }
+            Err(e) => tracing::error!(creator = %name, "scrape failed: {e:#}"),
+        }
+    }
+    files
 }
 
 pub async fn scrape_source(
