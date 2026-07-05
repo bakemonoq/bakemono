@@ -15,7 +15,10 @@ nostr-relay-builder = "0.44.1"
 # pin the rustls crypto provider: the dep tree pulls both ring and aws-lc-rs, so a provider must be installed explicitly
 rustls = { version = "0.23", features = ["ring"] }
 thiserror = "2"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "io-util", "signal", "sync"] }
 anyhow = "1"
 sha2 = "0.11"
