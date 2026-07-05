@@ -7,8 +7,12 @@ You run two stock programs, no Bakemono software: [Kubo](https://docs.ipfs.tech/
 ## Quick start
 
 ```sh
-# 1. install and start kubo with periodic GC
+# 1. install and configure kubo
 ipfs init
+# serve blocks to peers - recent kubo ships with the bitswap server OFF, which would make
+# your node a leech; and full want broadcasts, so fleet peers hear you without DHT luck
+ipfs config --json Bitswap.ServerEnabled true
+ipfs config --json Internal.Bitswap.BroadcastControl.Enable false
 ipfs config --json Reprovider.Strategy '"roots"'
 ipfs daemon --enable-gc &
 

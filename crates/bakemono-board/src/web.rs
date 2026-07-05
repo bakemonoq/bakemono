@@ -78,6 +78,7 @@ pub fn router(state: AppState) -> Router {
         .route("/t/{infohash}/f/{file_index}", get(gateway_file))
         .route("/f/{cid}", get(ipfs_file))
         .route("/head.json", get(head_json))
+        .route("/follower.json", get(follower_json))
         .with_state(state)
 }
 
@@ -1321,6 +1322,51 @@ async fn mod_deny_cid(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+// what a volunteer keeper points ipfs-cluster-follow at: the board's own cluster config with
+// follower-appropriate edits. built from the mounted cluster config dir; identity.json is read
+// for its public peer id ONLY - the private key never leaves this function
+async fn follower_json() -> Response {
+    let Some(dir) = std::env::var("BAKEMONO_CLUSTER_CONFIG_DIR").ok().filter(|s| !s.is_empty())
+    else {
+        return (StatusCode::NOT_FOUND, "no cluster configured").into_response();
+    };
+    let public_addr = std::env::var("BAKEMONO_CLUSTER_PUBLIC_ADDR").unwrap_or_default();
+    match build_follower_config(&dir, &public_addr).await {
+        Ok(json) => (
+            [(header::CONTENT_TYPE, "application/json"), (header::CACHE_CONTROL, "no-cache")],
+            json,
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("follower config build failed: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn build_follower_config(dir: &str, public_addr: &str) -> anyhow::Result<String> {
+    use serde_json::{json, Value};
+    let mut service: Value =
+        serde_json::from_slice(&tokio::fs::read(format!("{dir}/service.json")).await?)?;
+    let identity: Value =
+        serde_json::from_slice(&tokio::fs::read(format!("{dir}/identity.json")).await?)?;
+    let peer_id = identity["id"].as_str().unwrap_or_default().to_string();
+    anyhow::ensure!(!peer_id.is_empty(), "cluster identity has no id");
+
+    service["cluster"]["peername"] = json!("keeper");
+    service["cluster"]["listen_multiaddress"] = json!(["/ip4/0.0.0.0/tcp/9096"]);
+    service["cluster"]["peer_addresses"] = if public_addr.is_empty() {
+        json!([])
+    } else {
+        json!([format!("{public_addr}/p2p/{peer_id}")])
+    };
+    service["consensus"]["crdt"]["trusted_peers"] = json!([peer_id]);
+    // a follower replicates; it does not expose APIs or proxy its kubo
+    service["api"] = json!({});
+    service["ipfs_connector"]["ipfshttp"]["node_multiaddress"] = json!("/ip4/127.0.0.1/tcp/5001");
+    Ok(service.to_string())
 }
 
 // the signed pointer to the current manifest version, served verbatim as published

@@ -20,6 +20,7 @@ services:
       - "127.0.0.1:8081:8080"
     volumes:
       - bakemono-ipfs:/data/ipfs
+      - ./defaults/kubo-init.sh:/container-init.d/kubo-init.sh:ro
     restart: unless-stopped
 
   cluster:
@@ -84,6 +85,10 @@ services:
       # ed25519 board key (hex) that signs manifest heads; unset generates into the key file below
       BAKEMONO_BOARD_KEY: ${BAKEMONO_BOARD_KEY:-}
       BAKEMONO_BOARD_KEY_FILE: /cache/board.key
+      # cluster config (mounted ro) that /follower.json is derived from, and the public multiaddr
+      # keepers dial, e.g. /dns4/board.example/tcp/9096
+      BAKEMONO_CLUSTER_CONFIG_DIR: /cluster
+      BAKEMONO_CLUSTER_PUBLIC_ADDR: ${BAKEMONO_CLUSTER_PUBLIC_ADDR:-}
     ports:
       - "3000:3000"
       - "${BAKEMONO_GATEWAY_PORT:-4240}:${BAKEMONO_GATEWAY_PORT:-4240}"
@@ -91,6 +96,7 @@ services:
     volumes:
       - bakemono-cache:/cache
       - bakemono-scrape:/scrape
+      - bakemono-cluster:/cluster:ro
     depends_on:
       - postgres
       - relay
