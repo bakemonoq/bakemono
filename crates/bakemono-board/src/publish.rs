@@ -76,6 +76,48 @@ pub async fn revoke_cid(pool: &PgPool, kubo: &Kubo, cid: &str, reason: &str) -> 
     Ok(())
 }
 
+// post-level takedown: every file (and preview) of the post is denied and unpinned; the post
+// disappears from the next manifest because it has no visible files left
+pub async fn revoke_post(
+    pool: &PgPool,
+    kubo: &Kubo,
+    platform: &str,
+    creator_id: &str,
+    post_id: &str,
+    reason: &str,
+) -> Result<()> {
+    let cids = db::cids_for_post(pool, platform, creator_id, post_id).await?;
+    revoke_cids(pool, kubo, &cids, reason).await
+}
+
+pub async fn revoke_creator(
+    pool: &PgPool,
+    kubo: &Kubo,
+    platform: &str,
+    creator_id: &str,
+    reason: &str,
+) -> Result<()> {
+    let cids = db::cids_for_creator(pool, platform, creator_id).await?;
+    revoke_cids(pool, kubo, &cids, reason).await
+}
+
+async fn revoke_cids(pool: &PgPool, kubo: &Kubo, cids: &[String], reason: &str) -> Result<()> {
+    for cid in cids {
+        if let Some(thumb) = db::thumb_of(pool, cid).await? {
+            db::deny_cid(pool, &thumb, reason).await?;
+            if let Err(e) = kubo.unpin_archive(&thumb).await {
+                tracing::warn!("unpin thumb {thumb}: {e:#}");
+            }
+        }
+        db::deny_cid(pool, cid, reason).await?;
+        if let Err(e) = kubo.unpin_archive(cid).await {
+            tracing::warn!("unpin {cid}: {e:#}");
+        }
+    }
+    publish_if_changed(pool, kubo).await?;
+    Ok(())
+}
+
 async fn build_shard(
     pool: &PgPool,
     platform: &str,

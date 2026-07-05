@@ -1,7 +1,7 @@
 name: server
 
-# daemon + cli + bundled gallery-dl/ffmpeg, tarred so a server runs scrape+seed from the console
-# without docker. tauri-free; attaches to the same draft as release.yml
+# the board binary + bundled gallery-dl/ffmpeg, tarred so a host runs the whole board from the
+# console without docker
 on:
   push:
     tags: ["v*"]
@@ -23,10 +23,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Linux build deps
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -51,8 +47,8 @@ jobs:
           echo "from gallery_dl import main; main()" > gdl_entry.py
           pyinstaller --onefile --name gallery-dl --collect-all gallery_dl gdl_entry.py
 
-      - name: Build daemon + cli
-        run: cargo build --release -p bakemono-daemon -p bakemono-cli --target ${{ matrix.target }}
+      - name: Build the board
+        run: cargo build --release -p bakemono-board --target ${{ matrix.target }}
 
       - name: Package server bundle
         shell: bash
@@ -61,31 +57,30 @@ jobs:
           TARGET="${{ matrix.target }}"
           PKG="bakemono-server-$TARGET"
           rm -rf "$PKG"; mkdir -p "$PKG/bin"
-          cp "target/$TARGET/release/bakemono-daemon" "$PKG/bin/bakemono-daemon"
-          cp "target/$TARGET/release/bakemono"        "$PKG/bin/bakemono-cli"
-          cp "dist/gallery-dl"                        "$PKG/bin/gallery-dl"
+          cp "target/$TARGET/release/bakemono" "$PKG/bin/bakemono"
+          cp "dist/gallery-dl"                 "$PKG/bin/gallery-dl"
           npm i --no-save ffmpeg-static
           cp "$(node -e "process.stdout.write(require('ffmpeg-static'))")" "$PKG/bin/ffmpeg"
           chmod +x "$PKG/bin/"*
-          for entry in bakemono-daemon bakemono-cli; do
-            launcher="bakemonod"; [ "$entry" = bakemono-cli ] && launcher="bakemono"
-            cat > "$PKG/$launcher" <<LAUNCH
+          cat > "$PKG/bakemono" <<LAUNCH
           #!/bin/sh
           DIR="\$(cd "\$(dirname "\$0")" && pwd)"
           export BAKEMONO_GALLERY_DL="\$DIR/bin/gallery-dl"
           export BAKEMONO_FFMPEG="\$DIR/bin/ffmpeg"
-          exec "\$DIR/bin/$entry" "\$@"
+          exec "\$DIR/bin/bakemono" "\$@"
           LAUNCH
-            chmod +x "$PKG/$launcher"
-          done
+          chmod +x "$PKG/bakemono"
           cat > "$PKG/README.txt" <<'DOC'
-          Bakemono server bundle (no GUI, no docker).
+          Bakemono server bundle (no docker).
 
-          ./bakemonod &                                      run the daemon (seeds + scrape queue + Nostr publish)
-          ./bakemono scrape <creator> --cookies cookies.txt  queue a scrape (paid posts need a cookies.txt)
-          ./bakemono status | stats | stop                   control the running daemon
+          Needs postgres (DATABASE_URL) and a local kubo daemon; ipfs-cluster-service for a fleet.
 
-          Identity, config and seeded cache live under ~/.bakemono. Cookies never leave this machine.
+          ./bakemono serve                       run the board
+          ./bakemono scrape <url> [cookies.txt]  one-off scrape into the archive
+          ./bakemono ingest <dir>                import an already-scraped directory
+          ./bakemono source add <url> [cookies]  put a source on the scheduler
+          ./bakemono restore <head-cid>          rebuild everything from a keeper
+
           macOS: clear quarantine once with  xattr -dr com.apple.quarantine .
           DOC
           tar czf "$PKG.tar.gz" "$PKG"
@@ -105,9 +100,6 @@ jobs:
           set -euo pipefail
           TAG="${{ github.ref_name }}"
           PKG="bakemono-server-${{ matrix.target }}.tar.gz"
-          # release.yml owns creation; wait for that one draft, then attach - never create our own
-          for i in $(seq 1 60); do
-            gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 && break
-            echo "waiting for release $TAG ($i/60)"; sleep 10
-          done
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" --draft --title "$TAG" -R "$GITHUB_REPOSITORY"
           gh release upload "$TAG" "$PKG" --clobber -R "$GITHUB_REPOSITORY"

@@ -8,7 +8,7 @@ Keep the content you care about available even after the original site takes it 
 - Keeping is two stock programs: Kubo + `ipfs-cluster-follow`. No Bakemono software, no account.
 - Takedowns are honest: every removal is recorded in a hash-linked, signed manifest history that keepers hold and anyone can audit.
 
-Status: main is mid-migration to this architecture. The latest release still ships the previous BitTorrent + Nostr stack, including the desktop app; both go away when the migration lands (`docs/MVP.md` has the order).
+Status: main implements this architecture; releases older than the pivot shipped a different (BitTorrent + Nostr) stack and are obsolete.
 
 ## Try it
 
@@ -46,7 +46,7 @@ Single Cargo workspace, Rust stable:
 cargo build --workspace
 cargo test --workspace
 
-# the board (needs postgres at DATABASE_URL and a local kubo)
+# the board binary is `bakemono` (needs postgres at DATABASE_URL and a local kubo)
 cargo run -p bakemono-board -- serve
 ```
 

@@ -9,11 +9,6 @@ license = "AGPL-3.0-or-later"
 repository = "https://github.com/bakemonoq/bakemono"
 
 [workspace.dependencies]
-nostr = "0.44.3"
-nostr-sdk = "0.44.1"
-nostr-relay-builder = "0.44.1"
-# pin the rustls crypto provider: the dep tree pulls both ring and aws-lc-rs, so a provider must be installed explicitly
-rustls = { version = "0.23", features = ["ring"] }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -21,13 +16,10 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "io-util", "signal", "sync"] }
 anyhow = "1"
-sha2 = "0.11"
 hex = "0.4"
-dirs = "6"
 axum = "0.8"
 maud = "0.27"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "macros"] }
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-tracing-appender = "0.2"

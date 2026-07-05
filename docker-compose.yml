@@ -16,7 +16,6 @@ services:
       - "4001:4001"
       - "4001:4001/udp"
       - "127.0.0.1:5001:5001"
-      # host 8081: the container gateway is 8080, taken on the host by the relay mapping
       - "127.0.0.1:8081:8080"
     volumes:
       - bakemono-ipfs:/data/ipfs
@@ -44,69 +43,46 @@ services:
       - bakemono-cluster:/data/ipfs-cluster
     restart: unless-stopped
 
-  relay:
-    image: scsibug/nostr-rs-relay:latest
-    ports:
-      - "${RELAY_PORT:-8080}:8080"
-    volumes:
-      - bakemono-relay:/usr/src/app/db
-      - ./relay/config.toml:/usr/src/app/config.toml:ro
-    restart: unless-stopped
-
   board:
     image: ${BOARD_IMAGE:-bakemono-board:latest}
     build:
       context: .
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgres://postgres:postgres@postgres:5432/bakemono?sslmode=disable}
-      BAKEMONO_RELAYS: ${BAKEMONO_RELAYS:-ws://relay:8080}
-      # BT peer port the gateway listens on; must match the published port below and be open at the firewall
-      BAKEMONO_GATEWAY_PORT: ${BAKEMONO_GATEWAY_PORT:-4240}
-      # optional: comma-separated ip:port seeders to dial directly (a known seedbox), bypassing tracker/DHT
-      BAKEMONO_GATEWAY_PEERS: ${BAKEMONO_GATEWAY_PEERS:-}
-      # on-disk cache cap in GB; over budget, least-recently-used content is evicted. 0 = unlimited
-      BAKEMONO_CACHE_GB: ${BAKEMONO_CACHE_GB:-10}
-      # mod queue password (HTTP Basic auth); leave unset to disable /mod
+      BAKEMONO_KUBO_API: ${BAKEMONO_KUBO_API:-http://kubo:5001}
+      BAKEMONO_KUBO_GATEWAY: ${BAKEMONO_KUBO_GATEWAY:-http://kubo:8080}
+      BAKEMONO_CLUSTER_API: ${BAKEMONO_CLUSTER_API:-http://cluster:9094}
+      # cluster config (mounted ro) that /follower.json is derived from, and the public multiaddr
+      # keepers dial, e.g. /dns4/board.example/tcp/9096
+      BAKEMONO_CLUSTER_CONFIG_DIR: /cluster
+      BAKEMONO_CLUSTER_PUBLIC_ADDR: ${BAKEMONO_CLUSTER_PUBLIC_ADDR:-}
+      # ed25519 board key (hex) that signs manifest heads; unset generates into the key file below
+      BAKEMONO_BOARD_KEY: ${BAKEMONO_BOARD_KEY:-}
+      BAKEMONO_BOARD_KEY_FILE: /data/board.key
+      # seconds between scrape passes over enabled sources; 0 disables the scheduler
+      BAKEMONO_SCRAPE_INTERVAL_SECS: ${BAKEMONO_SCRAPE_INTERVAL_SECS:-21600}
+      # mod password (HTTP Basic auth); leave unset to disable /mod
       BAKEMONO_MOD_TOKEN: ${BAKEMONO_MOD_TOKEN:-}
-      # instance keypair (nsec) that signs kind 31064 takedowns; unset keeps hides local-only
-      BAKEMONO_INSTANCE_NSEC: ${BAKEMONO_INSTANCE_NSEC:-}
-      # peer instance npubs/hex whose takedowns this board honors, comma-separated
-      BAKEMONO_TRUSTED_INSTANCES: ${BAKEMONO_TRUSTED_INSTANCES:-}
       # board title shown in the header, browser tab and /info; unset keeps the default wordmark
       BAKEMONO_BOARD_NAME: ${BAKEMONO_BOARD_NAME:-}
       # DMCA and general contact shown on /info
       BAKEMONO_DMCA_CONTACT: ${BAKEMONO_DMCA_CONTACT:-}
       BAKEMONO_CONTACT: ${BAKEMONO_CONTACT:-}
-      BAKEMONO_KUBO_API: ${BAKEMONO_KUBO_API:-http://kubo:5001}
-      BAKEMONO_KUBO_GATEWAY: ${BAKEMONO_KUBO_GATEWAY:-http://kubo:8080}
-      BAKEMONO_CLUSTER_API: ${BAKEMONO_CLUSTER_API:-http://cluster:9094}
-      # seconds between scrape passes over enabled sources; 0 disables the scheduler
-      BAKEMONO_SCRAPE_INTERVAL_SECS: ${BAKEMONO_SCRAPE_INTERVAL_SECS:-21600}
-      # ed25519 board key (hex) that signs manifest heads; unset generates into the key file below
-      BAKEMONO_BOARD_KEY: ${BAKEMONO_BOARD_KEY:-}
-      BAKEMONO_BOARD_KEY_FILE: /cache/board.key
-      # cluster config (mounted ro) that /follower.json is derived from, and the public multiaddr
-      # keepers dial, e.g. /dns4/board.example/tcp/9096
-      BAKEMONO_CLUSTER_CONFIG_DIR: /cluster
-      BAKEMONO_CLUSTER_PUBLIC_ADDR: ${BAKEMONO_CLUSTER_PUBLIC_ADDR:-}
     ports:
       - "3000:3000"
-      - "${BAKEMONO_GATEWAY_PORT:-4240}:${BAKEMONO_GATEWAY_PORT:-4240}"
-      - "${BAKEMONO_GATEWAY_PORT:-4240}:${BAKEMONO_GATEWAY_PORT:-4240}/udp"
     volumes:
-      - bakemono-cache:/cache
+      - bakemono-data:/data
       - bakemono-scrape:/scrape
       - bakemono-cluster:/cluster:ro
     depends_on:
       - postgres
-      - relay
       - kubo
+      - cluster
     restart: unless-stopped
 
 volumes:
   bakemono-pg:
-  bakemono-relay:
-  bakemono-cache:
   bakemono-ipfs:
-  bakemono-scrape:
   bakemono-cluster:
+  bakemono-data:
+  bakemono-scrape:

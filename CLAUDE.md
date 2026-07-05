@@ -10,12 +10,13 @@ Centralized archives die with their one server, and volunteer-seeding designs di
 
 ## Migration status
 
-The docs describe the target architecture; code on main still implements the previous stack (librqbit BitTorrent gateway, Nostr kinds 31063/31064, Tauri desktop app, per-file torrents, RSS seed feed). The migration (order in `docs/MVP.md`) deletes `bakemono-app`, `bakemono-daemon`, `bakemono-torrent`, `bakemono-cli` and the relay sidecar, folds `bakemono-engine`/`bakemono-scraper` into the board, and rewrites `bakemono-core` around the manifest. Do not build new features on the Nostr/BT code paths.
+The IPFS stack is implemented and the Nostr/BitTorrent code is deleted (crates bakemono-app / bakemono-daemon / bakemono-engine / bakemono-torrent / bakemono-cli, the relay sidecar, kinds 31063/31064, per-file torrents, the RSS seed feed). The board schema drops the old tables on connect; there was no official launch, so no data migration exists. Remaining from `docs/MVP.md`: prod fleet deployment (kubo NoFetch + denylist wiring, DNSLink, keeper hosts).
 
-## Components (target)
+## Components
 
 - `bakemono-core` - shared library crate. Manifest types (head / root / shard), canonical JSON, ed25519 signing and verification, frozen `ipfs add` parameter constants. Pure logic, zero I/O. Unit-tested in isolation.
-- `bakemono-board` - the `bakemono` binary. Subcommands: `serve` (web UI + scrape worker + manifest publisher + `/f/{cid}` gateway proxy - the only long-running process), `scrape` (one-off creator scrape without a running board), `ingest` (import a directory of already-scraped files + sidecars), `restore` (rebuild postgres and pinset from a head CID). Rust: axum + sqlx + maud + Postgres.
+- `bakemono-scraper` - thin gallery-dl wrapper library (invocation, cookies, streaming output, download archive).
+- `bakemono-board` - the `bakemono` binary. Subcommands: `serve` (web UI + scrape worker + manifest publisher + `/f/{cid}` gateway proxy - the only long-running process), `scrape` (one-off creator scrape without a running board), `ingest` (import a directory of already-scraped files + sidecars), `source` (manage the scrape schedule), `restore` (rebuild postgres and pinset from a head CID). Rust: axum + sqlx + maud + Postgres.
 
 Alongside on the board host: postgres, Kubo, `ipfs-cluster-service`. Operator keeper hosts run Kubo + `ipfs-cluster-service` (trusted peers); volunteer keepers run Kubo + `ipfs-cluster-follow` and zero Bakemono software.
 

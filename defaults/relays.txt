@@ -1,8 +1,0 @@
-# Nostr relays the desktop app publishes manifests to and the board subscribes to.
-# One relay URL per line. Blank lines and lines starting with # are ignored.
-# To add a relay: open a PR adding one wss:// (or ws://) URL on its own line.
-wss://relay.bakemono.app
-wss://relay.damus.io
-wss://nos.lol
-wss://relay.snort.social
-wss://nostr.wine

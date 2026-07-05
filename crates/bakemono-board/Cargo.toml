@@ -1,17 +1,18 @@
 [package]
 name = "bakemono-board"
-description = "Self-hostable board: indexes kind 31063 events into Postgres and serves a browse UI"
+description = "Self-hostable board: server-side scraping, IPFS archive, signed manifest publishing"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[[bin]]
+name = "bakemono"
+path = "src/main.rs"
+
 [dependencies]
 bakemono-core = { path = "../bakemono-core" }
 bakemono-scraper = { path = "../bakemono-scraper" }
-bakemono-torrent = { path = "../bakemono-torrent" }
-nostr-sdk.workspace = true
-rustls.workspace = true
 sqlx.workspace = true
 axum.workspace = true
 maud.workspace = true
@@ -30,6 +31,3 @@ sha2 = "0.10"
 hmac = "0.12"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ammonia = "4.1.3"
-
-[dev-dependencies]
-nostr-relay-builder.workspace = true

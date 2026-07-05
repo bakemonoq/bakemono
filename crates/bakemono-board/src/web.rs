@@ -1,27 +1,17 @@
-use std::io::SeekFrom;
-use std::net::{IpAddr, SocketAddr};
-use std::collections::{HashMap, HashSet};
-use std::pin::Pin;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::task::{Context, Poll};
+use std::sync::{Arc, OnceLock};
 
 use axum::body::Body;
-use axum::extract::{ConnectInfo, Form, FromRef, Path, Query, State};
+use axum::extract::{Form, FromRef, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::{Html, IntoResponse, Json, Redirect, Response};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-use chrono::Utc;
 use maud::{html, Markup, PreEscaped, DOCTYPE};
-use nostr_sdk::prelude::{Client, Event, Keys, PublicKey, ToBech32};
+use chrono::Utc;
 use sqlx::postgres::PgPool;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, ReadBuf};
-use tokio_util::io::ReaderStream;
-
-use bakemono_core::{Takedown, Target};
 
 use crate::config;
 use crate::db;
@@ -29,11 +19,7 @@ use crate::db;
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
-    pub relays: Vec<String>,
-    pub signer: Option<Keys>,
-    pub gateway: Arc<bakemono_torrent::Gateway>,
     pub kubo: Arc<crate::kubo::Kubo>,
-    pub cold_limiter: Arc<crate::ratelimit::ColdLimiter>,
 }
 
 // lets handlers that only need the pool keep extracting State<PgPool> unchanged
@@ -52,30 +38,14 @@ pub fn router(state: AppState) -> Router {
         .route("/creators", get(creators_index))
         .route("/search", get(search_index))
         .route("/random", get(random_redirect))
-        .route("/feed.xml", get(seed_feed))
-        .route("/contribute", get(contribute))
         .route("/keepers", get(keepers))
         .route("/info", get(info_page))
         .route("/c/{platform}/{creator_id}", get(creator_page))
         .route("/p/{platform}/{creator_id}/{post_id}", get(post_page))
-        .route("/u/{pubkey}", get(uploader_page))
-        .route("/mod", get(mod_queue))
-        .route("/mod/queue-approve", post(mod_queue_approve))
-        .route("/mod/queue-reject", post(mod_queue_reject))
-        .route("/mod/ban-contributor", post(mod_ban_contributor))
-        .route("/mod/queue/{pubkey}/{platform}/{creator_id}", get(mod_queue_group))
-        .route("/mod/takedown", post(mod_takedown))
+        .route("/mod", get(mod_page))
         .route("/mod/deny-cid", post(mod_deny_cid))
-        .route("/mod/untakedown", post(mod_untakedown))
-        .route("/report", post(submit_report))
-        .route("/mod/report-dismiss", post(mod_report_dismiss))
-        .route("/mod/ban-post", post(mod_ban_post))
-        .route("/mod/ban-creator", post(mod_ban_creator))
-        .route("/mod/pubkey/{pubkey}", get(mod_pubkey_view))
-        .route("/mod/post/{platform}/{creator_id}/{post_id}", get(mod_post_view))
-        .route("/mod/author/{platform}/{creator_id}", get(mod_author_view))
-        .route("/t/{infohash}/meta", get(gateway_meta))
-        .route("/t/{infohash}/f/{file_index}", get(gateway_file))
+        .route("/mod/remove-post", post(mod_remove_post))
+        .route("/mod/remove-creator", post(mod_remove_creator))
         .route("/f/{cid}", get(ipfs_file))
         .route("/head.json", get(head_json))
         .route("/follower.json", get(follower_json))
@@ -509,185 +479,6 @@ fn content_type_for(name: &str) -> &'static str {
     }
 }
 
-// standard torrent RSS: point a client's auto-download rule (qBittorrent, Deluge, ruTorrent) at this and it
-// adds + seeds every new magnet, so any commodity client can help keep content alive with no bakemono software
-const DEFAULT_FEED: i64 = 200;
-const MAX_FEED: i64 = 1000;
-
-async fn seed_feed(
-    State(pool): State<PgPool>,
-    Query(q): Query<FeedQuery>,
-    headers: HeaderMap,
-) -> Response {
-    let base = base_url(&headers);
-    let limit = q.limit.unwrap_or(DEFAULT_FEED).clamp(1, MAX_FEED);
-    let (self_href, next_href, items_xml) = if q.sort.as_deref() == Some("endangered") {
-        endangered_feed(&pool, &base, limit).await
-    } else {
-        catalog_feed(&pool, &base, limit, &q).await
-    };
-    let xml = build_feed(&base, &self_href, next_href.as_deref(), &items_xml);
-    (
-        [(header::CONTENT_TYPE, "application/rss+xml; charset=utf-8")],
-        xml,
-    )
-        .into_response()
-}
-
-#[derive(serde::Deserialize)]
-struct FeedQuery {
-    limit: Option<i64>,
-    before: Option<i64>,
-    before_id: Option<String>,
-    sort: Option<String>,
-    platform: Option<String>,
-    creator: Option<String>,
-    post: Option<String>,
-    npub: Option<String>,
-}
-
-impl FeedQuery {
-    fn scope(&self) -> db::FeedScope {
-        db::FeedScope {
-            platform: self.platform.clone(),
-            creator_id: self.creator.clone(),
-            post_id: self.post.clone(),
-            // accept hex or npub; a malformed key filters to nothing rather than 500ing
-            pubkey: self
-                .npub
-                .as_deref()
-                .map(|s| PublicKey::parse(s).map(|p| p.to_hex()).unwrap_or_default()),
-        }
-    }
-}
-
-// the default feed: newest torrents in this scope, with a cursor so a mirror can page back through it all
-async fn catalog_feed(
-    pool: &PgPool,
-    base: &str,
-    limit: i64,
-    q: &FeedQuery,
-) -> (String, Option<String>, String) {
-    let scope = q.scope();
-    let scope_qs = scope_query(&scope);
-    let rows = db::feed(pool, limit, q.before, q.before_id.as_deref(), &scope)
-        .await
-        .unwrap_or_default();
-    let items = rows.iter().map(|m| feed_item(base, m)).collect();
-    let self_href = format!("{base}/feed.xml?limit={limit}{scope_qs}");
-    // a full page means older torrents remain: hand out the cursor to the next page of this same slice
-    let next = (rows.len() as i64 == limit)
-        .then(|| rows.last())
-        .flatten()
-        .map(|last| {
-            format!(
-                "{base}/feed.xml?before={}&before_id={}&limit={limit}{scope_qs}",
-                last.created_at,
-                qs_encode(&last.event_id)
-            )
-        });
-    (self_href, next, items)
-}
-
-// the keeper work list: fewest-seeded torrents first. no cursor - it is a priority list, not a full mirror
-async fn endangered_feed(pool: &PgPool, base: &str, limit: i64) -> (String, Option<String>, String) {
-    let rows = db::endangered(pool, limit).await.unwrap_or_default();
-    let items = rows.iter().map(|r| endangered_item(base, r)).collect();
-    (format!("{base}/feed.xml?sort=endangered&limit={limit}"), None, items)
-}
-
-// rebuild the active scope as a query suffix so the self and next links stay inside the same slice
-fn scope_query(scope: &db::FeedScope) -> String {
-    let mut qs = String::new();
-    let mut push = |key: &str, val: &Option<String>| {
-        if let Some(v) = val {
-            qs.push_str(&format!("&{key}={}", qs_encode(v)));
-        }
-    };
-    push("platform", &scope.platform);
-    push("creator", &scope.creator_id);
-    push("post", &scope.post_id);
-    push("npub", &scope.pubkey);
-    qs
-}
-
-fn build_feed(base: &str, self_href: &str, next_href: Option<&str>, items_xml: &str) -> String {
-    let board = board_name();
-    let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-    out.push_str("<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\">\n<channel>\n");
-    out.push_str(&format!("<title>{} - seed feed</title>\n", xml_escape(&board)));
-    out.push_str(&format!("<link>{base}/</link>\n"));
-    out.push_str(&format!(
-        "<atom:link href=\"{}\" rel=\"self\" type=\"application/rss+xml\"/>\n",
-        xml_escape(self_href)
-    ));
-    out.push_str("<description>Torrents to seed. Point your BitTorrent client's RSS auto-download at this feed to help keep content online; follow the next link to page through the whole catalog</description>\n");
-    if let Some(next) = next_href {
-        out.push_str(&format!(
-            "<atom:link rel=\"next\" href=\"{}\"/>\n",
-            xml_escape(next)
-        ));
-    }
-    out.push_str(items_xml);
-    out.push_str("</channel>\n</rss>\n");
-    out
-}
-
-fn feed_item(base: &str, m: &db::ManifestRow) -> String {
-    let guid = m.infohash.clone().unwrap_or_else(|| m.event_id.clone());
-    feed_item_xml(
-        base, &m.platform, &m.creator_id, &m.post_id, &m.creator,
-        &item_label(m.post_title.as_deref(), m.filename.as_deref(), &m.post_id),
-        &guid, m.created_at, &m.magnet, m.size, None,
-    )
-}
-
-fn endangered_item(base: &str, r: &db::EndangeredRow) -> String {
-    let guid = r.infohash.clone().unwrap_or_else(|| r.event_id.clone());
-    let note = r.seeders.map(|s| format!("{s} seeder(s)"));
-    feed_item_xml(
-        base, &r.platform, &r.creator_id, &r.post_id, &r.creator,
-        &item_label(r.post_title.as_deref(), r.filename.as_deref(), &r.post_id),
-        &guid, r.created_at, &r.magnet, r.size, note.as_deref(),
-    )
-}
-
-fn item_label(post_title: Option<&str>, filename: Option<&str>, post_id: &str) -> String {
-    post_title
-        .or(filename)
-        .unwrap_or(post_id)
-        .to_string()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn feed_item_xml(
-    base: &str,
-    platform: &str,
-    creator_id: &str,
-    post_id: &str,
-    creator: &str,
-    label: &str,
-    guid: &str,
-    created_at: i64,
-    magnet: &str,
-    size: i64,
-    note: Option<&str>,
-) -> String {
-    let title = xml_escape(&format!("{creator} - {label}"));
-    let link = format!("{base}/p/{platform}/{creator_id}/{post_id}");
-    let desc = note
-        .map(|n| format!("<description>{}</description>\n", xml_escape(n)))
-        .unwrap_or_default();
-    format!(
-        "<item>\n<title>{title}</title>\n<link>{link}</link>\n{desc}\
-         <guid isPermaLink=\"false\">{guid}</guid>\n<pubDate>{}</pubDate>\n\
-         <enclosure url=\"{}\" length=\"{}\" type=\"application/x-bittorrent\"/>\n</item>\n",
-        rfc822(created_at),
-        xml_escape(magnet),
-        size,
-    )
-}
-
 // absolute links for feed readers: honor the proxy's forwarded scheme (Cloudflare sets it), else assume http
 fn base_url(headers: &HeaderMap) -> String {
     let host = headers
@@ -699,21 +490,6 @@ fn base_url(headers: &HeaderMap) -> String {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("http");
     format!("{proto}://{host}")
-}
-
-fn rfc822(unix_secs: i64) -> String {
-    match chrono::DateTime::from_timestamp(unix_secs, 0) {
-        Some(dt) => dt.to_rfc2822(),
-        None => String::new(),
-    }
-}
-
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
 }
 
 fn qs_encode(s: &str) -> String {
@@ -729,211 +505,6 @@ fn qs_encode(s: &str) -> String {
     out
 }
 
-async fn contribute() -> Html<String> {
-    render(
-        "contribute",
-        html! {
-            h2 { "Help grow the archive" }
-            p { "Bakemono has no central server full of files. Every preview you see is streamed from someone running the desktop app and sharing what they archived. The more people who run it, the more stays online. Here is how to join in" }
-            p.muted { "Your Patreon and other logins never leave your computer. The app opens the real site in a window, you sign in yourself, and only the files you choose are shared - never your account or cookies" }
-            ol.steps {
-                li.step {
-                    h3 { "Get the app" }
-                    p { "Pick your system:" }
-                    (download_buttons())
-                    p.muted {
-                        "All builds come from the "
-                        a href=(format!("{REPO}/releases/latest")) { "latest release" }
-                        ". If a button does not start a download, the newest build may still be uploading - open that page and grab the file by hand"
-                    }
-                }
-                li.step {
-                    h3 { "Install and open it" }
-                    p { "Run the file you downloaded and follow the installer. On macOS drag Bakemono to Applications, then open it. On Windows confirm the SmartScreen prompt the first time" }
-                }
-                li.step {
-                    h3 { "Sign in to a creator you support" }
-                    p { "Inside the app, open the creator site in the built-in window and log in the way you normally would. The session stays on your machine" }
-                }
-                li.step {
-                    h3 { "Pick what to archive" }
-                    p { "Choose a creator you subscribe to and start. The app downloads your paid posts and begins sharing them with everyone browsing the board" }
-                }
-                li.step {
-                    h3 { "Leave it running" }
-                    p { "Bakemono keeps sharing in the background - close the window and the daemon keeps seeding from the tray. The longer it runs, the more reliably others can preview the files you shared. That is the whole contribution - bytes from your machine to the swarm" }
-                }
-            }
-        },
-    )
-}
-
-fn download_buttons() -> Markup {
-    html! {
-        div.downloads {
-            @for &(os, asset) in DOWNLOADS {
-                a.btn href=(format!("{REPO}/releases/latest/download/{asset}")) { "Download for " (os) }
-            }
-        }
-    }
-}
-
-async fn keepers(State(state): State<AppState>, headers: HeaderMap) -> Html<String> {
-    let base = base_url(&headers);
-    let feed = format!("{base}/feed.xml");
-    let backfill = format!(
-        "curl -s \"{feed}?limit=1000\" \\\n  | grep -oE 'magnet:[^\"]+' | sed 's/&amp;/\\&/g'"
-    );
-    let walk = format!(
-        "url=\"{feed}?limit=1000\"\nwhile [ -n \"$url\" ]; do\n  page=$(curl -s \"$url\")\n  printf '%s' \"$page\" | grep -oE 'magnet:[^\"]+' | sed 's/&amp;/\\&/g' | while read magnet; do\n    echo \"$magnet\"          # print; swap for your client's add command\n  done\n  url=$(printf '%s' \"$page\" | grep -oE 'rel=\"next\" href=\"[^\"]+\"' | sed 's/.*href=\"//; s/\".*//; s/&amp;/\\&/g')\ndone"
-    );
-    let endangered = db::endangered(&state.pool, 30).await.unwrap_or_default();
-    render(
-        "keepers",
-        html! {
-            h2 { "Become a keeper" }
-            p { "Every file here lives in a BitTorrent swarm, not on the board. When the last person seeding a file goes offline, that file is gone. Keepers are volunteers who adopt part of the archive and keep seeding it, so nothing rests on one machine. The model is borrowed from RuTracker's keepers" }
-            p.muted { "No Bakemono software needed. Any BitTorrent client - qBittorrent, Deluge, Transmission - can seed. The board publishes a feed of what to seed and your client does the rest" }
-
-            ol.steps {
-                li.step {
-                    h3 { "Pick what to keep" }
-                    p { "Seed the whole board, or just the creators you care about. The feed is:" }
-                    p { code { (feed) } }
-                    p { "Narrow it to adopt one slice:" }
-                    ul {
-                        li { code { (format!("{feed}?platform=patreon&creator=<id>")) } " - one creator" }
-                        li { code { (format!("{feed}?npub=<npub>")) } " - one contributor" }
-                        li { code { (format!("{feed}?sort=endangered")) } " - whatever is closest to dying" }
-                    }
-                }
-                li.step {
-                    h3 { "Point your client at it" }
-                    p { "In qBittorrent: View -> RSS, add the feed URL, then add an auto-download rule that matches everything. Deluge uses the YaRSS2 plugin, ruTorrent has an RSS plugin. Your client then adds and seeds every new torrent on its own" }
-                }
-                li.step {
-                    h3 { "Mirror everything (optional)" }
-                    p { "Auto-download only catches torrents added from now on. To back-fill the whole archive, walk the feed and hand the magnets to your client:" }
-                    pre { code { (backfill) } }
-                    p.muted {
-                        "Robust walker and per-client setup: "
-                        a href=(format!("{REPO}/blob/main/docs/SEEDING.md")) { "docs/SEEDING.md" }
-                    }
-                    details.helpbox {
-                        summary { "Set up a feed-walker (mirror everything, keep up with bursts)" }
-                        p { "RSS auto-download reads only one page of the feed per refresh, so a large or bursty batch of uploads can scroll past before your client polls. A walker follows the feed's next-page cursor to the end and hands every torrent to your client. Walk all pages and print every magnet:" }
-                        pre { code { (walk) } }
-                        p.muted {
-                            "Swap the " code { "echo \"$magnet\"" } " line for your client's add command - qBittorrent's WebUI: "
-                            code { "curl -s localhost:8080/api/v2/torrents/add --data-urlencode \"urls=$magnet\"" }
-                            " - then run it from cron or a systemd timer (every ~10 min) so it back-fills the archive and keeps catching new uploads"
-                        }
-                    }
-                }
-                li.step {
-                    h3 { "Leave it seeding" }
-                    p { "That is the whole job. The longer your client stays online, the more resilient the archive. Seeder counts are shown below so you can see where help is needed" }
-                }
-            }
-
-            h2 { "Endangered now" }
-            @if endangered.is_empty() {
-                p.muted { "Seeder counts are still being gathered, or everything is healthy. Check back soon" }
-            } @else {
-                p.muted { "Fewest seeders first - adopt these before they vanish" }
-                ul.list {
-                    @for e in &endangered {
-                        li {
-                            a href=(format!("/p/{}/{}/{}", e.platform, e.creator_id, e.post_id)) {
-                                (item_label(e.post_title.as_deref(), e.filename.as_deref(), &e.post_id))
-                            }
-                            span.muted { " " (e.creator) " - " (e.seeders.unwrap_or(0)) " seeder(s) " }
-                            a href=(e.magnet) { "magnet" }
-                            " "
-                            a href=(format!("/feed.xml?platform={}&creator={}", qs_encode(&e.platform), qs_encode(&e.creator_id))) { "adopt creator" }
-                        }
-                    }
-                }
-            }
-        },
-    )
-}
-
-async fn info_page(State(state): State<AppState>) -> Html<String> {
-    let stats = db::stats(&state.pool).await.unwrap_or_default();
-    let board_pubkey = state
-        .signer
-        .as_ref()
-        .map(|k| npub(&k.public_key().to_hex()));
-    render(
-        "info",
-        html! {
-            h2 { (board_name()) }
-            // operator-authored board description, rendered raw (same trust level as the binary)
-            @if let Some(about) = &config::get().about_html {
-                div.aboutblock { (PreEscaped(about)) }
-            }
-            div.stats {
-                (stat_card(stats.posts, "posts"))
-                (stat_card(stats.authors, "authors"))
-                (stat_card(stats.files, "files"))
-                (stat_card(stats.contributors, "contributors"))
-            }
-
-            h3 { "Board identity" }
-            @match &board_pubkey {
-                Some(key) => {
-                    p { "Public key to integrate with. Add it to a peer board's trusted instances to honor this board's takedowns:" }
-                    p { code { (key) } }
-                }
-                None => p.muted { "This board has not published an instance key yet" }
-            }
-
-            h3 { "Relays" }
-            p.muted { "Manifests are indexed from and takedowns published to:" }
-            ul.list {
-                @for relay in &state.relays {
-                    li { code { (relay) } }
-                }
-            }
-
-            h3 { "Source" }
-            p { a href=(REPO) { (REPO) } }
-
-            h3 { "Desktop app" }
-            p {
-                "Installers for macOS, Windows and Linux are on the "
-                a href=(format!("{REPO}/releases/latest")) { "latest release" }
-                " page"
-            }
-            details.helpbox {
-                summary { "macOS says the app is \"damaged\"?" }
-                p { "The builds are not signed with an Apple Developer ID yet, so macOS quarantines the download and reports it as \"damaged\" rather than offering an Open button. It is not actually damaged. Drag Bakemono to Applications, then clear the quarantine flag once from Terminal:" }
-                pre { code { "xattr -dr com.apple.quarantine /Applications/Bakemono.app" } }
-                p.muted { "After that it opens normally. If macOS still refuses, run " code { "sudo xattr -cr /Applications/Bakemono.app" } }
-            }
-
-            h3 { "DMCA and contact" }
-            p { "Takedowns on this board are published as signed kind 31064 Nostr events, a public transparency log. Each board sets its own posture by jurisdiction" }
-            @match dmca_contact() {
-                Some(email) => p { "DMCA notices: " a href=(format!("mailto:{email}")) { (email) } }
-                None => p.muted { "No DMCA contact configured for this board" }
-            }
-            @if let Some(email) = contact() {
-                p { "General contact: " a href=(format!("mailto:{email}")) { (email) } }
-            }
-        },
-    )
-}
-
-fn stat_card(num: i64, label: &str) -> Markup {
-    html! {
-        div.stat {
-            div.num { (num) }
-            div.label { (label) }
-        }
-    }
-}
 
 async fn creator_page(
     State(pool): State<PgPool>,
@@ -966,7 +537,6 @@ async fn creator_page(
 async fn post_page(
     State(pool): State<PgPool>,
     Path((platform, creator_id, post_id)): Path<(String, String, String)>,
-    Query(query): Query<ReportedQuery>,
     headers: HeaderMap,
 ) -> Response {
     let files = db::post_files(&pool, &platform, &creator_id, &post_id)
@@ -1016,7 +586,6 @@ async fn post_page(
             (carousel(&files))
             @if !body.is_empty() { div.body { (PreEscaped(&body)) } }
             @if is_mod(&headers) { (mod_bar_post(&platform, &creator_id, &post_id)) }
-            (report_box(&platform, &creator_id, &post_id, query.reported.is_some()))
             script { (PreEscaped(CAROUSEL_JS)) }
         },
     );
@@ -1062,14 +631,9 @@ fn nav_btn(
 fn carousel(files: &[db::ManifestRow]) -> Markup {
     let items: Vec<String> = files
         .iter()
-        .filter_map(|f| {
-            let url = match (&f.cid, f.infohash.as_deref()) {
-                (Some(cid), _) => format!("/f/{cid}"),
-                (None, Some(ih)) => format!("/t/{ih}/f/{}", f.bundle_index),
-                (None, None) => return None,
-            };
+        .map(|f| {
             let video = f.mime.starts_with("video/");
-            Some(format!("{{\"u\":\"{url}\",\"v\":{video}}}"))
+            format!("{{\"u\":\"/f/{}\",\"v\":{video}}}", f.cid)
         })
         .collect();
     if items.is_empty() {
@@ -1087,163 +651,219 @@ fn carousel(files: &[db::ManifestRow]) -> Markup {
     }
 }
 
-// public: a contributor's posts with their moderation state, so a publisher can tell whether this
-// board received their events and what still waits on review
-async fn uploader_page(State(pool): State<PgPool>, Path(pubkey): Path<String>) -> Response {
-    let Ok(pk) = PublicKey::parse(&pubkey) else {
-        return (StatusCode::NOT_FOUND, "not a pubkey").into_response();
-    };
-    let hex = pk.to_hex();
-    let files = db::pubkey_files(&pool, &hex).await.unwrap_or_default();
-    let live: HashSet<(String, String, String)> = db::visible_posts_for_pubkey(&pool, &hex)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-    let groups = upload_groups(&files, &live);
-    let live_count = groups.iter().filter(|g| g.state == UploadState::Live).count();
-    let pending_count = groups.iter().filter(|g| g.state == UploadState::Pending).count();
-    let removed_count = groups.len() - live_count - pending_count;
+async fn keepers(headers: HeaderMap) -> Html<String> {
+    let base = base_url(&headers);
     render(
-        "contributor",
+        "keepers",
         html! {
-            h1 { "Contributor" }
-            p { code { (npub(&hex)) } }
-            @if groups.is_empty() {
-                p.muted { "This board has not seen any manifests from this key. If you published just now, allow a minute for the relays; otherwise check that your relay list overlaps the board's" }
-            } @else {
-                p.muted {
-                    (groups.len()) @if groups.len() == 1 { " post: " } @else { " posts: " }
-                    (live_count) " live, " (pending_count) " pending review"
-                    @if removed_count > 0 { ", " (removed_count) " removed" }
-                }
-                p.muted { "Pending posts wait in the mod queue and are not public yet. A rejected post leaves this list; re-publishing queues it again" }
-                @for g in &groups {
-                    div.postgroup {
-                        h3 {
-                            @if g.state == UploadState::Live {
-                                a href=(format!("/p/{}/{}/{}", g.platform, g.creator_id, g.post_id)) { (g.title) }
-                            } @else { (g.title) }
-                            " " (state_chip(&g.state))
-                        }
-                        p.muted {
-                            span.chip.platform { (pretty_platform(g.platform)) }
-                            " " (g.files) @if g.files == 1 { " file" } @else { " files" }
-                            " - " (human_size(g.bytes))
-                        }
-                    }
-                }
+            h1 { "Become a keeper" }
+            p { "Keepers replicate this board's archive with two stock IPFS programs. No Bakemono software, no account. If this server dies, the archive is rebuilt from any keeper" }
+            h3 { "Quick start" }
+            pre { code {
+                "# 1. install and configure kubo (docs.ipfs.tech/install)\n"
+                "ipfs init\n"
+                "ipfs config --json Bitswap.ServerEnabled true\n"
+                "ipfs config --json Internal.Bitswap.BroadcastControl.Enable false\n"
+                "ipfs config --json Reprovider.Strategy '\"roots\"'\n"
+                "ipfs daemon --enable-gc &\n\n"
+                "# 2. follow this board's pinset (ipfscluster.io)\n"
+                "ipfs-cluster-follow bakemono init " (base) "/follower.json\n"
+                "ipfs-cluster-follow bakemono run"
+            } }
+            h3 { "What following means" }
+            ul.list {
+                li { "You mirror the whole archive: every file, preview, and the signed manifest history" }
+                li { "New publishes replicate automatically; takedowns unpin automatically - you host a moderated archive, not a write-once mirror" }
+                li { "Stopping is safe; nothing depends on your uptime individually" }
+                li { "Run kubo with " code { "--enable-gc" } " or removed content stays on your disk" }
+            }
+            h3 { "Pointers" }
+            ul.list {
+                li { a href="/follower.json" { "follower.json" } " - the cluster config your follower consumes" }
+                li { a href="/head.json" { "head.json" } " - the signed manifest head (the archive index)" }
             }
         },
     )
-    .into_response()
 }
 
-#[derive(PartialEq)]
-enum UploadState {
-    Live,
-    Pending,
-    Removed,
+async fn info_page(State(state): State<AppState>) -> Html<String> {
+    let stats = db::stats(&state.pool).await.unwrap_or_default();
+    let board_pubkey = crate::publish::board_pubkey().ok();
+    let head = db::last_head(&state.pool).await.ok().flatten();
+    render(
+        "info",
+        html! {
+            h2 { (board_name()) }
+            // operator-authored board description, rendered raw (same trust level as the binary)
+            @if let Some(about) = &config::get().about_html {
+                div.aboutblock { (PreEscaped(about)) }
+            }
+            div.stats {
+                (stat_card(stats.posts, "posts"))
+                (stat_card(stats.creators, "creators"))
+                (stat_card(stats.files, "files"))
+                (stat_card(stats.keepers_hint, "manifest version"))
+            }
+
+            h3 { "Archive identity" }
+            @match &board_pubkey {
+                Some(key) => {
+                    p { "This board signs its manifest with the key below. Peer boards and keepers verify against it:" }
+                    p { code { (key) } }
+                }
+                None => p.muted { "No board key yet; it is generated on first publish" }
+            }
+            @if let Some(h) = &head {
+                p { "Current manifest: version " (h.version) ", head " a href="/head.json" { code { (h.head_cid) } } }
+            }
+
+            h3 { "Keeping" }
+            p { "Anyone can replicate this archive with stock IPFS tools: " a href="/keepers" { "become a keeper" } }
+
+            h3 { "Source" }
+            p { a href=(REPO) { (REPO) } }
+
+            h3 { "DMCA and contact" }
+            p { "Removals are recorded in the signed manifest's revoked list - a public, hash-linked transparency log that keepers replicate" }
+            @match dmca_contact() {
+                Some(email) => p { "DMCA notices: " a href=(format!("mailto:{email}")) { (email) } }
+                None => p.muted { "No DMCA contact configured for this board" }
+            }
+            @if let Some(email) = contact() {
+                p { "General contact: " a href=(format!("mailto:{email}")) { (email) } }
+            }
+        },
+    )
 }
 
-struct UploadGroup<'a> {
-    platform: &'a str,
-    creator_id: &'a str,
-    post_id: &'a str,
-    title: &'a str,
-    latest: i64,
-    files: usize,
-    bytes: i64,
-    state: UploadState,
-}
-
-// fold a contributor's files (already post-contiguous) into one entry per post, newest post first
-fn upload_groups<'a>(
-    files: &'a [db::ManifestRow],
-    live: &HashSet<(String, String, String)>,
-) -> Vec<UploadGroup<'a>> {
-    let mut groups: Vec<UploadGroup> = Vec::new();
-    for f in files {
-        let same_post = groups.last().is_some_and(|g| {
-            g.platform == f.platform && g.creator_id == f.creator_id && g.post_id == f.post_id
-        });
-        if !same_post {
-            let key = (f.platform.clone(), f.creator_id.clone(), f.post_id.clone());
-            groups.push(UploadGroup {
-                platform: &f.platform,
-                creator_id: &f.creator_id,
-                post_id: &f.post_id,
-                title: f.post_title.as_deref().unwrap_or(&f.post_id),
-                latest: 0,
-                files: 0,
-                bytes: 0,
-                state: if live.contains(&key) { UploadState::Live } else { UploadState::Removed },
-            });
+fn stat_card(num: i64, label: &str) -> Markup {
+    html! {
+        div.stat {
+            div.num { (num) }
+            div.label { (label) }
         }
-        let g = groups.last_mut().expect("group just pushed");
-        g.files += 1;
-        g.bytes += f.size;
-        g.latest = g.latest.max(f.created_at);
-        if g.state != UploadState::Live && f.status == "pending" {
-            g.state = UploadState::Pending;
-        }
-    }
-    groups.sort_by_key(|g| std::cmp::Reverse(g.latest));
-    groups
-}
-
-fn state_chip(state: &UploadState) -> Markup {
-    match state {
-        UploadState::Live => html! { span.chip.ok { "live" } },
-        UploadState::Pending => html! { span.chip { "pending review" } },
-        UploadState::Removed => html! { span.chip.danger { "removed" } },
     }
 }
 
-// the gateway is the only thing here that speaks BitTorrent: it joins a swarm cold for an infohash the
-// board carries and hands the bytes back as plain HTTP, so browsers do no P2P
+async fn mod_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(denied) = require_mod(&headers) {
+        return denied;
+    }
+    let denied = db::denylist(&state.pool).await.unwrap_or_default();
+    let sources = db::list_sources(&state.pool).await.unwrap_or_default();
+    let page = render(
+        "mod",
+        html! {
+            h1 { "Moderation" }
+            h3 { "Take down a file" }
+            p.muted { "Denies the CID (and its preview), unpins it fleet-wide, republishes the manifest with a revoked entry. Post and creator removal buttons live on their pages" }
+            form method="post" action="/mod/deny-cid" {
+                input type="text" name="cid" placeholder="bafy..." required;
+                input type="text" name="reason" placeholder="reason (dmca-us, csam, wrong-content...)";
+                button type="submit" { "Take down" }
+            }
+            h3 { "Revoked (" (denied.len()) ")" }
+            @if denied.is_empty() { p.muted { "Nothing revoked" } }
+            @for d in &denied {
+                p { code { (d.0) } " - " (d.1) " - " (pretty_date(&d.2)) }
+            }
+            h3 { "Scrape sources" }
+            @if sources.is_empty() { p.muted { "No sources configured (bakemono source add <url> [cookies])" } }
+            @for (url, enabled, scraped_at, error) in &sources {
+                p {
+                    @if *enabled { span.chip { "on" } } @else { span.chip.muted { "off" } }
+                    " " (url)
+                    " - last: " (scraped_at.clone().unwrap_or_else(|| "never".into()))
+                    @if let Some(e) = error { span.muted { " - ERR " (e) } }
+                }
+            }
+        },
+    );
+    with_mod_cookie(page.into_response())
+}
 
-async fn gateway_meta(
+fn mod_bar_post(platform: &str, creator_id: &str, post_id: &str) -> Markup {
+    html! {
+        div.modbar {
+            form method="post" action="/mod/remove-post" {
+                input type="hidden" name="platform" value=(platform);
+                input type="hidden" name="creator_id" value=(creator_id);
+                input type="hidden" name="post_id" value=(post_id);
+                input type="text" name="reason" placeholder="reason";
+                button type="submit" { "Take down post" }
+            }
+        }
+    }
+}
+
+fn mod_bar_creator(platform: &str, creator_id: &str) -> Markup {
+    html! {
+        div.modbar {
+            form method="post" action="/mod/remove-creator" {
+                input type="hidden" name="platform" value=(platform);
+                input type="hidden" name="creator_id" value=(creator_id);
+                input type="text" name="reason" placeholder="reason";
+                button type="submit" { "Take down creator" }
+            }
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RemovePostForm {
+    platform: String,
+    creator_id: String,
+    post_id: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+async fn mod_remove_post(
     State(state): State<AppState>,
-    Path(infohash): Path<String>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    Form(form): Form<RemovePostForm>,
 ) -> Response {
-    let Some((magnet, private)) = resolve_gateway(&state, &infohash, &headers).await else {
-        return (StatusCode::NOT_FOUND, "unknown infohash").into_response();
-    };
-    if !private {
-        if let Some(resp) = cold_miss_guard(&state, &magnet, &headers, peer) {
-            return resp;
-        }
+    if let Err(denied) = require_mod(&headers) {
+        return denied;
     }
-    match state.gateway.meta(&magnet).await {
-        Ok(meta) => private_if(Json(meta).into_response(), private),
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("swarm error: {e:#}")).into_response(),
+    let reason = clean_reason(form.reason.as_deref());
+    match crate::publish::revoke_post(&state.pool, &state.kubo, &form.platform, &form.creator_id, &form.post_id, &reason).await {
+        Ok(()) => Redirect::to(&format!("/c/{}/{}", form.platform, form.creator_id)).into_response(),
+        Err(e) => {
+            tracing::error!("remove-post failed: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
-async fn gateway_file(
+#[derive(serde::Deserialize)]
+struct RemoveCreatorForm {
+    platform: String,
+    creator_id: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+async fn mod_remove_creator(
     State(state): State<AppState>,
-    Path((infohash, file_index)): Path<(String, usize)>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    Form(form): Form<RemoveCreatorForm>,
 ) -> Response {
-    let Some((magnet, private)) = resolve_gateway(&state, &infohash, &headers).await else {
-        return (StatusCode::NOT_FOUND, "unknown infohash").into_response();
-    };
-    if !private {
-        if let Some(resp) = cold_miss_guard(&state, &magnet, &headers, peer) {
-            return resp;
+    if let Err(denied) = require_mod(&headers) {
+        return denied;
+    }
+    let reason = clean_reason(form.reason.as_deref());
+    match crate::publish::revoke_creator(&state.pool, &state.kubo, &form.platform, &form.creator_id, &reason).await {
+        Ok(()) => Redirect::to("/creators").into_response(),
+        Err(e) => {
+            tracing::error!("remove-creator failed: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
-    match state.gateway.open(&magnet, file_index).await {
-        Ok(file) => {
-            let verify = verify_context(&state, &magnet, file_index).await;
-            private_if(stream_file(file, &headers, verify).await, private)
-        }
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("swarm error: {e:#}")).into_response(),
-    }
+}
+
+fn clean_reason(raw: Option<&str>) -> String {
+    raw.map(str::trim).filter(|r| !r.is_empty()).unwrap_or("unspecified").to_string()
 }
 
 // the new-stack gateway: catalog + denylist gate, then proxy the local kubo gateway.
@@ -1385,1143 +1005,7 @@ async fn head_json(State(pool): State<PgPool>) -> Response {
     }
 }
 
-// build the check the stream runs against: the sha256 and size this infohash+file is supposed to have.
-// None when we already hashed it once (don't re-hash on every serve) or when nothing declares its bytes
-async fn verify_context(state: &AppState, magnet: &str, file_index: usize) -> Option<VerifyContext> {
-    let infohash = bakemono_torrent::infohash_from_magnet(magnet)?;
-    if db::is_verified(&state.pool, &infohash, file_index).await.unwrap_or(true) {
-        return None;
-    }
-    let (expected_hash, size) = db::expected_content(&state.pool, &infohash, file_index).await.ok()??;
-    Some(VerifyContext {
-        pool: state.pool.clone(),
-        infohash,
-        file_index,
-        expected_hash,
-        expected_size: size as u64,
-    })
-}
 
-// warm content serves from disk and is never limited; a cold miss joins a swarm, so cap how fast one
-// client can trigger those. returns Some(429) when the client is over budget, None to proceed
-fn cold_miss_guard(
-    state: &AppState,
-    magnet: &str,
-    headers: &HeaderMap,
-    peer: SocketAddr,
-) -> Option<Response> {
-    let infohash = bakemono_torrent::infohash_from_magnet(magnet)?;
-    if state.gateway.is_cached(&infohash) {
-        return None;
-    }
-    let client = client_ip(headers, peer);
-    if state.cold_limiter.allow(client) {
-        return None;
-    }
-    let mut resp = (StatusCode::TOO_MANY_REQUESTS, "cold-fetch rate limit, retry shortly").into_response();
-    resp.headers_mut()
-        .insert(header::RETRY_AFTER, header::HeaderValue::from_static("2"));
-    Some(resp)
-}
-
-// the real client behind our proxy: only when the socket peer is a trusted proxy (Cloudflare by default)
-// do we believe CF-Connecting-IP / X-Forwarded-For; a direct hit uses the peer, so an untrusted client
-// cannot forge the rate-limit key by setting the header itself
-fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
-    if !crate::trusted_proxy::is_trusted_proxy(peer.ip()) {
-        return peer.ip();
-    }
-    if let Some(ip) = headers
-        .get("cf-connecting-ip")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse().ok())
-    {
-        return ip;
-    }
-    if let Some(ip) = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .and_then(|s| s.trim().parse().ok())
-    {
-        return ip;
-    }
-    peer.ip()
-}
-
-// the gateway builds its own magnet from the catalog infohash plus operator-configured trackers and never
-// reuses a contributor's trackers, so a manifest cannot make the board announce to a host of its choosing
-// (blind SSRF). only infohashes the board carries and that pass moderation resolve, so it is never an open
-// proxy; BAKEMONO_GATEWAY_OPEN lifts the catalog check for local testing of a cold load
-async fn resolve_gateway(state: &AppState, infohash: &str, headers: &HeaderMap) -> Option<(String, bool)> {
-    let infohash = infohash.trim().to_ascii_lowercase();
-    if infohash.len() != 40 || !infohash.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    // bytes served here once failed to hash to their manifest's claim, so the whole infohash is fraudulent;
-    // refuse it for everyone, mods included
-    if db::is_quarantined(&state.pool, &infohash).await.unwrap_or(false) {
-        return None;
-    }
-    if public_infohash(state, &infohash).await {
-        return Some((clean_magnet(&live_infohash(state, &infohash).await), false));
-    }
-    // a moderator additionally resolves pending or taken-down content (flagged private so it is never
-    // cached) so the mod views can preview what the public cannot see
-    if is_mod(headers) && matches!(db::magnet_by_infohash_any(&state.pool, &infohash).await, Ok(Some(_))) {
-        return Some((clean_magnet(&infohash), true));
-    }
-    None
-}
-
-async fn public_infohash(state: &AppState, infohash: &str) -> bool {
-    if matches!(db::magnet_by_infohash(&state.pool, infohash).await, Ok(Some(_))) {
-        return true;
-    }
-    env_opt("BAKEMONO_GATEWAY_OPEN").is_some()
-}
-
-// a swarm the prober saw empty falls back to a sibling torrent carrying the same file bytes (same
-// file_hash), so the response stays byte-identical to what the requested infohash names
-async fn live_infohash(state: &AppState, requested: &str) -> String {
-    if state.gateway.is_cached(requested) {
-        return requested.to_string();
-    }
-    let alternates = match db::swarm_alternates(&state.pool, requested).await {
-        Ok(alternates) => alternates,
-        Err(_) => return requested.to_string(),
-    };
-    choose_alternate(requested, &alternates, |ih| state.gateway.is_cached(ih))
-        .unwrap_or_else(|| requested.to_string())
-}
-
-// the requested torrent wins unless its last probe found zero seeders; then prefer a sibling already
-// on disk, then the best-seeded live one. an unprobed sibling is never picked over the requested hash
-fn choose_alternate(
-    requested: &str,
-    alternates: &[(String, Option<i32>)],
-    is_cached: impl Fn(&str) -> bool,
-) -> Option<String> {
-    let dead = alternates
-        .iter()
-        .any(|(ih, seeders)| ih == requested && *seeders == Some(0));
-    if !dead {
-        return None;
-    }
-    let siblings = || alternates.iter().filter(|(ih, _)| ih != requested);
-    if let Some((ih, _)) = siblings().find(|(ih, _)| is_cached(ih)) {
-        return Some(ih.clone());
-    }
-    siblings()
-        .filter(|(_, seeders)| seeders.is_some_and(|n| n > 0))
-        .max_by_key(|(_, seeders)| *seeders)
-        .map(|(ih, _)| ih.clone())
-}
-
-fn clean_magnet(infohash: &str) -> String {
-    let trackers: Vec<String> = bakemono_core::default_trackers()
-        .into_iter()
-        .filter(|t| !t.starts_with("wss://"))
-        .collect();
-    bakemono_torrent::synth_magnet(infohash, &trackers)
-}
-
-fn private_if(mut resp: Response, private: bool) -> Response {
-    if private {
-        resp.headers_mut().insert(
-            header::CACHE_CONTROL,
-            header::HeaderValue::from_static("private, no-store"),
-        );
-    }
-    resp
-}
-
-async fn stream_file(
-    mut file: bakemono_torrent::OpenFile,
-    headers: &HeaderMap,
-    verify: Option<VerifyContext>,
-) -> Response {
-    let total = file.size;
-    let range = headers
-        .get(header::RANGE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|r| parse_range(r, total));
-
-    let (status, body, content_len, content_range) = match range {
-        Some((start, end)) => {
-            if file.stream.seek(SeekFrom::Start(start)).await.is_err() {
-                return (StatusCode::INTERNAL_SERVER_ERROR, "seek failed").into_response();
-            }
-            let len = end - start + 1;
-            let body = Body::from_stream(ReaderStream::new(file.stream.take(len)));
-            let cr = format!("bytes {start}-{end}/{total}");
-            (StatusCode::PARTIAL_CONTENT, body, len, Some(cr))
-        }
-        // only a whole-file read can be hashed end to end, so verification rides the un-ranged serve
-        None => {
-            let body = match verify {
-                Some(ctx) => Body::from_stream(ReaderStream::new(VerifyingRead::new(file.stream, ctx))),
-                None => Body::from_stream(ReaderStream::new(file.stream)),
-            };
-            (StatusCode::OK, body, total, None)
-        }
-    };
-
-    let mut resp = Response::new(body);
-    *resp.status_mut() = status;
-    let h = resp.headers_mut();
-    if let Ok(v) = file.mime.parse() {
-        h.insert(header::CONTENT_TYPE, v);
-    }
-    h.insert(header::ACCEPT_RANGES, header::HeaderValue::from_static("bytes"));
-    // immutable: the URL is content-addressed by infohash, so the bytes can never change
-    h.insert(
-        header::CACHE_CONTROL,
-        header::HeaderValue::from_static("public, max-age=31536000, immutable"),
-    );
-    h.insert(header::CONTENT_LENGTH, header::HeaderValue::from(content_len));
-    if let Some(cr) = content_range.and_then(|cr| cr.parse().ok()) {
-        h.insert(header::CONTENT_RANGE, cr);
-    }
-    resp
-}
-
-// what the streamed bytes are supposed to hash to, carried to the finalizer that runs at end of stream
-struct VerifyContext {
-    pool: PgPool,
-    infohash: String,
-    file_index: usize,
-    expected_hash: String,
-    expected_size: u64,
-}
-
-// wraps the file stream, sha256s the bytes as the client reads them, and at end of stream records whether
-// they matched the manifest's claim. a mismatch quarantines the infohash; a match may promote re-publishes
-struct VerifyingRead {
-    inner: Pin<Box<dyn bakemono_torrent::SeekableRead>>,
-    hasher: Sha256,
-    len: u64,
-    ctx: Option<VerifyContext>,
-}
-
-impl VerifyingRead {
-    fn new(inner: Pin<Box<dyn bakemono_torrent::SeekableRead>>, ctx: VerifyContext) -> Self {
-        Self { inner, hasher: Sha256::new(), len: 0, ctx: Some(ctx) }
-    }
-}
-
-impl AsyncRead for VerifyingRead {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        let start = buf.filled().len();
-        let r = Pin::new(&mut this.inner).poll_read(cx, buf);
-        if let Poll::Ready(Ok(())) = &r {
-            let fresh = &buf.filled()[start..];
-            if fresh.is_empty() {
-                // a zero-length read is EOF: the client saw the whole file, so finalize exactly once
-                if let Some(ctx) = this.ctx.take() {
-                    let digest = hex_lower(this.hasher.finalize_reset());
-                    let len = this.len;
-                    tokio::spawn(finish_verification(ctx, digest, len));
-                }
-            } else {
-                this.hasher.update(fresh);
-                this.len += fresh.len() as u64;
-            }
-        }
-        r
-    }
-}
-
-async fn finish_verification(ctx: VerifyContext, digest: String, len: u64) {
-    let ok = len == ctx.expected_size && digest == ctx.expected_hash;
-    if db::record_verification(&ctx.pool, &ctx.infohash, ctx.file_index, &digest, ok, len)
-        .await
-        .is_ok()
-    {
-        let _ = db::apply_verification(&ctx.pool, &ctx.infohash, ctx.file_index, ok).await;
-    }
-    if !ok {
-        tracing::warn!(infohash = %ctx.infohash, file = ctx.file_index, "served bytes do not match manifest hash, quarantined");
-    }
-}
-
-pub(crate) fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
-    let bytes = bytes.as_ref();
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(char::from_digit((b >> 4) as u32, 16).unwrap());
-        out.push(char::from_digit((b & 0xf) as u32, 16).unwrap());
-    }
-    out
-}
-
-// one "bytes=start-end" range; suffix ("-N") and open-ended ("N-") forms supported, multi-range is not
-fn parse_range(raw: &str, total: u64) -> Option<(u64, u64)> {
-    let spec = raw.strip_prefix("bytes=")?;
-    if spec.contains(',') {
-        return None;
-    }
-    let (s, e) = spec.split_once('-')?;
-    let (start, end) = if s.is_empty() {
-        let n: u64 = e.parse().ok()?;
-        if n == 0 {
-            return None;
-        }
-        (total.saturating_sub(n), total.saturating_sub(1))
-    } else {
-        let start: u64 = s.parse().ok()?;
-        let end = if e.is_empty() {
-            total.saturating_sub(1)
-        } else {
-            e.parse::<u64>().ok()?.min(total.saturating_sub(1))
-        };
-        (start, end)
-    };
-    (total > 0 && start <= end && start < total).then_some((start, end))
-}
-
-async fn mod_queue(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(denied) = require_mod(&headers) {
-        return denied;
-    }
-    let groups = db::pending_groups(&state.pool, 1_000).await.unwrap_or_default();
-    let pending_posts = db::pending_post_count(&state.pool).await.unwrap_or(0);
-    let takedowns = db::takedowns(&state.pool).await.unwrap_or_default();
-    let reports = db::open_reports(&state.pool, 100).await.unwrap_or_default();
-    let report_count = db::open_report_count(&state.pool).await.unwrap_or(0);
-    let blocks = group_contributors(&groups);
-    let mut td_links: Vec<Option<String>> = Vec::with_capacity(takedowns.len());
-    for t in &takedowns {
-        let link = if t.target_type == "p" {
-            Some(format!("/mod/pubkey/{}", t.target))
-        } else {
-            db::locate_takedown(&state.pool, &t.target_type, &t.target)
-                .await
-                .ok()
-                .flatten()
-                .map(|(p, c, post)| format!("/mod/post/{p}/{c}/{post}"))
-        };
-        td_links.push(link);
-    }
-    let page = render(
-        "mod queue",
-        html! {
-            div.modhead {
-                h1.pagetitle { "Moderation" }
-                a.muted href="/" { "< back to board" }
-            }
-            div.stats {
-                a.stat.statlink href="#reports" {
-                    div.num.danger[report_count > 0] { (report_count) }
-                    div.label { "open reports" }
-                }
-                a.stat.statlink href="#queue" {
-                    div.num.danger[pending_posts > 0] { (pending_posts) }
-                    div.label { "pending posts" }
-                }
-                a.stat.statlink href="#queue" {
-                    div.num { (blocks.len()) }
-                    div.label { "contributors in queue" }
-                }
-                a.stat.statlink href="#takedowns" {
-                    div.num { (takedowns.len()) }
-                    div.label { "takedowns" }
-                }
-            }
-            (reports_section(&reports, report_count))
-            section.block id="queue" {
-                div.blockhead {
-                    h2 { "Pending review" }
-                    @if pending_posts > 0 { span.chip { (pending_posts) " posts" } }
-                }
-                p.muted { "grouped by contributor and author; open a group to page through its posts, or approve / reject whole groups here" }
-                @if blocks.is_empty() { p.muted { "nothing awaiting review" } }
-                @for c in &blocks {
-                    div.qblock {
-                        div.qhead {
-                            div.who { code { (npub(c.pubkey)) } span.muted { (block_post_total(c)) " posts" } }
-                            div.rowactions {
-                                (queue_form("/mod/queue-approve", c.pubkey, "", "", "", "/mod", "approve all", false))
-                                (queue_form("/mod/queue-reject", c.pubkey, "", "", "", "/mod", "reject all", true))
-                                (queue_form("/mod/ban-contributor", c.pubkey, "", "", "", "/mod", "ban", true))
-                            }
-                        }
-                        @for a in &c.authors {
-                            div.qauthorrow {
-                                div.who {
-                                    span.strong { (a.creator.as_deref().unwrap_or(a.creator_id.as_str())) }
-                                    span.chip.platform { (pretty_platform(&a.platform)) }
-                                    span.muted { (a.posts) " posts - " (a.files) " files" }
-                                }
-                                div.rowactions {
-                                    a.viewlink href=(format!("/mod/queue/{}/{}/{}", c.pubkey, a.platform, a.creator_id)) { "view posts" }
-                                    (queue_form("/mod/queue-approve", c.pubkey, &a.platform, &a.creator_id, "", "/mod", "approve all", false))
-                                    (queue_form("/mod/queue-reject", c.pubkey, &a.platform, &a.creator_id, "", "/mod", "reject all", true))
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            (takedown_section(&state, &takedowns, &td_links))
-        },
-    );
-    let mut resp = page.into_response();
-    if let Ok(v) = header::HeaderValue::from_str(&mod_session_cookie()) {
-        resp.headers_mut().insert(header::SET_COOKIE, v);
-    }
-    resp
-}
-
-fn takedown_section(state: &AppState, takedowns: &[db::TakedownRow], links: &[Option<String>]) -> Markup {
-    html! {
-      section.block id="takedowns" {
-        div.blockhead { h2 { "Takedowns" } }
-        @match &state.signer {
-            Some(keys) => p.muted { "publishing kind 31064 as " code { (npub(&keys.public_key().to_hex())) } }
-            None => p.muted { "set BAKEMONO_INSTANCE_NSEC to publish takedowns to peers; hides apply locally either way" }
-        }
-        form method="post" action="/mod/takedown" class="takedown" {
-            select name="target_type" {
-                option value="e" { "event id" }
-                option value="x" { "file hash" }
-                option value="i" { "infohash" }
-                option value="p" { "pubkey" }
-                option value="post" { "post" }
-                option value="creator" { "creator" }
-            }
-            input type="text" name="target" placeholder="target value (hash, infohash, npub, or platform:creator_id[:post_id])" required;
-            input type="text" name="reason" placeholder="reason (dmca-us, csam, spam...)" required;
-            input type="text" name="explanation" placeholder="note (optional)";
-            button { "hide + publish" }
-        }
-        @if takedowns.is_empty() { p.muted { "no takedowns recorded" } }
-        ul.list.rows {
-            @for (t, link) in takedowns.iter().zip(links) {
-                li {
-                    div.rowmain {
-                        div.rowtitle {
-                            @match link {
-                                Some(href) => a href=(href) { code { (t.target_type) ":" (t.target) } }
-                                None => code { (t.target_type) ":" (t.target) }
-                            }
-                        }
-                        div.rowmeta { span.muted {
-                            (t.reason)
-                            @if !t.explanation.is_empty() { " - " (t.explanation) }
-                            " - via " (takedown_source(&t.source))
-                            @if !t.applied_at.is_empty() { " - " (pretty_date(&t.applied_at)) }
-                        } }
-                    }
-                    div.rowactions {
-                        form method="post" action="/mod/untakedown" class="modform" {
-                            input type="hidden" name="d_tag" value=(t.d_tag);
-                            button { "undo" }
-                        }
-                    }
-                }
-            }
-        }
-      }
-    }
-}
-
-#[derive(serde::Deserialize)]
-struct QueueScope {
-    #[serde(default)]
-    pubkey: String,
-    #[serde(default)]
-    platform: String,
-    #[serde(default)]
-    creator_id: String,
-    #[serde(default)]
-    post_id: String,
-    #[serde(default)]
-    back: String,
-}
-
-async fn mod_queue_approve(
-    State(pool): State<PgPool>,
-    headers: HeaderMap,
-    Form(form): Form<QueueScope>,
-) -> Response {
-    if let Err(denied) = require_mod(&headers) {
-        return denied;
-    }
-    let _ = db::approve_pending(&pool, &form.pubkey, &form.platform, &form.creator_id, &form.post_id).await;
-    Redirect::to(&safe_back(&form.back)).into_response()
-}
-
-async fn mod_queue_reject(
-    State(pool): State<PgPool>,
-    headers: HeaderMap,
-    Form(form): Form<QueueScope>,
-) -> Response {
-    if let Err(denied) = require_mod(&headers) {
-        return denied;
-    }
-    let _ = db::reject_pending(&pool, &form.pubkey, &form.platform, &form.creator_id, &form.post_id).await;
-    Redirect::to(&safe_back(&form.back)).into_response()
-}
-
-// paginated per-group review: the individual pending posts for one (contributor, author), so the main
-// queue never has to list thousands of posts inline
-async fn mod_queue_group(
-    State(state): State<AppState>,
-    Path((pubkey, platform, creator_id)): Path<(String, String, String)>,
-    Query(q): Query<PageQuery>,
-    headers: HeaderMap,
-) -> Response {
-    if let Err(denied) = require_mod(&headers) {
-        return denied;
-    }
-    const PER_PAGE: i64 = 50;
-    let total = db::pending_group_post_count(&state.pool, &pubkey, &platform, &creator_id)
-        .await
-        .unwrap_or(0);
-    let last = if total == 0 { 0 } else { (total - 1) / PER_PAGE };
-    let page = q.page.clamp(0, last);
-    let posts = db::pending_posts_for(&state.pool, &pubkey, &platform, &creator_id, PER_PAGE, page * PER_PAGE)
-        .await
-        .unwrap_or_default();
-    let name = posts
-        .first()
-        .and_then(|p| p.creator.clone())
-        .unwrap_or_else(|| creator_id.clone());
-    let base = format!("/mod/queue/{pubkey}/{platform}/{creator_id}");
-    let back = format!("{base}?page={page}");
-    let rendered = render(
-        &name,
-        html! {
-            p { a href="/mod" { "< mod queue" } }
-            div.modhead { h2 { (name) " " span.chip.platform { (pretty_platform(&platform)) } } }
-            p.muted { "by contributor " code { (npub(&pubkey)) } " - " (total) " pending posts" }
-            div.modbar {
-                (queue_form("/mod/queue-approve", &pubkey, &platform, &creator_id, "", "/mod", "approve all pending", false))
-                (queue_form("/mod/queue-reject", &pubkey, &platform, &creator_id, "", "/mod", "reject all pending", true))
-            }
-            @if posts.is_empty() { p.muted { "no pending posts" } }
-            ul.list.rows {
-                @for post in &posts {
-                    li {
-                        div.rowmain {
-                            div.rowtitle {
-                                a href=(format!("/mod/post/{}/{}/{}?pk={}", platform, creator_id, post.post_id, pubkey)) {
-                                    (post.post_title.clone().unwrap_or_else(|| post.post_id.clone()))
-                                }
-                            }
-                            div.rowmeta { span.muted { (post.files) " file(s)" } }
-                        }
-                        div.rowactions {
-                            (queue_form("/mod/queue-approve", &pubkey, &platform, &creator_id, &post.post_id, &back, "approve", false))
-                            (queue_form("/mod/queue-reject", &pubkey, &platform, &creator_id, &post.post_id, &back, "reject", true))
-                        }
-                    }
-                }
-            }
-            @if last > 0 {
-                div.pager {
-                    @if page > 0 { a.btn.ghost href=(format!("{base}?page={}", page - 1)) { "< prev" } }
-                    span.muted { "page " (page + 1) " of " (last + 1) }
-                    @if page < last { a.btn.ghost href=(format!("{base}?page={}", page + 1)) { "next >" } }
-                }
-            }
-        },
-    );
-    private_page(rendered)
-}
-
-#[derive(serde::Deserialize)]
-struct PageQuery {
-    #[serde(default)]
-    page: i64,
-}
-
-// ban a contributor: publish a kind 31064 pubkey takedown (so their future uploads auto-drop at ingest)
-// and clear their current queue
-async fn mod_ban_contributor(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Form(form): Form<ModForm>,
-) -> Response {
-    if let Err(denied) = require_mod(&headers) {
-        return denied;
-    }
-    apply_ban(&state, Target::Pubkey(form.pubkey.clone())).await;
-    let _ = db::reject_pending(&state.pool, &form.pubkey, "", "", "").await;
-    Redirect::to("/mod").into_response()
-}
-
-// group the per-(contributor, author) summary rows into contributor blocks, each holding its authors
-struct CBlock<'a> {
-    pubkey: &'a str,
-    authors: Vec<&'a db::QueueGroup>,
-}
-fn group_contributors(groups: &[db::QueueGroup]) -> Vec<CBlock<'_>> {
-    let mut blocks: Vec<CBlock> = Vec::new();
-    for g in groups {
-        if blocks.last().map(|c| c.pubkey != g.pubkey).unwrap_or(true) {
-            blocks.push(CBlock { pubkey: &g.pubkey, authors: Vec::new() });
-        }
-        blocks.last_mut().unwrap().authors.push(g);
-    }
-    blocks
-}
-fn block_post_total(c: &CBlock) -> i64 {
-    c.authors.iter().map(|a| a.posts).sum()
-}
-fn queue_form(
-    action: &str,
-    pubkey: &str,
-    platform: &str,
-    creator_id: &str,
-    post_id: &str,
-    back: &str,
-    label: &str,
-    danger: bool,
-) -> Markup {
-    html! {
-        form method="post" action=(action) class="modform" {
-            input type="hidden" name="pubkey" value=(pubkey);
-            input type="hidden" name="platform" value=(platform);
-            input type="hidden" name="creator_id" value=(creator_id);
-            input type="hidden" name="post_id" value=(post_id);
-            input type="hidden" name="back" value=(back);
-            button class=(if danger { "danger" } else { "ok" }) { (label) }
-        }
-    }
-}
-
-// record the hide locally first so it takes effect even if relays are unreachable, then sign and fan
-// the kind 31064 out to the relay set; a missing instance key keeps the hide local-only
-async fn mod_takedown(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Form(form): Form<TakedownForm>,
-) -> Response {
-    if let Err(denied) = require_mod(&headers) {
-        return denied;
-    }
-    let value = form.target.trim().to_string();
-    let Some(target) = Target::from_parts(&form.target_type, value) else {
-        return (StatusCode::BAD_REQUEST, "unknown target type").into_response();
-    };
-    if target.parts().1.is_empty() {
-        return Redirect::to("/mod").into_response();
-    }
-    let takedown = Takedown {
-        target,
-        reason: non_empty(form.reason).unwrap_or_else(|| "unspecified".into()),
-        applied_at: Some(Utc::now().to_rfc3339()),
-        explanation: form.explanation.unwrap_or_default().trim().to_string(),
-    };
-    match &state.signer {
-        Some(keys) => publish_takedown(&state, keys, &takedown).await,
-        None => {
-            let _ = db::record_takedown(&state.pool, &takedown, "local", None).await;
-        }
-    }
-    Redirect::to("/mod").into_response()
-}
-
-async fn publish_takedown(state: &AppState, keys: &Keys, takedown: &Takedown) {
-    let event = match takedown.to_event(keys) {
-        Ok(event) => event,
-        Err(e) => {
-            tracing::error!("takedown sign failed: {e}");
-            let _ = db::record_takedown(&state.pool, takedown, "local", None).await;
-            return;
-        }
-    };
-    let id = event.id.to_hex();
-    let _ = db::record_takedown(
-        &state.pool,
-        takedown,
-        &keys.public_key().to_hex(),
-        Some(&id),
-    )
-    .await;
-    if let Err(e) = send_to_relays(&state.relays, keys, &event).await {
-        tracing::warn!("takedown {id} publish failed (kept local): {e:#}");
-    }
-}
-
-async fn send_to_relays(relays: &[String], keys: &Keys, event: &Event) -> anyhow::Result<()> {
-    let client = Client::new(keys.clone());
-    for relay in relays {
-        client.add_relay(relay).await?;
-    }
-    client.connect().await;
-    client.send_event(event).await?;
-    client.disconnect().await;
-    Ok(())
-}
-
-async fn mod_untakedown(
-    State(pool): State<PgPool>,
-    headers: HeaderMap,
-    Form(form): Form<UntakedownForm>,
-) -> Response {
-    if let Err(denied) = require_mod(&headers) {
-        return denied;
-    }
-    let _ = db::remove_takedown(&pool, &form.d_tag).await;
-    Redirect::to("/mod").into_response()
-}
-
-const REPORT_REASONS: &[&str] = &[
-    "csam", "dmca", "spam", "malware", "mislabeled", "broken", "other",
-];
-
-// unauthenticated: the one write path a random visitor reaches, so it is gated by a honeypot, an
-// issue-time token that forces a real page load first, and a per-ip + per-post rate limit
-async fn submit_report(
-    State(pool): State<PgPool>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Form(form): Form<ReportForm>,
-) -> Response {
-    let back = format!("/p/{}/{}/{}", form.platform, form.creator_id, form.post_id);
-    if !form.website.trim().is_empty() {
-        return Redirect::to(&back).into_response();
-    }
-    if !REPORT_REASONS.contains(&form.reason.as_str()) {
-        return Redirect::to(&back).into_response();
-    }
-    let now = now_secs();
-    if !verify_report_token(&form.platform, &form.creator_id, &form.post_id, &form.token, now) {
-        return Redirect::to(&back).into_response();
-    }
-    let ip = client_ip(&headers, peer);
-    let post_key = format!("{}:{}:{}", form.platform, form.creator_id, form.post_id);
-    if !report_limiter().allow(&ip_hash(&ip.to_string()), &post_key, now) {
-        return Redirect::to(&back).into_response();
-    }
-    if !matches!(
-        db::post_is_visible(&pool, &form.platform, &form.creator_id, &form.post_id).await,
-        Ok(true)
-    ) {
-        return Redirect::to(&back).into_response();
-    }
-    let _ =
-        db::record_report(&pool, &form.platform, &form.creator_id, &form.post_id, &form.reason).await;
-    Redirect::to(&format!("{back}?reported=1")).into_response()
-}
-
-async fn mod_report_dismiss(
-    State(pool): State<PgPool>,
-    headers: HeaderMap,
-    Form(form): Form<PostForm>,
-) -> Response {
-    if let Err(denied) = require_mod(&headers) {
-        return denied;
-    }
-    let _ = db::resolve_report(&pool, &form.platform, &form.creator_id, &form.post_id).await;
-    Redirect::to("/mod").into_response()
-}
-
-// hide a whole post with one kind 31064 post-target event (federates), then clear any report on it
-async fn mod_ban_post(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Form(form): Form<BanPostForm>,
-) -> Response {
-    if let Err(denied) = require_mod(&headers) {
-        return denied;
-    }
-    apply_ban(&state, Target::post(&form.platform, &form.creator_id, &form.post_id)).await;
-    let _ = db::resolve_report(&state.pool, &form.platform, &form.creator_id, &form.post_id).await;
-    Redirect::to(&safe_back(&form.back)).into_response()
-}
-
-// hide every post from a creator with one kind 31064 creator-target event, so a fresh approved
-// contributor re-uploading the same creator stays hidden too
-async fn mod_ban_creator(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Form(form): Form<BanCreatorForm>,
-) -> Response {
-    if let Err(denied) = require_mod(&headers) {
-        return denied;
-    }
-    apply_ban(&state, Target::creator(&form.platform, &form.creator_id)).await;
-    Redirect::to(&safe_back(&form.back)).into_response()
-}
-
-// sign + fan the takedown to peers when the board has an instance key, else record it locally only
-async fn apply_ban(state: &AppState, target: Target) {
-    let takedown = Takedown {
-        target,
-        reason: "moderator".into(),
-        applied_at: Some(Utc::now().to_rfc3339()),
-        explanation: String::new(),
-    };
-    match &state.signer {
-        Some(keys) => publish_takedown(state, keys, &takedown).await,
-        None => {
-            let _ = db::record_takedown(&state.pool, &takedown, "local", None).await;
-        }
-    }
-}
-
-// only ever bounce to a local path so a crafted back field cannot turn this into an open redirect
-fn safe_back(back: &str) -> String {
-    if back.starts_with('/') && !back.starts_with("//") {
-        back.to_string()
-    } else {
-        "/mod".to_string()
-    }
-}
-
-fn mod_bar_post(platform: &str, creator_id: &str, post_id: &str) -> Markup {
-    let back = format!("/c/{platform}/{creator_id}");
-    html! {
-        div.modbar {
-            span.muted { "mod" }
-            form method="post" action="/mod/ban-post" class="modform" {
-                input type="hidden" name="platform" value=(platform);
-                input type="hidden" name="creator_id" value=(creator_id);
-                input type="hidden" name="post_id" value=(post_id);
-                input type="hidden" name="back" value=(back);
-                button.danger { "hide post" }
-            }
-            form method="post" action="/mod/ban-creator" class="modform" {
-                input type="hidden" name="platform" value=(platform);
-                input type="hidden" name="creator_id" value=(creator_id);
-                input type="hidden" name="back" value=(back);
-                button.danger { "ban author" }
-            }
-            a.btn.ghost href="/mod" { "mod queue" }
-        }
-    }
-}
-
-fn mod_bar_creator(platform: &str, creator_id: &str) -> Markup {
-    html! {
-        div.modbar {
-            span.muted { "mod" }
-            form method="post" action="/mod/ban-creator" class="modform" {
-                input type="hidden" name="platform" value=(platform);
-                input type="hidden" name="creator_id" value=(creator_id);
-                input type="hidden" name="back" value="/creators";
-                button.danger { "ban author" }
-            }
-            a.btn.ghost href="/mod" { "mod queue" }
-        }
-    }
-}
-
-// mod-only: everything a contributor uploaded, grouped by post, so a mod can open the files and review
-// before approving; nothing here is public until the pubkey is approved
-async fn mod_pubkey_view(
-    State(state): State<AppState>,
-    Path(pubkey): Path<String>,
-    headers: HeaderMap,
-) -> Response {
-    if let Err(denied) = require_mod(&headers) {
-        return denied;
-    }
-    let files = db::pubkey_files(&state.pool, &pubkey).await.unwrap_or_default();
-    let page = render(
-        "contributor",
-        html! {
-            p { a href="/mod" { "< mod queue" } }
-            h2 { "Contributor" }
-            p { code { (npub(&pubkey)) } }
-            div.modbar {
-                span.muted { "review the posts, then:" }
-                (queue_form("/mod/queue-approve", &pubkey, "", "", "", "/mod", "approve all pending", false))
-                (queue_form("/mod/queue-reject", &pubkey, "", "", "", "/mod", "reject all pending", true))
-                (queue_form("/mod/ban-contributor", &pubkey, "", "", "", "/mod", "ban contributor", true))
-            }
-            @if files.is_empty() { p.muted { "no files" } }
-            (post_groups(&files))
-        },
-    );
-    private_page(page)
-}
-
-// mod-only: one post's files at any status, with a banner and one-click ban or unban
-#[derive(serde::Deserialize)]
-struct PostViewQuery {
-    #[serde(default)]
-    pk: Option<String>,
-}
-
-async fn mod_post_view(
-    State(state): State<AppState>,
-    Path((platform, creator_id, post_id)): Path<(String, String, String)>,
-    Query(q): Query<PostViewQuery>,
-    headers: HeaderMap,
-) -> Response {
-    if let Err(denied) = require_mod(&headers) {
-        return denied;
-    }
-    // reviewing from the queue carries the contributor, so show their own manifest with no cross-pubkey
-    // dedup; a content-oriented entry (reports, author view) has no pubkey and keeps the servable pick
-    let reviewing = q.pk.as_deref().filter(|s| !s.is_empty());
-    let files = match reviewing {
-        Some(pk) => db::post_files_for_pubkey(&state.pool, pk, &platform, &creator_id, &post_id)
-            .await
-            .unwrap_or_default(),
-        None => db::post_files_any(&state.pool, &platform, &creator_id, &post_id)
-            .await
-            .unwrap_or_default(),
-    };
-    let visible = db::post_is_visible(&state.pool, &platform, &creator_id, &post_id)
-        .await
-        .unwrap_or(false);
-    let takedown = db::post_takedown(&state.pool, &platform, &creator_id, &post_id)
-        .await
-        .ok()
-        .flatten();
-    let title = files
-        .first()
-        .and_then(|f| f.post_title.clone())
-        .unwrap_or_else(|| post_id.clone());
-    let creator = files.first().map(|f| f.creator.clone());
-    let page = render(
-        &title,
-        html! {
-            p { a href="/mod" { "< mod queue" } }
-            h2 { (title) }
-            p.muted {
-                @if let Some(c) = &creator { "by " a href=(format!("/c/{platform}/{creator_id}")) { (c) } " - " }
-                span.chip.platform { (pretty_platform(&platform)) }
-                @if let Some(pk) = reviewing { " - contributor " code { (npub(pk)) } }
-            }
-            @if visible {
-                div.statusbar.ok { "public - this post is live" }
-                (mod_bar_post(&platform, &creator_id, &post_id))
-            } @else if let Some((d_tag, reason)) = &takedown {
-                div.statusbar.danger {
-                    span { "hidden by takedown: " (reason) }
-                    form method="post" action="/mod/untakedown" class="modform" {
-                        input type="hidden" name="d_tag" value=(d_tag);
-                        button.ok { "unban" }
-                    }
-                }
-            } @else {
-                div.statusbar { "pending review - not yet public" }
-                (mod_bar_post(&platform, &creator_id, &post_id))
-            }
-            @if files.is_empty() { p.muted { "no files" } }
-            (carousel(&files))
-            script { (PreEscaped(CAROUSEL_JS)) }
-        },
-    );
-    private_page(page)
-}
-
-// mod-only: an author's files grouped by post, so a mod can review a first-seen creator before its
-// content is allowed to publish
-async fn mod_author_view(
-    State(state): State<AppState>,
-    Path((platform, creator_id)): Path<(String, String)>,
-    headers: HeaderMap,
-) -> Response {
-    if let Err(denied) = require_mod(&headers) {
-        return denied;
-    }
-    let files = db::author_files(&state.pool, &platform, &creator_id)
-        .await
-        .unwrap_or_default();
-    let name = files
-        .first()
-        .map(|f| f.creator.clone())
-        .unwrap_or_else(|| creator_id.clone());
-    let page = render(
-        &name,
-        html! {
-            p { a href="/mod" { "< mod queue" } }
-            h2 { (name) " " span.chip.platform { (pretty_platform(&platform)) } }
-            div.modbar {
-                span.muted { "approve or drop this author's queued posts from every contributor:" }
-                (queue_form("/mod/queue-approve", "", &platform, &creator_id, "", "/mod", "approve all pending", false))
-                (queue_form("/mod/queue-reject", "", &platform, &creator_id, "", "/mod", "reject all pending", true))
-            }
-            @if files.is_empty() { p.muted { "no files" } }
-            (post_groups(&files))
-        },
-    );
-    private_page(page)
-}
-
-// a contributor's files split into their posts, each header linking to that post's mod view
-fn post_groups(files: &[db::ManifestRow]) -> Markup {
-    let mut groups: Vec<(&str, &str, &str, &str, Vec<&db::ManifestRow>)> = Vec::new();
-    for f in files {
-        match groups.last_mut() {
-            Some(g) if g.0 == f.platform.as_str() && g.1 == f.creator_id.as_str() && g.2 == f.post_id.as_str() => {
-                g.4.push(f)
-            }
-            _ => groups.push((
-                f.platform.as_str(),
-                f.creator_id.as_str(),
-                f.post_id.as_str(),
-                f.post_title.as_deref().unwrap_or(f.post_id.as_str()),
-                vec![f],
-            )),
-        }
-    }
-    html! {
-        @for (platform, creator_id, post_id, title, rows) in &groups {
-            div.postgroup {
-                h3 { a href=(format!("/mod/post/{platform}/{creator_id}/{post_id}")) { (title) } }
-                (file_list(rows))
-            }
-        }
-    }
-}
-
-// files as openable links, never inline images, so a moderator opens each item deliberately
-fn file_list(files: &[&db::ManifestRow]) -> Markup {
-    html! {
-        ul.filelist {
-            @for f in files {
-                li {
-                    @match &f.infohash {
-                        Some(ih) => a.filelink href=(format!("/t/{ih}/f/{}", f.bundle_index)) target="_blank" rel="noopener" {
-                            (f.filename.clone().unwrap_or_else(|| format!("file {}", f.file_index)))
-                        }
-                        None => span { (f.filename.clone().unwrap_or_else(|| format!("file {}", f.file_index))) }
-                    }
-                    span.muted { " - " (f.mime) " - " (human_size(f.size)) }
-                }
-            }
-        }
-    }
-}
-
-fn human_size(bytes: i64) -> String {
-    let b = bytes as f64;
-    if b >= 1e9 {
-        format!("{:.1} GB", b / 1e9)
-    } else if b >= 1e6 {
-        format!("{:.1} MB", b / 1e6)
-    } else if b >= 1e3 {
-        format!("{:.0} KB", b / 1e3)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
-fn private_page(page: Html<String>) -> Response {
-    let mut resp = page.into_response();
-    resp.headers_mut().insert(
-        header::CACHE_CONTROL,
-        header::HeaderValue::from_static("private, no-store"),
-    );
-    resp
-}
-
-#[derive(serde::Deserialize)]
-struct BanPostForm {
-    platform: String,
-    creator_id: String,
-    post_id: String,
-    #[serde(default)]
-    back: String,
-}
-
-#[derive(serde::Deserialize)]
-struct BanCreatorForm {
-    platform: String,
-    creator_id: String,
-    #[serde(default)]
-    back: String,
-}
-
-fn reports_section(reports: &[db::ReportGroup], open_count: i64) -> Markup {
-    html! {
-      section.block id="reports" {
-        div.blockhead {
-            h2 { "Reports" }
-            @if open_count > 0 { span.chip.danger { (open_count) " open" } }
-        }
-        @if reports.is_empty() {
-            p.muted { "no open reports" }
-        } @else {
-            p.muted { "user-flagged posts, most severe first; hide publishes a takedown, dismiss clears the flag" }
-            ul.list.rows {
-                @for r in reports {
-                    li.report.csam[r.has_csam] {
-                        div.rowmain {
-                            div.rowtitle {
-                                a href=(format!("/mod/post/{}/{}/{}", r.platform, r.creator_id, r.post_id)) {
-                                    (r.post_title.clone().unwrap_or_else(|| r.post_id.clone()))
-                                }
-                                " " span.chip.platform { (pretty_platform(&r.platform)) }
-                                @if r.has_csam { " " span.chip.danger { "CSAM" } }
-                            }
-                            div.rowmeta { span.muted {
-                                @if !r.creator.is_empty() { (r.creator) " - " }
-                                @if let Some(rs) = &r.reasons { (rs) " - " }
-                                (r.total) " report(s)"
-                            } }
-                        }
-                        div.rowactions {
-                            form method="post" action="/mod/ban-post" class="modform" {
-                                input type="hidden" name="platform" value=(r.platform);
-                                input type="hidden" name="creator_id" value=(r.creator_id);
-                                input type="hidden" name="post_id" value=(r.post_id);
-                                input type="hidden" name="back" value="/mod";
-                                button.danger { "hide post" }
-                            }
-                            form method="post" action="/mod/ban-creator" class="modform" {
-                                input type="hidden" name="platform" value=(r.platform);
-                                input type="hidden" name="creator_id" value=(r.creator_id);
-                                input type="hidden" name="back" value="/mod";
-                                button.danger { "ban author" }
-                            }
-                            form method="post" action="/mod/report-dismiss" class="modform" {
-                                input type="hidden" name="platform" value=(r.platform);
-                                input type="hidden" name="creator_id" value=(r.creator_id);
-                                input type="hidden" name="post_id" value=(r.post_id);
-                                button { "dismiss" }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-      }
-    }
-}
-
-fn report_box(platform: &str, creator_id: &str, post_id: &str, reported: bool) -> Markup {
-    html! {
-        @if reported {
-            p.reported { "Thanks - a moderator will review this post" }
-        } @else {
-            details.reportbox {
-                summary { "Report this post" }
-                form method="post" action="/report" {
-                    input type="hidden" name="platform" value=(platform);
-                    input type="hidden" name="creator_id" value=(creator_id);
-                    input type="hidden" name="post_id" value=(post_id);
-                    input type="hidden" name="token" value=(report_token(platform, creator_id, post_id, now_secs()));
-                    input.hp type="text" name="website" tabindex="-1" autocomplete="off" aria-hidden="true";
-                    select name="reason" {
-                        option value="csam" { "illegal / CSAM" }
-                        option value="dmca" { "copyright / DMCA" }
-                        option value="spam" { "spam" }
-                        option value="malware" { "malware" }
-                        option value="mislabeled" { "mislabeled" }
-                        option value="broken" { "broken / unavailable" }
-                        option value="other" { "other" }
-                    }
-                    button { "Submit report" }
-                }
-            }
-        }
-    }
-}
 
 fn now_secs() -> i64 {
     Utc::now().timestamp()
@@ -2529,7 +1013,7 @@ fn now_secs() -> i64 {
 
 // derived from the mod token so it is stable across restarts with no rng dep; it salts the ip hash
 // and keys the anti-replay token
-fn report_secret() -> &'static [u8; 32] {
+fn session_secret() -> &'static [u8; 32] {
     static SECRET: OnceLock<[u8; 32]> = OnceLock::new();
     SECRET.get_or_init(|| {
         let token = std::env::var("BAKEMONO_MOD_TOKEN").unwrap_or_default();
@@ -2545,167 +1029,6 @@ fn report_secret() -> &'static [u8; 32] {
 
 type HmacSha256 = Hmac<Sha256>;
 
-fn report_token(platform: &str, creator_id: &str, post_id: &str, issued_at: i64) -> String {
-    let mut mac = HmacSha256::new_from_slice(report_secret()).expect("hmac key");
-    mac.update(format!("{platform}:{creator_id}:{post_id}:{issued_at}").as_bytes());
-    let tag = mac.finalize().into_bytes();
-    let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&tag[..16]);
-    format!("{issued_at}.{sig}")
-}
-
-const REPORT_TOKEN_MIN_AGE: i64 = 2;
-const REPORT_TOKEN_MAX_AGE: i64 = 3600;
-
-fn verify_report_token(
-    platform: &str,
-    creator_id: &str,
-    post_id: &str,
-    token: &str,
-    now: i64,
-) -> bool {
-    let Some((ts, sig_b64)) = token.split_once('.') else {
-        return false;
-    };
-    let Ok(issued_at) = ts.parse::<i64>() else {
-        return false;
-    };
-    let age = now - issued_at;
-    if !(REPORT_TOKEN_MIN_AGE..=REPORT_TOKEN_MAX_AGE).contains(&age) {
-        return false;
-    }
-    let Ok(sig) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(sig_b64) else {
-        return false;
-    };
-    let mut mac = HmacSha256::new_from_slice(report_secret()).expect("hmac key");
-    mac.update(format!("{platform}:{creator_id}:{post_id}:{issued_at}").as_bytes());
-    mac.verify_truncated_left(&sig).is_ok()
-}
-
-// hashed with the secret so a raw ip is never stored or logged; keying only, privacy per project stance
-fn ip_hash(ip: &str) -> String {
-    let mut h = Sha256::new();
-    h.update(b"bakemono-report-ip-v1");
-    h.update(report_secret());
-    h.update(ip.as_bytes());
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(h.finalize())
-}
-
-const REPORT_WINDOW_SECS: i64 = 600;
-const REPORT_PER_POST_MAX: u32 = 3;
-const REPORT_PER_IP_MAX: u32 = 20;
-const REPORT_GLOBAL_MAX: u32 = 500;
-const REPORT_MAX_TRACKED: usize = 50_000;
-
-fn report_limiter() -> &'static ReportLimiter {
-    static L: OnceLock<ReportLimiter> = OnceLock::new();
-    L.get_or_init(ReportLimiter::default)
-}
-
-// fixed-window limiter over hashed ip, hashed ip+post, and a global ceiling; a submit bumps all three
-// so hammering a blocked key keeps it blocked
-#[derive(Default)]
-struct ReportLimiter {
-    state: Mutex<ReportLimiterState>,
-}
-
-#[derive(Default)]
-struct ReportLimiterState {
-    windows: HashMap<String, ReportWindow>,
-    global: ReportWindow,
-}
-
-#[derive(Default, Clone, Copy)]
-struct ReportWindow {
-    start: i64,
-    count: u32,
-}
-
-impl ReportLimiter {
-    fn allow(&self, ip_hash: &str, post_key: &str, now: i64) -> bool {
-        let mut st = self.state.lock().unwrap();
-        if st.windows.len() > REPORT_MAX_TRACKED {
-            st.windows.retain(|_, w| now - w.start < REPORT_WINDOW_SECS);
-        }
-        let per_ip = bump_window(
-            st.windows.entry(format!("ip:{ip_hash}")).or_default(),
-            now,
-            REPORT_PER_IP_MAX,
-        );
-        let per_post = bump_window(
-            st.windows.entry(format!("pp:{ip_hash}:{post_key}")).or_default(),
-            now,
-            REPORT_PER_POST_MAX,
-        );
-        let mut global = st.global;
-        let global_ok = bump_window(&mut global, now, REPORT_GLOBAL_MAX);
-        st.global = global;
-        per_ip && per_post && global_ok
-    }
-}
-
-fn bump_window(w: &mut ReportWindow, now: i64, max: u32) -> bool {
-    if now - w.start >= REPORT_WINDOW_SECS {
-        w.start = now;
-        w.count = 0;
-    }
-    w.count += 1;
-    w.count <= max
-}
-
-#[derive(serde::Deserialize)]
-struct ReportForm {
-    platform: String,
-    creator_id: String,
-    post_id: String,
-    reason: String,
-    token: String,
-    #[serde(default)]
-    website: String,
-}
-
-#[derive(serde::Deserialize)]
-struct PostForm {
-    platform: String,
-    creator_id: String,
-    post_id: String,
-}
-
-#[derive(serde::Deserialize)]
-struct ReportedQuery {
-    reported: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-struct ModForm {
-    pubkey: String,
-}
-
-#[derive(serde::Deserialize)]
-struct TakedownForm {
-    target_type: String,
-    target: String,
-    reason: String,
-    explanation: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-struct UntakedownForm {
-    d_tag: String,
-}
-
-fn non_empty(value: String) -> Option<String> {
-    let trimmed = value.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
-}
-
-// peer takedowns store the signer pubkey; render it as an npub, leave "local" as-is
-fn takedown_source(source: &str) -> String {
-    if source.len() == 64 && source.bytes().all(|b| b.is_ascii_hexdigit()) {
-        npub(source)
-    } else {
-        source.to_string()
-    }
-}
 
 // the mod routes require HTTP Basic auth with the password set in BAKEMONO_MOD_TOKEN
 fn require_mod(headers: &HeaderMap) -> Result<(), Response> {
@@ -2744,7 +1067,7 @@ fn is_mod(headers: &HeaderMap) -> bool {
 const MOD_SESSION_TTL: i64 = 8 * 3600;
 
 // a signed, expiring cookie minted when a mod loads /mod with the token, so ban buttons work on the
-// public pages without re-prompting; keyed on report_secret (mod-token-derived) so rotating the token
+// public pages without re-prompting; keyed on session_secret (mod-token-derived) so rotating the token
 // invalidates every outstanding session
 fn mod_session_cookie() -> String {
     let expiry = now_secs() + MOD_SESSION_TTL;
@@ -2752,8 +1075,15 @@ fn mod_session_cookie() -> String {
     format!("modsession={expiry}.{sig}; Path=/; Max-Age={MOD_SESSION_TTL}; HttpOnly; SameSite=Strict")
 }
 
+fn with_mod_cookie(mut resp: Response) -> Response {
+    if let Ok(v) = header::HeaderValue::from_str(&mod_session_cookie()) {
+        resp.headers_mut().insert(header::SET_COOKIE, v);
+    }
+    resp
+}
+
 fn mod_session_sig(expiry: i64) -> String {
-    let mut mac = HmacSha256::new_from_slice(report_secret()).expect("hmac key");
+    let mut mac = HmacSha256::new_from_slice(session_secret()).expect("hmac key");
     mac.update(format!("modsession:{expiry}").as_bytes());
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&mac.finalize().into_bytes()[..16])
 }
@@ -2774,7 +1104,7 @@ fn valid_mod_cookie(headers: &HeaderMap, now: i64) -> bool {
     let Ok(sig) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(sig_b64) else {
         return false;
     };
-    let mut mac = HmacSha256::new_from_slice(report_secret()).expect("hmac key");
+    let mut mac = HmacSha256::new_from_slice(session_secret()).expect("hmac key");
     mac.update(format!("modsession:{expiry}").as_bytes());
     mac.verify_truncated_left(&sig).is_ok()
 }
@@ -2789,13 +1119,6 @@ fn basic_auth_password(headers: &HeaderMap) -> Option<String> {
     creds.split_once(':').map(|(_, pass)| pass.to_string())
 }
 
-fn npub(pubkey_hex: &str) -> String {
-    PublicKey::from_hex(pubkey_hex)
-        .ok()
-        .and_then(|pk| pk.to_bech32().ok())
-        .unwrap_or_else(|| pubkey_hex.to_string())
-}
-
 fn board_name() -> String {
     config::get().name.clone()
 }
@@ -2808,12 +1131,6 @@ fn contact() -> Option<String> {
     config::get().contact.clone()
 }
 
-fn env_opt(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
 
 // a stable per-post cookie token so a refresh does not re-count a view; hashed so odd ids stay cookie-safe
 fn view_token(platform: &str, creator_id: &str, post_id: &str) -> String {
@@ -2957,13 +1274,6 @@ fn community_icon(label: &str) -> &'static str {
 }
 
 const REPO: &str = env!("CARGO_PKG_REPOSITORY");
-
-// per-OS desktop builds, served by GitHub's stable latest-release redirect; names track Tauri's bundles
-const DOWNLOADS: &[(&str, &str)] = &[
-    ("Windows", "Bakemono_x64-setup.exe"),
-    ("macOS (Apple Silicon)", "Bakemono_aarch64.dmg"),
-    ("Linux (.deb)", "Bakemono_amd64.deb"),
-];
 
 // inline SVGs so the page pulls no icon font or external asset. shared attrs are per-svg to stay standalone
 const ICON_SHUFFLE: &str = "<svg viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M16 3h5v5'/><path d='M4 20 21 3'/><path d='M21 16v5h-5'/><path d='M15 15l6 6'/><path d='M4 4l5 5'/></svg>";
@@ -3417,189 +1727,12 @@ for (const el of document.querySelectorAll('.carousel')) {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_feed, choose_alternate, endangered_item, feed_item, pretty_date};
-    use super::{report_token, verify_report_token, ReportLimiter, REPORT_WINDOW_SECS};
-    use super::{upload_groups, UploadState};
-    use crate::db::{EndangeredRow, ManifestRow};
-
-    #[test]
-    fn upload_groups_fold_posts_and_rank_newest_first() {
-        let mut old_live = row("e1", 10);
-        let mut old_live_2 = row("e2", 20);
-        old_live_2.file_hash = "h2".into();
-        let mut queued = row("e3", 15);
-        queued.post_id = "p2".into();
-        queued.status = "pending".into();
-        let mut gone = row("e4", 5);
-        gone.post_id = "p3".into();
-        old_live.size = 1;
-        old_live_2.size = 2;
-        let files = vec![old_live, old_live_2, queued, gone];
-        let live = std::iter::once(("patreon".to_string(), "c1".to_string(), "p1".to_string())).collect();
-
-        let groups = upload_groups(&files, &live);
-
-        assert_eq!(groups.len(), 3);
-        // p1 carries the newest event so it leads despite sitting first in post order too
-        assert_eq!(groups[0].post_id, "p1");
-        assert!(groups[0].state == UploadState::Live);
-        assert_eq!(groups[0].files, 2);
-        assert_eq!(groups[0].bytes, 3);
-        assert_eq!(groups[1].post_id, "p2");
-        assert!(groups[1].state == UploadState::Pending);
-        // approved but absent from the visible set means a takedown removed it
-        assert_eq!(groups[2].post_id, "p3");
-        assert!(groups[2].state == UploadState::Removed);
-    }
-
-    #[test]
-    fn alternate_kicks_in_only_for_a_probed_dead_swarm() {
-        let alts = |req: Option<i32>| {
-            vec![
-                ("req".to_string(), req),
-                ("weak".to_string(), Some(1)),
-                ("strong".to_string(), Some(4)),
-                ("unprobed".to_string(), None),
-            ]
-        };
-        let uncached = |_: &str| false;
-        // live or never-probed requested hash is served as-is
-        assert_eq!(choose_alternate("req", &alts(Some(2)), uncached), None);
-        assert_eq!(choose_alternate("req", &alts(None), uncached), None);
-        // dead requested hash falls back to the best-seeded sibling, never an unprobed one
-        assert_eq!(
-            choose_alternate("req", &alts(Some(0)), uncached),
-            Some("strong".to_string())
-        );
-        // a sibling already on disk beats swarm counts
-        assert_eq!(
-            choose_alternate("req", &alts(Some(0)), |ih| ih == "weak"),
-            Some("weak".to_string())
-        );
-        // no usable sibling -> stay on the requested hash
-        let lonely = vec![("req".to_string(), Some(0)), ("other".to_string(), None)];
-        assert_eq!(choose_alternate("req", &lonely, uncached), None);
-    }
-
-    #[test]
-    fn report_token_round_trips_within_window() {
-        let t = report_token("patreon", "c1", "p1", 1_000);
-        assert!(verify_report_token("patreon", "c1", "p1", &t, 1_010));
-    }
-
-    #[test]
-    fn report_token_rejects_too_fast_and_too_old() {
-        let t = report_token("patreon", "c1", "p1", 1_000);
-        assert!(!verify_report_token("patreon", "c1", "p1", &t, 1_001));
-        assert!(!verify_report_token("patreon", "c1", "p1", &t, 5_000));
-    }
-
-    #[test]
-    fn report_token_is_bound_to_the_post() {
-        let t = report_token("patreon", "c1", "p1", 1_000);
-        assert!(!verify_report_token("patreon", "c1", "p2", &t, 1_010));
-        assert!(!verify_report_token("patreon", "c2", "p1", &t, 1_010));
-    }
-
-    #[test]
-    fn report_token_rejects_garbage() {
-        assert!(!verify_report_token("patreon", "c1", "p1", "not-a-token", 1_010));
-        assert!(!verify_report_token("patreon", "c1", "p1", "1000.zzzz", 1_010));
-    }
-
-    #[test]
-    fn report_limiter_caps_per_post_then_resets() {
-        let lim = ReportLimiter::default();
-        let first: Vec<bool> = (0..5).map(|_| lim.allow("iphash", "post", 1_000)).collect();
-        assert_eq!(first, vec![true, true, true, false, false]);
-        assert!(lim.allow("iphash", "post", 1_000 + REPORT_WINDOW_SECS));
-    }
+    use super::pretty_date;
 
     #[test]
     fn formats_iso_dates_and_passes_junk_through() {
-        assert_eq!(pretty_date("2026-06-23T17:46:49.000+00:00"), "Jun 23, 2026");
-        assert_eq!(pretty_date("2026-01-03 10:00:00"), "Jan 3, 2026");
-        assert_eq!(pretty_date("whenever"), "whenever");
-    }
-
-    #[test]
-    fn item_emits_magnet_enclosure_and_escapes() {
-        let xml = feed_item("https://board.example", &row("evt", 1_700_000_000));
-        assert!(xml.contains("<link>https://board.example/p/patreon/c1/p1</link>"));
-        assert!(xml.contains("url=\"magnet:?xt=urn:btih:abc&amp;tr=udp://t\""));
-        assert!(xml.contains("type=\"application/x-bittorrent\""));
-        // no infohash -> guid falls back to the event id
-        assert!(xml.contains("<guid isPermaLink=\"false\">evt</guid>"));
-        assert!(xml.contains("Foo &amp; Bar"));
-    }
-
-    #[test]
-    fn endangered_item_carries_seeder_note() {
-        let xml = endangered_item(
-            "https://board.example",
-            &EndangeredRow {
-                platform: "patreon".into(),
-                creator_id: "c1".into(),
-                post_id: "p1".into(),
-                creator: "C".into(),
-                post_title: Some("Hi".into()),
-                filename: None,
-                magnet: "magnet:?xt=urn:btih:abc".into(),
-                infohash: Some("abc".into()),
-                event_id: "evt".into(),
-                created_at: 10,
-                size: 1,
-                seeders: Some(2),
-            },
-        );
-        assert!(xml.contains("<description>2 seeder(s)</description>"));
-        // the infohash is the stable guid when present
-        assert!(xml.contains("<guid isPermaLink=\"false\">abc</guid>"));
-    }
-
-    #[test]
-    fn build_feed_wraps_self_and_next_links() {
-        let items = feed_item("https://board.example", &row("evt", 10));
-        let next = "https://board.example/feed.xml?before=10&limit=3&creator=xyz";
-        let xml = build_feed(
-            "https://board.example",
-            "https://board.example/feed.xml?limit=3&creator=xyz",
-            Some(next),
-            &items,
-        );
-        assert!(xml.contains("rel=\"self\""));
-        // the cursor href is xml-escaped so its & separators do not break the feed
-        assert!(xml.contains(
-            "rel=\"next\" href=\"https://board.example/feed.xml?before=10&amp;limit=3&amp;creator=xyz\""
-        ));
-        assert!(xml.contains("<guid isPermaLink=\"false\">evt</guid>"));
-    }
-
-    fn row(event_id: &str, created_at: i64) -> ManifestRow {
-        ManifestRow {
-            event_id: event_id.into(),
-            pubkey: "pk".into(),
-            created_at,
-            d_tag: "d".into(),
-            file_hash: "h".into(),
-            size: 4096,
-            mime: "image/jpeg".into(),
-            magnet: "magnet:?xt=urn:btih:abc&tr=udp://t".into(),
-            platform: "patreon".into(),
-            creator: "Foo & Bar".into(),
-            creator_id: "c1".into(),
-            post_id: "p1".into(),
-            file_index: 0,
-            filename: None,
-            post_title: Some("Hi".into()),
-            posted_at: None,
-            tier: None,
-            content: "body".into(),
-            thumb: None,
-            infohash: None,
-            bundle_index: 0,
-            status: "approved".into(),
-            cid: None,
-        }
+        assert_eq!(pretty_date("2026-03-14T10:00:00.000+00:00"), "Mar 14, 2026");
+        assert_eq!(pretty_date("2026-03-14"), "Mar 14, 2026");
+        assert_eq!(pretty_date("not a date"), "not a date");
     }
 }

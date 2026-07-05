@@ -1,4 +1,4 @@
-# image-only: copy just this file to the mac-mini, no source needed.
+# image-only: copy just this file to the box, no source needed.
 # build + push from a machine that has the source (see deploy.sh), then `docker compose -f docker-compose.deploy.yml up -d`
 services:
   postgres:
@@ -10,13 +10,33 @@ services:
       - bakemono-pg:/var/lib/postgresql/data
     restart: unless-stopped
 
-  relay:
-    image: scsibug/nostr-rs-relay:latest
+  kubo:
+    image: ipfs/kubo:latest
     ports:
-      - "${RELAY_PORT:-8080}:8080"
+      - "4001:4001"
+      - "4001:4001/udp"
     volumes:
-      - bakemono-relay:/usr/src/app/db
-      - ./relay/config.toml:/usr/src/app/config.toml:ro
+      - bakemono-ipfs:/data/ipfs
+      - ./kubo-init.sh:/container-init.d/kubo-init.sh:ro
+    restart: unless-stopped
+
+  cluster:
+    image: ipfs/ipfs-cluster:latest
+    depends_on:
+      - kubo
+    environment:
+      CLUSTER_PEERNAME: ${CLUSTER_PEERNAME:-board}
+      # 32-byte hex fencing the cluster's libp2p network; set a real one before exposing 9096
+      CLUSTER_SECRET: ${CLUSTER_SECRET:?set CLUSTER_SECRET}
+      CLUSTER_IPFSHTTP_NODEMULTIADDRESS: /dns4/kubo/tcp/5001
+      CLUSTER_CRDT_TRUSTEDPEERS: ${CLUSTER_TRUSTED_PEERS:-*}
+      CLUSTER_RESTAPI_HTTPLISTENMULTIADDRESS: /ip4/0.0.0.0/tcp/9094
+      CLUSTER_LISTENMULTIADDRESS: /ip4/0.0.0.0/tcp/9096
+    ports:
+      # 9096 is what keepers dial; leave 9094 (the pin API) unpublished
+      - "9096:9096"
+    volumes:
+      - bakemono-cluster:/data/ipfs-cluster
     restart: unless-stopped
 
   board:
@@ -24,29 +44,19 @@ services:
     pull_policy: always
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgres://postgres:postgres@postgres:5432/bakemono?sslmode=disable}
-      BAKEMONO_RELAYS: ${BAKEMONO_RELAYS:-ws://relay:8080}
-      # BT peer port the gateway listens on; must match the published port below and be open at the firewall
-      BAKEMONO_GATEWAY_PORT: ${BAKEMONO_GATEWAY_PORT:-4240}
-      # optional: comma-separated ip:port seeders to dial directly (a known seedbox), bypassing tracker/DHT
-      BAKEMONO_GATEWAY_PEERS: ${BAKEMONO_GATEWAY_PEERS:-}
-      # on-disk cache cap in GB; over budget, least-recently-used content is evicted. 0 = unlimited
-      BAKEMONO_CACHE_GB: ${BAKEMONO_CACHE_GB:-10}
-      # reject any single file larger than this many GB before streaming; defaults to the cache cap above
-      BAKEMONO_MAX_FILE_GB: ${BAKEMONO_MAX_FILE_GB:-}
-      # ceiling on torrents fetched at once, so a flood of distinct infohashes can't exhaust the box. 0 = off
-      BAKEMONO_MAX_TORRENTS: ${BAKEMONO_MAX_TORRENTS:-64}
-      # comma-separated CIDRs whose forwarding headers are trusted for the real client IP; unset/empty
-      # defaults to Cloudflare's ranges, the literal "none" trusts no proxy (use the socket peer)
-      BAKEMONO_TRUSTED_PROXIES: ${BAKEMONO_TRUSTED_PROXIES:-}
-      # per-client cold-miss rate limit (a miss joins a swarm): token bucket size, 0 disables; refill per second
-      BAKEMONO_COLD_MISS_BURST: ${BAKEMONO_COLD_MISS_BURST:-20}
-      BAKEMONO_COLD_MISS_REFILL: ${BAKEMONO_COLD_MISS_REFILL:-1}
-      # mod queue password (HTTP Basic auth); leave unset to disable /mod
+      BAKEMONO_KUBO_API: http://kubo:5001
+      BAKEMONO_KUBO_GATEWAY: http://kubo:8080
+      BAKEMONO_CLUSTER_API: http://cluster:9094
+      # cluster config (mounted ro) that /follower.json derives from, and the multiaddr keepers dial
+      BAKEMONO_CLUSTER_CONFIG_DIR: /cluster
+      BAKEMONO_CLUSTER_PUBLIC_ADDR: ${BAKEMONO_CLUSTER_PUBLIC_ADDR:-}
+      # ed25519 board key (hex) that signs manifest heads; unset generates into the key file below
+      BAKEMONO_BOARD_KEY: ${BAKEMONO_BOARD_KEY:-}
+      BAKEMONO_BOARD_KEY_FILE: /data/board.key
+      # seconds between scrape passes over enabled sources; 0 disables the scheduler
+      BAKEMONO_SCRAPE_INTERVAL_SECS: ${BAKEMONO_SCRAPE_INTERVAL_SECS:-21600}
+      # mod password (HTTP Basic auth); leave unset to disable /mod
       BAKEMONO_MOD_TOKEN: ${BAKEMONO_MOD_TOKEN:-}
-      # instance keypair (nsec) that signs kind 31064 takedowns; unset keeps hides local-only
-      BAKEMONO_INSTANCE_NSEC: ${BAKEMONO_INSTANCE_NSEC:-}
-      # peer instance npubs/hex whose takedowns this board honors, comma-separated
-      BAKEMONO_TRUSTED_INSTANCES: ${BAKEMONO_TRUSTED_INSTANCES:-}
       # board title shown in the header, browser tab and /info; unset keeps the default wordmark
       BAKEMONO_BOARD_NAME: ${BAKEMONO_BOARD_NAME:-}
       # DMCA and general contact shown on /info
@@ -57,19 +67,22 @@ services:
       BAKEMONO_CONFIG: /config/board.toml
     ports:
       - "3000:3000"
-      - "${BAKEMONO_GATEWAY_PORT:-4240}:${BAKEMONO_GATEWAY_PORT:-4240}"
-      - "${BAKEMONO_GATEWAY_PORT:-4240}:${BAKEMONO_GATEWAY_PORT:-4240}/udp"
     volumes:
-      - bakemono-cache:/cache
+      - bakemono-data:/data
+      - bakemono-scrape:/scrape
+      - bakemono-cluster:/cluster:ro
       # board.toml + static assets shipped by deploy.sh; static_dir in board.toml should be /config/static
       - ./board.toml:/config/board.toml:ro
       - ./static:/config/static:ro
     depends_on:
       - postgres
-      - relay
+      - kubo
+      - cluster
     restart: unless-stopped
 
 volumes:
   bakemono-pg:
-  bakemono-relay:
-  bakemono-cache:
+  bakemono-ipfs:
+  bakemono-cluster:
+  bakemono-data:
+  bakemono-scrape:
