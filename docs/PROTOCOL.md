@@ -1,211 +1,173 @@
 # Protocol
 
-Bakemono uses **Nostr** as its metadata wire format and federation transport. This means: signed events published to relays, identity via secp256k1 / Schnorr keys, censorship resistance via multi-relay publishing. The actual file bytes flow over classic BitTorrent (TCP/uTP + DHT + trackers); a board joins the swarm and re-serves those bytes to browsers as plain HTTP, but the manifest protocol below is unchanged.
+Bakemono's entire wire format is one data structure: the **manifest**, a DAG of plain JSON files stored in IPFS and signed by the board's key. A board publishes its archive as a manifest, keepers replicate the CIDs it lists, and other boards import it. There are no relays, no per-user events, no other message types.
 
-The full reasoning for choosing Nostr lives in `docs/ARCHITECTURE.md`. The short version: Nostr already solves federation, durability across operators, and pubkey identity. We get those for free instead of inventing them.
+The canonical implementation of every object and routine below lives in `bakemono-core`. Everything is plain JSON stored as UnixFS files, so the whole protocol is inspectable with `curl` and `jq` against any IPFS node.
 
-The canonical rust implementation of every event type and routine described in this document lives in the `bakemono-core` crate, wrapping the `nostr` crate from rust-nostr.org. Both `bakemono-app` (which builds and signs events) and `bakemono-board` (which verifies, indexes, and serves them) import it.
+## Object graph
 
-## The Bakemono Manifest Event
+```
+pointer (DNSLink / head.json / cluster pinset)
+  -> head    signed, versioned, chains to the previous head
+     -> root    shard index + revoked list + peers
+        -> shard    one creator's posts
+           -> file CIDs    content bytes and thumbnails
+```
 
-A Bakemono manifest is a Nostr event of **kind 31063** (in the parameterized-replaceable range 30000-39999 per NIP-33; chosen as a thematic riff on NIP-94 file metadata kind 1063). Every event is signed by the contributor's secp256k1 public key using the standard Nostr Schnorr signature scheme (BIP-340).
+One subtlety that shapes everything below: manifest objects are plain JSON, so CID references inside them are strings, not IPLD links. Pinning a shard does not pin the files it names. That is deliberate - it lets the full manifest history stay pinned forever (it is tiny) while revoked file bytes are dropped.
 
-### Event shape
+## Head
+
+The unit of publication. Every publish creates a new head; the head is what the pointer names and what consumers verify.
 
 ```json
 {
-  "id": "<sha256 of canonical event-form, hex>",
-  "kind": 31063,
-  "pubkey": "<32-byte secp256k1 x-only pubkey, hex>",
-  "created_at": 1717527612,
-  "tags": [
-    ["d", "<platform>:<creator_id>:<post_id>:0"],
-    ["x", "<sha256-hex-of-file>"],
-    ["size", "245760"],
-    ["m", "image/jpeg"],
-    ["filename", "post123_image.jpg"],
-    ["magnet", "magnet:?xt=urn:btih:<sha1-hex-of-info-dict>&dn=..."],
-    ["platform", "<source-extractor-id>"],
-    ["creator", "<source-handle>"],
-    ["creator_id", "<source-id>"],
-    ["post_id", "<post-id>"],
-    ["post_title", "March art dump"],
-    ["posted_at", "2026-03-14T10:00:00Z"],
-    ["tier", "subscriber"]
-  ],
-  "content": "post body text, if any. plain text or markdown.",
-  "sig": "<128-hex-char Schnorr signature>"
+  "schema": 1,
+  "version": 42,
+  "root": "bafy...",
+  "prev": "bafy...",
+  "published_at": "2026-07-05T12:00:00Z",
+  "pubkey": "<32-byte ed25519 public key, hex>",
+  "sig": "<64-byte ed25519 signature, hex>"
 }
 ```
 
-### Required tags
+- `schema` - manifest format version, fixed at 1. A breaking change bumps it.
+- `version` - monotonically increasing integer, +1 per publish.
+- `root` - CID of the root index.
+- `prev` - CID of the previous head, `null` for the first publish. Heads form a hash-linked chain: anyone pinning old heads holds a verifiable history of every version of the archive, including every takedown. This chain is the transparency log; there is no separate one.
+- `pubkey` - the board's ed25519 public key, and the board's identity.
+- `sig` - signature over the canonical form.
 
-- `d` - the **replaceable identifier**. Format `<platform>:<creator_id>:<post_id>:<file_index>` where `file_index` is `0` for single-file posts. Drives NIP-33 dedup: relays keep only the latest event per `(pubkey, kind, d)` triple, which lets a contributor update or replace their own manifest cleanly.
-- `x` - sha256 of the file bytes, lowercase hex (no `sha256:` prefix; Nostr convention is bare hex).
-- `size` - file size in bytes as a decimal string.
-- `m` - MIME type from the file's magic bytes, not extension.
-- `magnet` - BitTorrent v1 magnet link, full URI. Format: `magnet:?xt=urn:btih:<sha1-of-bencoded-info-dict>&dn=<filename>&tr=...`. The infohash is sha1, what BT v1 uses and what librqbit produces when it creates the torrent. The `x` tag above is sha256 of the file bytes and is independent of the infohash; the two coexist (one identifies the torrent the board's gateway joins, the other identifies the file content for dedup).
+### Signing
 
-  Torrent construction is deterministic so that independent contributors of the same file land in the same swarm instead of forking it: single-file torrent, info-dict name = `<sha256-of-file-bytes>.<ext>` (extension lowercased, `jpeg` normalized to `jpg`, omitted when the source file has none), piece length fixed at 1 MiB (1048576 bytes). Same bytes -> same info dict -> same infohash on every client.
+Serialize the head without the `sig` field as canonical JSON: UTF-8, object keys sorted bytewise, no insignificant whitespace. Sign the bytes with the board's ed25519 key, hex-encode into `sig`. The head holds only strings and integers by design, so canonicalization needs no float or unicode-normalization rules.
 
-  These construction parameters are frozen protocol constants (`PIECE_LENGTH` and the staged-name scheme in `bakemono-torrent`). Any client change MUST reproduce them exactly: a different piece length, name, or any extra info-dict field changes the infohash, splits contributors of the same file into disjoint swarms that cannot share peers, and silently breaks cross-client dedup. Torrents created before this rule existed (librqbit defaults, original filename) stay valid; clients keep seeding them alongside the deterministic torrent until their manifests are re-published.
+### Verification
 
-  Boards treat manifests sharing an `x` value as interchangeable at the gateway: if the requested torrent's swarm is dead, the gateway may serve the same bytes from a sibling manifest's torrent. This trusts the `x` a manifest claims, so the fallback pool MUST be limited to manifests that passed local moderation and carry no takedown; a manifest lying about `x` could otherwise substitute wrong bytes under a content-addressed URL. Byte-level verification at the gateway is a future hardening.
-- `platform` - lowercase identifier matching the source extractor name. Clients SHOULD use the gallery-dl extractor identifier for interoperability. Any non-empty lowercase string is valid; indexers MUST treat unknown values as opaque.
-- `creator` - human-readable source handle.
-- `creator_id` - source-specific creator identifier.
-- `post_id` - source-specific post identifier.
+Consumers (keeper tooling, peer boards, `bakemono restore`) accept a head only if:
 
-### Optional tags
+1. `sig` verifies against `pubkey` over the canonical form.
+2. `pubkey` equals the key already trusted for this board. Keys are exchanged out of band (or learned from a trusted board's `peers` list); the pointer channels are untrusted transport.
+3. `version` is strictly greater than the last version accepted from this key. This rejects replay of an older, validly-signed head.
 
-- `filename` - original filename if known.
-- `post_title` - title of the source post.
-- `posted_at` - ISO 8601 timestamp of when the source post was published.
-- `tier` - `free`, `subscriber`, or `unknown`. Whether the source content required an authenticated subscription.
-- `t` - free-form topic tags per NIP-12. Multiple `t` tags allowed. E.g., `["t", "furry"]`, `["t", "art"]`.
-- `thumb` - inline thumbnail as a base64 `data:` URL. Only for very small previews (target a few KB). Lets a board render a placeholder with zero swarm fetch. See Thumbnails below.
-- `thumb_x` - sha256 of a separately-seeded thumbnail file, used when the preview is too large to inline. Same encoding as `x`.
-- `thumb_magnet` - magnet for the thumbnail referenced by `thumb_x`. The thumbnail seeds as its own tiny torrent, so a board can preview without ever fetching the full-resolution file.
+## Root
 
-### Content field
+The index of the archive at one version.
 
-The `content` field is the source post's body text, plain or markdown. Empty string if the source post has no body.
-
-## Thumbnails
-
-Previews are generated client-side by the desktop app at scrape time, never by the board. After hashing the original file the app shells out to a bundled ffmpeg to make one downscaled JPEG frame (longest side ~400px) - a single frame for images and animated GIFs, a poster frame a second in for video - and attaches it one of two ways:
-
-- A seeded preview is its own small file, referenced by `thumb_x` (sha256) + `thumb_magnet`. It joins the swarm like any other file, so previews stay decentralized and survive the original's seeders going away. This is what v0 produces.
-- A tiny preview (a few KB) can instead go inline in the `thumb` tag as a base64 `data:` URL, rendered by a board with no swarm activity at all. The tag exists for this but v0 does not emit it.
-
-A board therefore never pulls the full-resolution file just to fill a grid of previews; the full file is fetched only when a user actually opens it. Thumbnails are immutable and content-addressed like everything else, so identical previews dedupe by hash
-
-Signing follows Nostr's standard NIP-01. No custom canonicalization, no `serde_jcs`.
-
-1. Build a JSON array: `[0, pubkey, created_at, kind, tags, content]` with no insignificant whitespace, UTF-8 encoded.
-2. sha256 the bytes. The result is the event `id`, lowercase hex.
-3. Sign the 32-byte id with the contributor's secp256k1 private key using BIP-340 Schnorr signatures. The signature is 64 bytes, hex-encoded.
-
-In rust this is one call via the `nostr` crate:
-
-```rust
-use nostr::{EventBuilder, Keys, Kind, Tag};
-
-let keys = Keys::generate();
-let event = EventBuilder::new(Kind::Custom(31063), content)
-    .tags(tags)
-    .sign(&keys)
-    .await?;
+```json
+{
+  "shards": {
+    "patreon:12345": { "cid": "bafy...", "posts": 210, "bytes": 5203942342 },
+    "fanbox:9876":   { "cid": "bafy...", "posts": 34,  "bytes": 120394234 }
+  },
+  "revoked": [
+    { "cid": "bafy...", "sha256": "<hex>", "reason": "dmca-us", "revoked_at": "2026-06-27T20:00:00Z" },
+    { "creator": "patreon:666", "reason": "csam", "revoked_at": "2026-06-01T00:00:00Z" }
+  ],
+  "peers": [
+    { "name": "board.example", "pubkey": "<hex>", "pointer": "https://board.example/head.json" }
+  ]
+}
 ```
+
+- `shards` - keyed by `<platform>:<creator_id>`. A publish rewrites only shards whose content changed; an unchanged shard keeps its CID, so keepers and peer boards fetch only the delta.
+- `revoked` - content removed on purpose, as opposed to merely absent. Each entry carries `reason`, `revoked_at`, and at least one target: `cid` (one file), `sha256` (same file by byte hash), `post` (`platform:creator_id:post_id`), or `creator` (`platform:creator_id`). `reason` is free-form with conventional values: `dmca-us`, `eu-court-order`, `csam`, `spam`, `wrong-content`. The list is append-only across versions.
+- `peers` - other boards this board knows and trusts enough to name. This is the discovery gossip: importing one board's manifest teaches you about others.
+
+## Shard
+
+All archived posts of one creator on one platform.
+
+```json
+{
+  "platform": "patreon",
+  "creator_id": "12345",
+  "creator": "somehandle",
+  "posts": [
+    {
+      "post_id": "98765",
+      "title": "March art dump",
+      "body": "post body text, plain or markdown",
+      "posted_at": "2026-03-14T10:00:00Z",
+      "tier": "subscriber",
+      "files": [
+        {
+          "cid": "bafy...",
+          "sha256": "<hex of the raw file bytes>",
+          "size": 245760,
+          "mime": "image/jpeg",
+          "filename": "post123_image.jpg",
+          "thumb": "bafy..."
+        }
+      ]
+    }
+  ]
+}
+```
+
+- `cid` - the file, added with the frozen parameters below.
+- `sha256` - hash of the raw bytes. Independent of the CID (a chunked file's CID is a DAG root, not the byte hash). Kept for dedup across boards and for integrity checks outside IPFS.
+- `mime` - from magic bytes, not extension.
+- `thumb` - CID of the preview JPEG, generated at scrape time (longest side ~400px, a poster frame for video). Optional.
+- `tier` - `free`, `subscriber`, or `unknown`.
+
+Posts sort newest first. `body` is an empty string when the source post has none.
+
+## File addition parameters
+
+Same bytes MUST map to the same CID on every board, or cross-board dedup and revocation-by-CID silently break. Files are added with frozen parameters, protocol constants in `bakemono-core`:
+
+- CIDv1, base32 text encoding
+- raw leaves
+- sha2-256
+- fixed chunker `size-1048576` (1 MiB)
+- no wrapping directory, no filename in the DAG
+
+Any deviation forks the CID for identical bytes. Manifest JSON objects are added with the same parameters.
+
+## Pointer
+
+The head CID must be discoverable even when the board is down. Three redundant channels, all untrusted (the signature carries the trust):
+
+1. **HTTPS**: `GET https://<board>/head.json` returns the current head verbatim.
+2. **DNSLink**: `_dnslink.<board>` TXT record `dnslink=/ipfs/<head-cid>`, resolvable by any IPFS node without touching the board.
+3. **Cluster pinset**: the head is pinned, so every keeper holds the newest head their follower has synced. Disaster recovery is "ask any keeper".
+
+## Pinset
+
+What the cluster pins, i.e. what keepers replicate:
+
+- every file CID and thumbnail CID referenced by the current version
+- every shard, root, and head, including all historical ones (they are small JSON; keeping them preserves the transparency chain)
+- NOT the file CIDs of revoked content: those leave the pinset in the same publish that revokes them
+
+Because JSON references are not IPLD links, pinned historical shards do not re-anchor revoked bytes; the hashes remain auditable while the content is gone from every honoring node.
+
+## Revocation semantics
+
+Removing content from the archive:
+
+1. The entry disappears from its shard; the target lands in `revoked` with a reason.
+2. A new version publishes; the revoked CIDs leave the cluster pinset.
+3. The operator fleet and every follower unpin on their next sync; periodic GC frees the bytes.
+4. The board's gateway denylist gains the CID, so the gateway will not serve it even if some node still holds it.
+5. Peer boards see the new `revoked` entries on their next import and apply them per local policy. `csam` entries are applied unconditionally by every board; a board that refuses is dropped from `peers` lists.
+
+What revocation cannot do: force a node outside the cluster that pinned the CID independently to drop it. The manifest records intent; enforcement ends at the trust boundary, as in any open network.
 
 ## Identity
 
-Contributors are identified by their secp256k1 public key (32 bytes, x-only form per BIP-340).
+One ed25519 keypair per board. It signs heads and nothing else.
 
-- Generation: `Keys::generate()` from the `nostr` crate.
-- Storage: file in app data dir, mode 600. Optionally encrypted with a user passphrase (out of scope for MVP).
-- Export / backup: standard Nostr `nsec` format (bech32-encoded private key per NIP-19). Compatible with any Nostr client, so users can back up their identity in any Nostr-aware tool.
-- Hardware wallet support: secp256k1 is what Bitcoin uses. Hardware wallets that support BIP-340 Schnorr can hold Bakemono keys directly. Post-MVP convenience.
+- Storage: a file on the board host, mode 600, plus an offline backup. The key outliving the server is the whole recovery story, so back it up before first publish.
+- Losing the key stops publication permanently; already-published history remains valid and fetchable.
+- Rotation: publish a final head under the old key whose root `peers` entry names the new key, then re-establish trust with keepers and peer boards out of band.
 
-## Relays
-
-A relay is a server that accepts events, stores them, and serves them to subscribers. Bakemono manifests are published to **multiple relays simultaneously** to ensure durability.
-
-### What the reference instance runs
-
-- `nostr-rs-relay` (rust, MIT, by Greg Heartsfield) as a sidecar process colocated with the board. Exposed at `wss://relay.bakemono.app`.
-- The board's indexer connects to its own relay (`ws://localhost:8080`) AND to a configured list of public relays.
-
-### Default relay set for the desktop app
-
-The app ships with sensible defaults; users can edit the list. v0 default:
-
-- `wss://relay.bakemono.app` (ours)
-- `wss://relay.damus.io` (public, large)
-- `wss://nos.lol` (public, persistent)
-- `wss://relay.snort.social` (public)
-- `wss://nostr.wine` (public; we maintain a paid write account, free read)
-
-Every publish fans out to ALL configured relays. If our relay is down, the rest still receive the event. If a public relay is down, the rest still receive it. The publish operation succeeds as long as at least one relay accepts the event.
-
-### Relay protocol
-
-Standard Nostr WebSocket protocol per NIP-01:
-
-- **Publish**: client sends `["EVENT", <event_json>]`. Relay responds `["OK", <event_id>, true|false, "<message>"]`.
-- **Subscribe**: client sends `["REQ", "<sub_id>", <filter>, ...]`. Relay streams matching events, then `["EOSE", "<sub_id>"]` (end of stored events) and continues streaming new ones as they arrive.
-- **Close subscription**: client sends `["CLOSE", "<sub_id>"]`.
-
-### Indexer subscription filter
-
-The board's indexer pulls all Bakemono manifests with:
-
-```json
-["REQ", "bakemono-ingest", {"kinds": [31063], "since": <last_seen_unix>}]
-```
-
-Where `last_seen_unix` is the highest `created_at` the indexer has stored. The relay returns everything newer, plus streams new events in real time.
-
-## Replaceable event semantics
-
-Because we use kind 31063 (parameterized-replaceable per NIP-33), each unique `(pubkey, kind, d_tag)` triple is replaced by the most recent event with the same triple. This means:
-
-- A contributor can update their own manifest (e.g., re-scrape after the creator edited the post) by publishing a new event with the same `d` tag. Relays drop the old version.
-- A contributor cannot replace another contributor's manifest. The `pubkey` is part of the dedup key.
-- Two different contributors who both scraped the same post create two events with the same `d` content but different `pubkey`. Both events exist. Our indexer dedupes at the display layer by the file `x` (hash) tag.
-
-## Mod actions
-
-Mod actions are separate event kinds, signed by instance operators' keys (instances also hold secp256k1 keypairs and act as first-class Nostr identities).
-
-### Kind 31064: takedown
-
-Signed by an instance operator. Records that this instance has chosen to hide a specific event, hash, or pubkey.
-
-```json
-{
-  "kind": 31064,
-  "tags": [
-    ["d", "takedown:<target_type>:<target_value>"],
-    ["e", "<event_id>"],
-    ["reason", "dmca-us"],
-    ["applied_at", "2026-06-27T20:00:00Z"]
-  ],
-  "content": "optional human-readable explanation"
-}
-```
-
-Target is one of `e` (event id), `x` (file sha256), `i` (torrent infohash), `p` (contributor pubkey), `post` (`platform:creator_id:post_id`), or `creator` (`platform:creator_id`). An `i` takedown suppresses the bytes at the gateway for every manifest pointing at that swarm, so dedup-by-content cannot keep taken-down bytes reachable through a second manifest. The `reason` tag is a free-form string with conventional values: `dmca-us`, `eu-court-order`, `csam`, `spam`, `wrong-content`, etc
-
-### How peer instances apply mod actions
-
-Each instance's indexer subscribes to kinds 31064 from peer instance pubkeys it trusts (configurable). When it receives a takedown signed by a trusted peer, it applies the takedown to its own postgres index per local policy.
-
-`csam` and other categorically illegal categories are applied unconditionally by every instance, no operator runs without this. Instances that refuse to honor `csam` takedowns get dropped from peer trust lists.
-
-## NIPs we follow
-
-- **NIP-01** - basic protocol, events and relays
-- **NIP-11** - relay information document (relay capability discovery)
-- **NIP-12** - generic tag queries (the `t` tag for topic queries)
-- **NIP-19** - bech32-encoded entities (`nsec` / `npub` / `note` for user-facing keys and ids)
-- **NIP-33** - parameterized replaceable events (our kind 31063 lives in this range)
-- **NIP-65** - relay list metadata (clients publish their preferred relay set as a kind 10002 event)
+There are no user keys. Users do not publish; the board is the only writer of its manifest.
 
 ## Versioning
 
-- The Bakemono manifest kind is fixed at 31063 for v1 of the schema. Breaking changes introduce a new kind (e.g., 31066) and we publish to both for a transition period.
-- Tag additions within v1 must be ignorable by older indexers. No required new tags after launch.
-
-## Reserved kinds
-
-- **31065** is reserved for a future periodic transparency-log aggregate event (signed daily summary of an instance's mod actions). Not implemented in MVP; do not reuse for anything else
-
-## Reserved tags
-
-For future use; do not put unrelated data in these:
-
-- `collection` - parent collection / pack id
-- `replaces` - id of a specific event this supersedes for the same contributor, beyond `d` tag dedup
-- `lang` - content language (ISO 639-1)
-- `nsfw` - boolean string `true` / `false`, content rating hint for clients
+- New optional fields may appear in any object; consumers MUST ignore fields they do not know.
+- No new required fields within a schema version.
+- A breaking change bumps `schema`. A consumer seeing an unknown schema stops and reports rather than guessing

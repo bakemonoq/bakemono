@@ -1,200 +1,137 @@
 # Architecture
 
-Bakemono is built around one core idea: separate WHAT a file is from WHERE it lives, replicate the WHAT across many independent operators, and let the bytes flow peer to peer.
+Bakemono is built around one core idea: separate WHAT a file is from WHERE it lives, describe the whole archive in one signed structure, and let anyone replicate that structure with stock tools. One curated publisher per board, many independent replicators.
 
 ## The three layers
 
 ### 1. Content layer
 
-The actual file bytes. Lives in a classic BitTorrent swarm (TCP/uTP + DHT + trackers). Every file is addressed by its sha256 hash, so the file's identity is what it is, not where it lives. Any peer holding the bytes can serve them to any other peer, and a board joins the swarm to pull bytes it then re-serves to browsers over plain HTTP. The content layer has no central server, no CDN, no single point of failure. Taking down any host, instance, or the project's primary domain does not affect content availability as long as at least one peer is seeding.
+The file bytes. Every file lives in IPFS, addressed by CID, so its identity is what it is, not where it lives. The nodes holding the bytes are the board's own Kubo, the operator's keeper fleet (a few hosts in different failure domains), and volunteer keepers. IPFS does not replicate anything by itself; replication is explicit and orchestrated by the next layer.
 
-### 2. Metadata layer
+### 2. Replication layer
 
-Signed Nostr events describing each file. A Bakemono manifest is a Nostr event of kind 31063 (in the NIP-33 parameterized-replaceable range) with tags carrying file hash, file size, MIME, magnet link, source platform, creator handle, post id, etc. The event is signed by the contributor's secp256k1 public key using Nostr's standard BIP-340 Schnorr scheme.
+IPFS Cluster maintains the pinset: the authoritative list of every CID that makes up the archive. The operator's own hosts run `ipfs-cluster-service` as trusted peers; volunteers run `ipfs-cluster-follow`, which syncs the pinset and pins everything in it automatically. When a publish adds CIDs they flow out to the whole fleet; when a takedown removes CIDs every follower unpins them on next sync. A keeper needs zero Bakemono software - Kubo plus cluster-follow, both stock (see `docs/KEEPERS.md`).
 
-Events are published to multiple Nostr relays simultaneously. They are NOT distributed peer-to-peer like the file bytes. The metadata layer is replicated horizontally across many independent relays, because metadata is small, must be queryable (search, browse, filter), and must allow per-board moderation decisions (DMCA, takedowns, abuse).
+### 3. Index layer
 
-An event does not include the file bytes. It points at them via the `x` tag (sha256) and the `magnet` tag.
+The manifest: a signed DAG of plain JSON in the same IPFS store (head -> root -> per-creator shards; full spec in `docs/PROTOCOL.md`). It is the source of truth for what the archive contains, the takedown ledger, and the federation format all at once. Because the manifest itself is pinned by the cluster, index durability equals content durability: any keeper can hand you the latest signed head, and the whole board rebuilds from it.
 
-### 3. Discovery layer
-
-Each Bakemono board runs an indexer that subscribes to a configured set of Nostr relays, ingests kind 31063 events, dedupes by event id and file hash, and stores everything in a local postgres for fast querying. On top of postgres, the board serves search/browse UI. Each operator picks their own technology, design, and moderation posture. There is no custom federation protocol because Nostr's relay-multi-publish model is itself the federation.
+The board's postgres is derived state - a query index built from the manifest, never the truth. Operational data (source cookies, scrape job history, view counters) is host-local and explicitly NOT part of the archive.
 
 ## File lifecycle
 
-The end-to-end flow of one file from scrape to view in another user's browser. Reference for the entire system.
+End-to-end flow of one file, from source to a viewer's browser.
 
-1. **Retrieve.** Alice runs the desktop app. She has an active subscription on a source platform and is signed in via the embedded webview. The app uses her local session to retrieve content she already has access to; credentials never leave her machine. It writes `post123_image.jpg` (240 KB) to her hard drive.
-
-2. **Hash and build event.** App computes sha256, gets `a3f8d2e1...`. Reads source metadata (source handle, post id, title, timestamp). Generates a small preview client-side (downscaled image, or a poster frame for video) and either inlines it in the `thumb` tag or seeds it as its own tiny file referenced by `thumb_x` + `thumb_magnet`, so a board can show previews without ever fetching the full file. Builds a Nostr event of kind 31063 with tags `x`, `size`, `m`, `magnet`, `platform`, `creator`, `post_id`, etc. Signs with Alice's secp256k1 private key using BIP-340 Schnorr (one call via the `nostr` rust crate).
-
-3. **Seed.** App creates a torrent from the file and seeds it over classic BT with librqbit, on a fixed listen port. Joins the DHT and announces to the magnet's trackers: "I have this infohash at my IP:port". Alice's computer is now a peer in the swarm for this file.
-
-4. **Publish to relays.** App fans out the event to its full configured relay set in parallel: our `wss://relay.bakemono.app`, plus public Nostr relays (relay.damus.io, nos.lol, nostr.wine, etc). Each relay verifies the signature, stores the event, and starts streaming it to its subscribers. NO bytes go to any relay, only the event.
-
-5. **Browse.** Bob lands on a Bakemono board and searches for a source handle. The board's postgres (filled by its indexer subscribing to the same relays Alice published to) returns Alice's event. Page renders with post title, text, image placeholder.
-
-6. **Preview.** The page renders `<img src="/t/{infohash}/f/0">`. The board's gateway resolves that infohash to the magnet in its catalog, joins the swarm with librqbit (finding Alice via the magnet's trackers and the DHT, or a pinned seeder), pulls the 240 KB, verifies each piece against the infohash, and streams the bytes back to Bob over HTTP with a long immutable cache header. Bob's browser did no P2P.
-
-7. **Persistence.** Bob's browser is a plain HTTP client and never joins the swarm. The file stays available as long as someone seeds it: Alice's daemon, any operator running a standard BT client, or the board itself once it has pulled the bytes (it uploads what it holds to other peers like any leecher). Nothing depends on the primary domain.
+1. **Adopt.** The operator adds a creator to the scrape list, with session cookies for the source platform (their own subscription, or cookies a contributor handed over).
+2. **Scrape.** The board's scrape worker invokes gallery-dl / yt-dlp server-side. Files land in a staging directory with source metadata sidecars. Because the board fetched the bytes from the source itself, provenance is first-party: there is no substituted-file problem and no per-file verification queue.
+3. **Add.** Each file is hashed (sha256), thumbnailed (ffmpeg, ~400px JPEG), and added to the local Kubo with the frozen parameters from `PROTOCOL.md`, yielding a CID. Metadata rows land in postgres.
+4. **Publish.** The publisher rebuilds the shards whose content changed, writes a new root, signs a new head (version+1, prev = old head), updates the pointer (head.json + DNSLink), and updates the cluster pinset: new CIDs in, revoked CIDs out.
+5. **Replicate.** Cluster peers and followers see the pinset change and fetch the new CIDs from the board's node (and from each other). Within minutes the file exists on every keeper.
+6. **Browse.** A viewer hits the board's web UI (axum + maud over postgres). The grid renders thumbnails, the post page renders `<img src="/f/{cid}">` / `<video>`.
+7. **Serve.** The `/f/{cid}` route checks the catalog and the denylist, then proxies the local Kubo gateway (`Gateway.NoFetch=true`, so only local blocks are ever served). `Range` passes through; the browser does no P2P and needs no connectivity to anything but the board. A CDN can sit in front; every URL is immutable.
+8. **Persist.** The file stays available as long as any node pins it. The board host dying does not remove it from the fleet; every keeper serves it to any IPFS peer, and a resurrected board re-pins everything from them.
 
 ## Code layout
 
-The repo is a single Cargo workspace with three rust crates:
+Single Cargo workspace, two crates:
 
 ```
 Bakemono/
-  Cargo.toml              # workspace root
   crates/
-    bakemono-core/        # shared library crate
-      src/
-        events/           # kind 31063 manifest, kind 31064 takedown
-        tags.rs           # tag schema constants and helpers
-        validation.rs     # event well-formedness checks beyond Nostr's base
-        protocol.rs       # kind constants, version constants
-    bakemono-board/       # binary crate (the web instance)
-      src/
-        main.rs
-        web/              # axum routes, maud SSR pages
-        indexer/          # subscribes to relays, ingests events into postgres
-        db/               # sqlx queries
-        cache/            # warm cache for popular files
-        mod_queue/        # first-seen-pubkey gating, takedown application
-        ops_keys/         # instance keypair for signing kind 31064 takedowns
-    bakemono-app/         # binary crate (Tauri desktop client)
-      src/
-        main.rs           # Tauri shell + GUI commands
-        daemon/           # background: scrape queue, relay publisher, seeding
-        scraper/          # gallery-dl / yt-dlp sidecar invocation
-        seeder/           # classic-BT seeding via bakemono-torrent (librqbit)
-        identity/         # local secp256k1 keypair management
-        relays/           # default relay list, user-configured overrides
+    bakemono-core/     # manifest types (head/root/shard), canonical JSON, ed25519
+                       # signing, frozen add parameters. Pure logic, zero I/O.
+    bakemono-board/    # the `bakemono` binary
+      serve            #   web UI, scrape worker, publisher, gateway proxy
+      scrape           #   one-off scrape of a creator into the archive
+      ingest           #   import a directory of already-scraped files + sidecars
+      restore          #   rebuild postgres + pinset from a head CID
   docs/
 ```
 
-Alongside the rust crates:
+`serve` is the only long-running process. `scrape`/`ingest` exist for backfills without a running board; `restore` exists because on the day it is needed there is no web UI to click.
 
-- `nostr-rs-relay` (rust binary) sits next to the board as a sidecar, exposing `ws://localhost:8080` to the indexer.
-- The torrent engine is `librqbit`, used as a rust library through the `bakemono-torrent` crate: the desktop daemon seeds scraped files, the board runs it leech-only behind the HTTP gateway. No Node, no separate seeder process.
-- `gallery-dl` (and `ffmpeg` for thumbnails) run as Tauri sidecar binaries in the desktop app.
-
-`bakemono-core` is the contract. If a type or routine ends up in both `bakemono-app` and `bakemono-board`, it belongs in core. Keeping I/O out of core means the event-shaping logic stays trivially unit-testable and the workspace builds quickly.
+Alongside, on the board host: postgres, Kubo, `ipfs-cluster-service`. On the operator's other keeper hosts: Kubo + `ipfs-cluster-service` (trusted peers). Volunteers: Kubo + `ipfs-cluster-follow`.
 
 ## Component layout
 
 ```
-+---------------------+
-| Alice's machine     |
-|---------------------|
-| bakemono-app GUI    |
-| bakemono-daemon     |
-|   scraper           |
-|   event signer      |
-|   librqbit seeder --+--- classic BT (TCP/uTP + DHT + trackers) ---+
-|   relay publisher   |                                             |
-+---------+-----------+                                             v
-          |                                          +--------------------------+
-          | WebSocket EVENT publish (fan out)        |     BitTorrent swarm      |
-          v                                          +------------+-------------+
-+-------------------------+  +-------------------------+          ^
-| wss://relay.bakemono... |  | wss://relay.damus.io    | ...      | gateway pulls
-| nostr-rs-relay sidecar  |  | (public Nostr relay)    |          | (librqbit, leech-only)
-+-----------+-------------+  +-----------+-------------+           |
-            ^                            ^                         |
-            |  WebSocket REQ subscribe   |                         |
-            |  {"kinds":[31063],...}     |                         |
-+-----------+----------------------------+-------------------------+
-| bakemono-board                                                  |
-|-----------------------------------------------------------------|
-|  Indexer (subscribes to many relays) -> Postgres (searchable)   |
-|  Torrent -> HTTP gateway (librqbit)                             |
-|  Mod queue + takedown signer                                    |
-+--------------------------------+--------------------------------+
-                                 | HTTP (bytes + Range, immutable cache)
-                                 v
-                           Bob's browser  (<img>/<video>, no P2P)
++----------------------------------------------+
+| board host                                   |
+|----------------------------------------------|
+| bakemono serve                               |
+|   axum web UI  <- postgres (derived index)   |
+|   scrape worker (gallery-dl / yt-dlp)        |
+|   publisher (shards, head, pointer, pinset)  |
+|   /f/{cid} proxy -> local Kubo gateway       |
+| kubo (NoFetch, denylist)                     |
+| ipfs-cluster-service (trusted peer)          |
++---------------------+------------------------+
+                      | cluster pinset sync + bitswap
+        +-------------+--------------+
+        v                            v
++------------------+       +----------------------+
+| operator keeper  |  ...  | volunteer keeper     |
+| kubo + cluster-  |       | kubo + ipfs-cluster- |
+| service (trusted)|       | follow               |
++------------------+       +----------------------+
+
+viewer's browser -> board web UI + /f/{cid} over plain HTTP (Range, immutable cache)
+peer board       -> GET /head.json, verify sig, import shards, apply revoked
 ```
 
-## NAT and connectivity
+## Moderation and takedowns
 
-Classic BitTorrent has no browser-style rendezvous, so cold-fill needs at least one reachable side. The browser never touches any of this - it is a plain HTTP client of the board's gateway, so a viewer needs no peer connectivity at all. The burden sits entirely between seeders and the gateway:
+Moderation happens in the manifest, not in the network. Two decisions exist:
 
-- **Seeder listen port**: the daemon/app seeds on a fixed TCP port (default 4250). A seeder behind NAT can still dial out to a reachable peer and upload, so if the board's gateway port is open, the NAT'd seeder connects to it and serves.
-- **Gateway listen port**: the board opens `BAKEMONO_GATEWAY_PORT` (default 4240) so NAT'd seeders can reach it. This cannot go through an HTTP-only proxy like Cloudflare; it needs a direct port-forward.
-- **Peer pinning**: the gateway can be handed explicit `ip:port` seeders (`BAKEMONO_GATEWAY_PEERS`) to dial directly. The reliable path on a LAN (public trackers hand back the public IP and rarely hairpin two peers behind one NAT) or to a known seedbox.
-- **DHT + trackers**: discovery for everyone else. The magnet carries the trackers; the session also runs the DHT.
+1. **What gets in.** The only ingestion path is the board's own scrape worker, so admission control is source-level: which platforms, which creators. There is no upload endpoint, no per-file review queue, no first-seen-contributor gating - those defended against untrusted writers, and there are none.
+2. **What comes out.** A takedown removes the entry from its shard, appends the target to `revoked` with a reason, publishes a new version, and drops the CIDs from the pinset. From there it is automatic: the fleet and every follower unpin, periodic GC frees the bytes, and the gateway denylist blocks serving the CID regardless. Full semantics in `PROTOCOL.md`.
 
-Realistic split: on a LAN or with a pinned seeder, connection is immediate. Across the internet, an operator seedbox with an open port (or the board's own open gateway port for home seeders to dial) covers the common case; a fully-firewalled seeder with no reachable counterpart is the degraded case, same as any classic torrent.
+Three surfaces, by reach:
 
-## Federation via Nostr
+- **Own fleet and followers**: takedown fully enforced, automatically. Distinctly stronger than the old BitTorrent model, where a third-party seeder could not be stopped.
+- **Peer boards**: see `revoked` on next import, apply per local policy. `csam` is applied unconditionally everywhere; refusing boards get dropped from `peers` lists.
+- **Independent IPFS nodes** that pinned a CID on their own: outside anyone's control, inherent to open networks. The signed history chain at least proves what was removed, when, and why.
 
-Bakemono federates over Nostr's relay model. There is no custom instance-to-instance sync protocol because Nostr already solves this.
+Every takedown is permanently auditable: heads chain by hash, and the chain stays pinned.
 
-### How it works
+## Federation between boards
 
-1. A contributor's desktop app holds a list of relays it publishes to (typically 5-10). When the app publishes a manifest, it fans out the event to ALL configured relays in parallel.
-2. Each relay independently stores the event. Relays do not coordinate with each other; they are independent stores connected only by clients that publish to several of them.
-3. A board's indexer subscribes to a list of relays (its own embedded relay + several public Nostr relays known to carry Bakemono kind 31063 events). The subscription filter is `{"kinds": [31063], "since": <last_seen_unix>}`. Relays stream matching events to the indexer in real time.
-4. The indexer stores received events in postgres for fast search/browse, deduping by event id and by `x` tag (file hash). The postgres store is just a cache; the source of truth is the union of events across all relays.
-5. Existing Nostr clients (Damus, Amethyst, snort, nostrudel) can also subscribe to kind 31063 directly. Their UX is degraded (they do not know our source-platform tags) but the data is reachable from outside our ecosystem.
+A board imports another board's archive with two facts: the peer's pubkey and a pointer URL.
 
-### Resilience
+1. Poll the pointer (HTTPS or DNSLink), verify the head signature and version monotonicity.
+2. Fetch the root, then only the shards whose CIDs changed since the last import; merge entries into the local postgres index.
+3. Apply the peer's `revoked` list per local policy.
+4. Optionally run `ipfs-cluster-follow` against the peer's cluster to co-host their bytes, not just their index. Without it, an importing board links or proxies to the origin for content it does not hold.
+5. The peer's `peers` list seeds discovery of further boards.
 
-- **Our relay goes down**: events already exist on every other relay in the default set. Contributors keep publishing to the rest. Our board's indexer keeps pulling from them. When our relay returns, it backfills from peer relays via standard Nostr re-sync.
-- **Our entire board goes down**: search/browse web UI dies (that piece is specifically our infrastructure). The data still exists across many relays. Anyone can spin up a clone board: point its indexer at the same relay set, subscribe from event time zero, postgres fills within minutes. The clone looks and feels identical.
-- **A public relay goes down**: events still exist on the others. Contributors' apps detect the failed relay and continue publishing to the rest. Our indexer drops that relay from its sources and keeps going.
-- **All relays in the default set go down simultaneously**: would require coordinated failure across many independent operators in many jurisdictions. Not a realistic single-point failure mode.
-- **Network partition between regions**: nothing breaks. Relays in each partition keep accepting events. When the partition heals, indexers eventually see events from the other side and the postgres stores reconverge. Signed events with deterministic ids make merge trivial; no conflict resolution needed.
+There is no push, no handshake protocol, no shared state - polling a signed pointer is the whole transport. Two boards importing each other converge without coordinating.
 
-### Mod actions across the federation
+## Connectivity notes
 
-Instance operators are themselves first-class Nostr identities, holding their own secp256k1 keypairs. They publish mod actions as kind 31064 events signed by the instance's pubkey. Other boards subscribe to kind 31064 from peer operator pubkeys they trust (configurable). When a board's indexer receives a takedown from a trusted peer, it applies the takedown to its own postgres index per local policy.
+- **Inside the fleet**: cluster peers and followers connect directly (the follower config carries bootstrap addresses; `Peering.Peers` keeps fleet nodes glued). Content transfer between keepers never depends on public DHT lookups.
+- **Public DHT**: best-effort extra reachability. At archive scale, reproviding every block is the classic Kubo pain, so nodes run `Reprovider.Strategy=roots` - only the CIDs manifests actually reference get announced. Delegated routing (IPNI) can come later.
+- **Ports**: a keeper works outbound-only; an open libp2p port (4001) makes it fetchable by strangers and is recommended, not required.
+- **Browsers**: plain HTTP clients of a board. No P2P, no connectivity requirements.
 
-A takedown does NOT delete the original event from any relay. It records that this instance has chosen to hide a particular event for a particular reason. Relays we do not operate are unaffected. The event lives wherever it was published.
+## Recovery
 
-This reflects the federated model: no single operator holds global authority over the network. Each operator's moderation decisions apply within their own boundary; other operators apply their own policies independently.
+Total loss of the board host:
 
-### Why this is better than the custom federation we originally specced
+1. Provision a new host: postgres, Kubo, cluster-service, the `bakemono` binary.
+2. Restore the board key from offline backup.
+3. Obtain the latest head CID: DNSLink if DNS survived, otherwise any keeper.
+4. `bakemono restore --head <cid>`: verifies the chain, rebuilds postgres from the shards, re-pins the pinset. Bytes flow back from keepers.
+5. Point DNS at the new host; `serve` resumes. Source cookies are re-added by hand (operational state, never in the archive).
 
-- Day-1 federation, not v1. Manifests are redundantly stored across many independent relays from the moment they are published.
-- No custom HTTP polling logic to write or maintain.
-- Existing infrastructure does the work: nostr-rs-relay handles event storage and subscription; the `nostr` rust crate handles client publishing and verification.
-- No relay is privileged, including ours; the protocol does not designate a coordinating authority.
-- Bakemono can be reconstituted by anyone, anywhere, by running an indexer pointed at the relay set. The archive does not depend on any single operator's continued participation.
+If at least one keeper survives, the archive survives. The board key backup is the only thing that must never be lost - and losing it stops future publishes, not existing content.
 
-## Identity and auth
+## What changed from the previous design and why
 
-Every user's app generates a secp256k1 keypair on first run (the Nostr standard). Private key never leaves the user's machine. Public key is the user's Nostr identity across the entire relay network, including but not limited to Bakemono boards. All manifests are signed by the pubkey. Kudos accrue to the pubkey. The user has the same identity on every relay and every board.
+Until mid-2026 Bakemono was a desktop app (Tauri) whose users scraped sources themselves, seeded files over classic BitTorrent, and published per-file manifests as signed Nostr events to public relays; boards indexed relays and gatewayed torrents to HTTP. It was retired for four reasons:
 
-User-facing key format is `nsec` (private) / `npub` (public) bech32-encoded per NIP-19, compatible with any Nostr-aware tool. Users can back up their identity in Damus, Amethyst, Alby, or any other Nostr client.
+- **Leecher economics.** Nearly all app users downloaded and closed the app; durable seeding came only from dedicated parties. The design now targets those parties (keepers) directly.
+- **Per-file torrents do not scale operationally.** One swarm per file meant hundreds of thousands of tiny swarms: per-infohash DHT announces, tracker scrapes, and torrent-client UIs that degrade past tens of thousands of entries. A pinset is one list managed by one daemon.
+- **Untrusted writers forced heavy verification.** User-published manifests meant byte-verification pipelines and moderation queues to catch substituted files. Server-side scraping makes provenance first-party and deletes that machinery.
+- **Remote takedown was impossible.** A commodity BT client seeds whatever it was given. Cluster followers honor pinset removals automatically, which the project's moderation posture requires.
 
-No accounts. No emails. No passwords. The keypair IS the account.
-
-Anti-spam:
-
-- New pubkeys: each board's indexer holds events from never-seen-before pubkeys in a small mod queue for human review.
-- After N approved events (configurable per board, default 3), the pubkey flows freely on that board.
-- Spam or abuse: the board publishes a kind 31064 takedown targeting the pubkey (`p` tag) and propagates to peer boards.
-- For higher-friction anti-spam, boards can require NIP-13 proof-of-work on incoming events or charge for write access via NIP-57 zaps. Out of scope for v0.
-
-## DMCA and takedowns
-
-The system has three independent surfaces, each with its own scope:
-
-1. **Board's postgres index**: operator marks the event hidden for its local users. Content no longer appears in search or browse on this board. Affects only this board.
-2. **Kind 31064 takedown event**: operator publishes a signed takedown to relays. Peer boards subscribing to this operator's takedowns receive it and decide whether to honor it based on jurisdiction. Relays themselves do not automatically delete the targeted event; they just carry the takedown alongside it.
-3. **Network-wide content layer**: not under any single operator's control. Independently-operated relays apply their own retention policies. The BitTorrent swarm persists as long as peers continue to seed. This is an inherent property of decentralized protocol design, shared by federated and peer-to-peer systems generally.
-
-Every takedown is itself a signed Nostr event, providing a built-in transparency log. Anyone can subscribe to kind 31064 from a given operator's pubkey and audit their takedown history.
-
-CSAM and other categorically illegal content is moderated proactively at every board regardless of takedown receipt. Boards that refuse to honor `csam`-reason takedowns get dropped from peer trust lists. Hash-based blacklists circulate as kind 31064 events with `x`-tag targets.
-
-## What this architecture buys us
-
-- **No central content host.** No single-IP-block failure mode that has historically taken centralized archives offline.
-- **No central metadata host either.** Manifests live on many independent Nostr relays from the first publish. The archive is genuinely distributed.
-- **Per-jurisdiction posture.** Each operator determines their own moderation posture in line with local legal obligations. Takedowns are per-board, not global. Relays operated by other parties are not bound by any single operator's decisions.
-- **Real browser previews.** The board's torrent -> HTTP gateway makes content viewable in any browser without a plugin, torrent client, or in-page P2P.
-- **User-owned identity.** Standard Nostr keypair stays with the user across boards and across the broader Nostr ecosystem. Backup-able in any Nostr client.
-- **Bring-your-own credentials.** Each user authenticates to source platforms with their own session; no shared credentials, no pooled access infrastructure.
-- **Outlives the founders.** Even if every Bakemono operator quits, the events on relays remain queryable. Anyone can spin up a new board and resurrect the experience
+Nostr went with it: with one publisher per board there is nothing multi-writer left to federate, and a signed manifest in IPFS carries the index, the takedown ledger, and the transparency log in one structure that keepers already replicate

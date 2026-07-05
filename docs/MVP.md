@@ -1,96 +1,61 @@
 # MVP
 
-The smallest demoable system. One reference board (with its own embedded relay), one desktop app, one user flow that works end-to-end.
+The smallest demoable system on the IPFS architecture: one board scraping server-side, publishing a signed manifest, replicated by keepers, restorable from them. This doubles as the migration plan off the BitTorrent + Nostr stack.
 
 ## Acceptance criteria
 
-A new user discovers Bakemono. They:
+1. Operator adds a creator and cookies; the scrape worker retrieves the posts; they appear on the board with thumbnails.
+2. A browser previews images and short video straight off `/f/{cid}` with `Range` working.
+3. The manifest head publishes and resolves through both `head.json` and DNSLink, and verifies against the board key.
+4. A second host running stock Kubo + `ipfs-cluster-follow` replicates the full pinset with no Bakemono software installed.
+5. A takedown removes a file: the next manifest version carries it in `revoked`, the follower unpins it, the gateway refuses to serve it.
+6. Kill the board host. On a fresh host, `bakemono restore --head <cid>` (head fetched from the follower) rebuilds postgres and re-pins everything; the board comes back complete.
 
-1. Visit the reference board, browse content, preview images and short video in-browser
-2. Read the "How to Contribute" page, download the desktop app for their OS
-3. Install the app, generate their Nostr keypair (saved locally as `nsec`), sign in to a source platform in the embedded webview
-4. Select the content they want to back up, click "Archive and Share"
-5. App retrieves, hashes, seeds, signs kind 31063 events and publishes them to the default relay set
-6. Their contributions appear on the board within seconds (the board's indexer is subscribed to the same relays)
-7. Their contribution byte counter (proto-kudos) ticks up
-
-If all seven steps work without intervention, MVP ships.
+If all six work without intervention, MVP ships.
 
 ## In scope
 
-### bakemono-board v0
-
-- `nostr-rs-relay` running as a sidecar at `wss://relay.bakemono.app`
-- Indexer that subscribes to a configured relay set (ours + 4-5 public Nostr relays) with filter `{"kinds": [31063]}`
-- Postgres schema for events (deduped by event id, indexed by file hash, pubkey, creator, platform, posted_at), mod queue, takedown ledger
-- Search and browse UI: by creator, by recent, by hash, by simple text search on post title and content
-- Post view page rendering `<video>` / `<img>` straight from the board's torrent -> HTTP gateway
-- Torrent -> HTTP gateway: joins the swarm for a cataloged infohash, streams the file over HTTP with `Range`
-- Mod queue UI for board operators to approve / reject events from first-seen pubkeys
-- Instance operator keypair management, kind 31064 takedown signing
-- Gateway BT peer port open so home seeders can dial the board (default 4240)
-
-### bakemono-app v0
-
-- Tauri shell, single binary per OS (Windows, macOS, Linux x86_64 + arm64)
-- Three internal pieces: daemon, GUI, tray icon
-- Daemon: rust core seeding scraped files over classic BT via librqbit (`bakemono-torrent`), plus DHT participation, scrape queue, Nostr event signer, multi-relay publisher
-- GUI: keypair management (`nsec` import/export), source platform login webview, content selection, archive progress, contribution stats, relay list editor
-- Tray: status, pause/resume seeding, open GUI, quit
-- Source extractor: gallery-dl (Python sidecar) wrapped for one source platform in v0, exposing one source at a time
-- Default relay set baked in: ours + relay.damus.io + nos.lol + relay.snort.social + nostr.wine
-- Auto-update via Tauri's updater (signed release artifacts)
-- Bandwidth limits configurable, default cap at 20 Mbit up
-- Daemon autostart configurable, default off (user opts in)
-
-### Common
-
-- `bakemono-core` with kind 31063 manifest + kind 31064 takedown event types, tag helpers, validation (see `PROTOCOL.md`)
-- Signing and verification via the `nostr` rust crate (secp256k1 Schnorr)
-- Classic BitTorrent via librqbit (`bakemono-torrent`): the desktop daemon seeds, the board runs a torrent -> HTTP gateway, and browsers fetch over plain HTTP
+- `bakemono-core`: manifest types (head / root / shard), canonical JSON, ed25519 signing, frozen add parameters (see `PROTOCOL.md`)
+- `bakemono-board` as the single `bakemono` binary: `serve`, `scrape`, `ingest`, `restore`
+- Scrape worker inside `serve`: gallery-dl / yt-dlp invocation, cookie store, ffmpeg thumbnails
+- Publisher: shard diffing, head signing, pointer update (head.json + DNSLink), cluster pinset update
+- Gateway proxy `/f/{cid}` to local Kubo with catalog check and denylist; `Gateway.NoFetch` posture
+- Kubo + `ipfs-cluster-service` deployment on the board host and 1-2 operator keeper hosts
+- Published follower config so volunteers can join with `ipfs-cluster-follow`
+- Takedown flow end to end (admin UI button -> revoked -> unpin -> denylist)
+- Migration of the existing catalog off BitTorrent (step 8 below)
 
 ## Out of scope for v0
 
-- Multiple Bakemono boards run by us (Nostr handles base federation already; we run one board, but events are durable across the relay network from day 1)
-- Kudos UI beyond a byte counter
-- Leaderboards, badges, flair, social features
-- IPFS for any layer
-- Volunteer seedbox tier
-- Mobile app (browse-only via web is fine)
-- Comments, votes, ratings
-- Tag taxonomy, PTR-style tag federation
-- Multi-source parallel retrieval (one at a time in v0)
-- Additional source platforms (the gallery-dl ecosystem supports many; exposed in v1)
-- Hardware wallet key storage
-- NIP-13 proof-of-work anti-spam, NIP-57 zap-gated writes
-- Backup torrents of the postgres snapshot (post-MVP, low effort)
+- Partial adoption by keepers (per-creator or per-collection pinsets)
+- Peer board import UI (the manifest format supports it; the polling/merge code comes with the second board)
+- Keeper stats, kudos, leaderboards
+- IPNI delegated routing
+- Mobile app, comments, votes, social features
+- Community uploads of any kind (permanent non-goal, not just deferred)
 
 ## Build order
 
-Loose sequence. Each step ships something demoable.
+Each step ships something demoable.
 
-1. **Workspace + `bakemono-core`.** Set up the Cargo workspace under `crates/`. Build `bakemono-core` first: kind 31063 manifest event type, kind 31064 takedown event type, tag schema constants and helpers, event validation, wrapping the `nostr` crate. Unit tests covering: event build + sign + verify roundtrip; tag schema validation (missing required tag is rejected); replaceable event semantics (same `(pubkey, kind, d)` triple replaces older event in a mock store); forged-signature rejection. This is the foundation everything else imports.
-2. **Tiny CLI smoke test.** Throwaway binary that uses `bakemono-core` to read a file from disk, build a kind 31063 event, sign it, and publish it to a single local relay over WebSocket. Throwaway tiny subscriber that connects to the same relay and prints received events. Proves the core works end-to-end against a real relay before any product code.
-3. **Wrapper around gallery-dl.** Retrieves one source into a folder. CLI only; Python sidecar invoked from rust. Output is just files on disk.
-4. **Retrieval pipeline producing signed events.** Wire steps 1-3 together: extractor outputs files, each file gets hashed, each gets a signed kind 31063 event built and published. CLI driver still.
-5. **Add the librqbit seeder (`bakemono-torrent`).** The rust daemon creates a torrent from each scraped file and seeds it over classic BT on a fixed listen port. The magnet uses `urn:btih:<sha1-hex>` and matches the `magnet` tag in the published event. Test on a single machine, then verify a second machine pulls the file over classic BT.
-6. **Build `bakemono-board` v0 skeleton.** Run `nostr-rs-relay` sidecar locally. Build the indexer that subscribes to the local relay with `{"kinds": [31063]}` and writes events into postgres. Build a stub axum + maud frontend with creator-list and post-view pages. Add the torrent -> HTTP gateway route and render `<img>` / `<video>` against it.
-7. **End-to-end loop demo.** Machine A runs the CLI: scrape, sign, publish to its local relay, seed. Machine B runs the board: indexer ingests events from a relay it subscribes to (could be A's), web UI shows them, the board's gateway pulls the file from A and streams it to the browser over HTTP. This is the milestone where the architecture is proven real.
-8. **Wrap CLI extractor in the Tauri GUI.** Add keypair management (generate, import via `nsec`, export, backup prompt), source platform webview, content picker, archive progress UI. Daemon shape emerges.
-9. **Add the daemon/tray split.** Background seeding and publishing continue after GUI is closed. Tray icon shows status. Autostart hooks for each OS.
-10. **Multi-relay publish in the app.** App publishes every event to its full configured relay set in parallel. Default list baked in; user can edit. Add public relays (damus, nos.lol, etc) and confirm the board's indexer (also subscribed to these) sees the events too, not just our relay.
-11. **Build the mod queue UI on the board.** First-seen-pubkey gating: events from a new pubkey are held in a queue, operator approves / rejects, future events from approved pubkeys flow through automatically.
-12. **Warm cache on the board.** Top-N viewed files cached on disk for instant preview. Eviction by least-recent-use.
-13. **Takedown signing and publishing.** Board operator UI for marking events hidden locally + publishing kind 31064 takedowns signed by the instance keypair. Tested by another instance (if we have one) honoring the takedown.
-14. **Polish, release builds, signed installers, auto-update, public launch.**
+1. **Rewrite `bakemono-core`.** Head/root/shard types, canonical JSON serializer, ed25519 sign + verify, frozen add-parameter constants. Unit tests: sign/verify roundtrip; canonical form byte-stability; version monotonicity rejection; unchanged shard -> unchanged CID (delta stability); unknown-field tolerance.
+2. **Kubo integration in the board.** Add pipeline over the Kubo HTTP API with the frozen parameters; `/f/{cid}` proxy route with catalog + denylist checks and `Range` passthrough. Demo: add a file by hand, view it through the board.
+3. **Fold scraping into the board.** Move the engine/scraper code from `bakemono-engine` / `bakemono-scraper` into `bakemono-board`; per-creator scrape jobs, cookie store in postgres, thumbnail generation. `bakemono scrape <creator>` works headless; `serve` runs the same jobs on schedule.
+4. **Publisher.** Build shards from postgres, diff against the previous version, sign and publish the head, write `head.json`, update DNSLink. Demo: `curl head.json | jq`, walk the DAG by hand.
+5. **Cluster.** `ipfs-cluster-service` on the board host + one operator keeper host; publisher updates the pinset through the cluster API. Demo: acceptance criterion 4.
+6. **Takedowns.** Admin action -> shard rebuild + revoked entry + pinset removal + denylist write. Demo: acceptance criterion 5.
+7. **`bakemono restore`.** Verify chain, rebuild postgres from shards, re-pin pinset. Demo: acceptance criterion 6 on a scratch host.
+8. **Catalog migration.** One-off: walk the existing postgres, pull each file's bytes from the warm cache or the still-alive torrent swarms, `ipfs add`, record CIDs, publish manifest version 1. Run while the BT stack still works; do not turn it off first.
+9. **Delete the old stack.** Remove `bakemono-app`, `bakemono-daemon`, `bakemono-torrent`, `bakemono-cli`, the relay sidecar and compose service, the Nostr types in core, the GUI release workflow. Rewrite the `/keepers` page for cluster-follow.
+10. **Deploy and launch.** Fleet on the prod box + keeper hosts, follower config published, keeper doc live.
 
 ## Definition of done per step
 
 - Code reviewed and merged on main
 - Integration test covering the happy path runs in CI
-- Manual smoke test on the relevant OS(es) before merging
+- Manual smoke test before merging
 - README updated for any new user-facing behaviour
 
 ## Team sizing assumption
 
-This MVP plan assumes 1-3 people, evenings and weekends. The sequencing is set up so each step is independently demoable, in case the team shrinks to one person mid-way
+1-3 people, evenings and weekends. Steps are sequenced so each is independently demoable in case the team shrinks to one person mid-way
