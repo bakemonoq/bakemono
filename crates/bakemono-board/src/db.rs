@@ -134,7 +134,7 @@ pub async fn list_creators(
                 cov.thumb, cov.mime
          FROM (
              SELECT platform, creator_id, MAX(creator) AS creator,
-                    COUNT(DISTINCT post_id) AS posts, COUNT(DISTINCT file_hash) AS files,
+                    COUNT(DISTINCT post_id) AS posts, COUNT(DISTINCT cid) AS files,
                     MAX(created_at) AS last_at
              FROM visible_content
              WHERE ($1 = '' OR creator ILIKE '%' || $1 || '%')
@@ -174,7 +174,7 @@ pub async fn creator_posts(
         "SELECT t.*, COALESCE(pv.views, 0) AS views FROM (
              SELECT DISTINCT ON (platform, creator_id, post_id)
                     platform, creator_id, post_id, creator, post_title, posted_at, created_at,
-                    mime, thumb, infohash,
+                    mime, thumb,
                     COUNT(*) OVER (PARTITION BY platform, creator_id, post_id) AS files
              FROM visible_content
              WHERE platform = $1 AND creator_id = $2
