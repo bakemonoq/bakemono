@@ -12,3 +12,7 @@ ipfs config --json Internal.Bitswap.BroadcastControl.Enable false
 
 # announce only the CIDs manifests reference, or reproviding drowns at archive scale
 ipfs config Reprovider.Strategy roots 2>/dev/null || ipfs config Provide.Strategy roots 2>/dev/null || true
+
+# the gateway serves only blocks this node already holds; the board's catalog is always pinned
+# locally, and a taken-down CID must not be fetchable from the network through us
+ipfs config --json Gateway.NoFetch true

@@ -9,7 +9,8 @@ FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates ffmpeg pipx \
     && rm -rf /var/lib/apt/lists/* \
-    && PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx install gallery-dl yt-dlp
+    && PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx install gallery-dl \
+    && PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx install yt-dlp
 COPY --from=builder /src/target/release/bakemono /usr/local/bin/bakemono
 ENV BAKEMONO_BIND=0.0.0.0:3000
 # scrape staging + gallery-dl download archive; mount a volume so re-scrapes stay incremental
