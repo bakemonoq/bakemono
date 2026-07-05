@@ -10,8 +10,13 @@ ipfs config --json Bitswap.ServerEnabled true
 # known fleet, so the reduction buys nothing - restore full broadcasts
 ipfs config --json Internal.Bitswap.BroadcastControl.Enable false
 
-# announce only the CIDs manifests reference, or reproviding drowns at archive scale
-ipfs config Reprovider.Strategy roots 2>/dev/null || ipfs config Provide.Strategy roots 2>/dev/null || true
+# announce only the CIDs manifests reference, or reproviding drowns at archive scale.
+# kubo >= 0.38 wants Provide.Strategy and FATALs if a deprecated Reprovider key lingers
+if ipfs config Provide.Strategy roots 2>/dev/null; then
+    ipfs config --json Reprovider '{}' 2>/dev/null || true
+else
+    ipfs config Reprovider.Strategy roots
+fi
 
 # the gateway serves only blocks this node already holds; the board's catalog is always pinned
 # locally, and a taken-down CID must not be fetchable from the network through us
