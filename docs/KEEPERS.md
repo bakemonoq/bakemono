@@ -4,7 +4,17 @@ How to donate disk and bandwidth so the archive outlives any single server. A ke
 
 You run two stock programs, no Bakemono software: [Kubo](https://docs.ipfs.tech/install/command-line/) and [ipfs-cluster-follow](https://ipfscluster.io/documentation/deployment/setup/#running-ipfs-cluster-follow). The board's `/keepers` page is the human front door: it shows the follower config URL, the current pinset size, and live fleet stats.
 
-## Quick start
+## Quick setup (Linux)
+
+One command on a fresh Linux box installs kubo + ipfs-cluster-follow, points a follower at the board, and runs both under systemd. Swap in the board you want to keep:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/bakemonoq/bakemono/main/scripts/keeper-setup.sh | sudo bash -s -- https://board.example
+```
+
+The script is [`scripts/keeper-setup.sh`](../scripts/keeper-setup.sh); it is idempotent, so re-running it is safe. The board's own `/keepers` page shows the same command pre-filled with its URL.
+
+## Manual setup
 
 ```sh
 # 1. install and configure kubo
@@ -21,7 +31,7 @@ ipfs-cluster-follow bakemono init https://board.example/follower.json
 ipfs-cluster-follow bakemono run
 ```
 
-That is the whole job. The follower syncs the pinset, Kubo fetches and pins every CID in it, and new publishes flow in automatically. Run both under systemd or in containers for anything long-lived; the `/keepers` page links ready-made unit files and a compose file.
+That is the whole job. The follower syncs the pinset, Kubo fetches and pins every CID in it, and new publishes flow in automatically. For anything long-lived run both under systemd, which is exactly what the quick-setup script wires up for you.
 
 ## What following means
 

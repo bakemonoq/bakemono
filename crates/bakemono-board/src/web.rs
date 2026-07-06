@@ -2035,16 +2035,4 @@ mod tests {
         assert_eq!(pretty_date("2026-03-14"), "Mar 14, 2026");
         assert_eq!(pretty_date("not a date"), "not a date");
     }
-
-    #[test]
-    fn dump_pages() {
-        let dir = "/tmp/scratch";
-        std::fs::write(format!("{dir}/style.css"), super::STYLE).unwrap();
-        std::fs::write(format!("{dir}/contribute.html"), super::render("contribute", super::contribute_body(None)).0).unwrap();
-        let mut h = axum::http::HeaderMap::new();
-        h.insert(axum::http::header::HOST, "bake.example".parse().unwrap());
-        h.insert("x-forwarded-proto", "https".parse().unwrap());
-        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
-        std::fs::write(format!("{dir}/keepers.html"), rt.block_on(super::keepers(h)).0).unwrap();
-    }
 }
