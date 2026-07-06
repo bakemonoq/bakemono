@@ -5,7 +5,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
-use maud::html;
+use maud::{html, PreEscaped};
 use serde::Serialize;
 use sqlx::postgres::PgPool;
 
@@ -17,13 +17,14 @@ use crate::web::AppState;
 // both fall away once other keepers hold the pinset
 const API_PAGE: i64 = 100;
 const GUIDE: &str = "https://docs.ipfs.tech/how-to/command-line-quick-start/";
-const NOTICE: &str = "Please don't scrape these pages. This API hands out IPFS CIDs, not bytes - fetch content with IPFS tooling instead. Any node or public gateway serves the same CID, it keeps load off this board, and the more you pull over IPFS the less any single host matters.";
+const NOTICE: &str = "Please don't scrape the browsing pages - use this API instead. It hands out IPFS CIDs, not bytes, so content comes straight from IPFS rather than through this board. Any node or public gateway serves the same CID, which keeps load off this server, and the more you pull over IPFS the less any single host matters";
 const ENDPOINTS: &[&str] = &[
     "/api/posts?source=&tier=&q=&sort=&dir=&page=",
     "/api/posts/{platform}/{creator_id}/{post_id}",
     "/api/creators?source=&sort=&dir=&page=",
     "/api/creators/{platform}/{creator_id}?tier=&page=",
 ];
+const ICON_WARN: &str = "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z'/><path d='M12 9v4'/><path d='M12 17h.01'/></svg>";
 
 pub fn routes() -> axum::Router<AppState> {
     use axum::routing::get;
@@ -65,27 +66,39 @@ fn page(head: Option<&str>, root: Option<&str>) -> Html<String> {
     crate::web::render(
         "API",
         html! {
-            h1.pagetitle { "API" }
-            div.aboutblock {
-                p { (NOTICE) }
-                p {
-                    "New to IPFS? "
-                    a href=(GUIDE) rel="noopener noreferrer" target="_blank" { "a short how-to" }
-                    ". In short: fetch a CID with " code { "ipfs get <cid>" } ", or open "
-                    code { "https://dweb.link/ipfs/<cid>" } " in a browser"
+            section.keepwrap {
+                div.contribintro {
+                    h1 { "API" }
+                    p { "A read-only JSON index of everything this board holds. Every file reference is an IPFS CID, not bytes - read the structure here and fetch content from any IPFS node" }
                 }
-            }
-            h3 { "Manifest" }
-            p {
-                "The whole signed index lives in IPFS as head -> root -> per-creator shards. Start from "
-                a href="/head.json" { "/head.json" } " and walk it; no per-post request touches this board"
-            }
-            @if let Some(h) = head { p { "head " code { (h) } } }
-            @if let Some(r) = root { p { "root " code { (r) } } }
-            h3 { "Endpoints" }
-            p { "Every file reference is a CID plus an " code { "ipfs://<cid>" } " URI; bytes come from IPFS, not from us" }
-            div.aboutblock {
-                @for e in ENDPOINTS { p { code { (e) } } }
+                div.warnbox {
+                    (PreEscaped(ICON_WARN))
+                    p { (NOTICE) }
+                }
+                div.panel {
+                    h3 { "New to IPFS?" }
+                    p {
+                        "Fetch a CID with " code { "ipfs get <cid>" } ", or open "
+                        code { "https://dweb.link/ipfs/<cid>" } " in a browser. Here is "
+                        a href=(GUIDE) rel="noopener noreferrer" target="_blank" { "a short how-to" }
+                    }
+                }
+                div.panel {
+                    h3 { "Manifest" }
+                    p {
+                        "The whole signed index lives in IPFS as head -> root -> per-creator shards. Start from "
+                        a href="/head.json" { "/head.json" } " and walk it; no per-post request touches this board"
+                    }
+                    @if let Some(h) = head { p.cidline { "head " code { (h) } } }
+                    @if let Some(r) = root { p.cidline { "root " code { (r) } } }
+                }
+                div.panel {
+                    h3 { "Endpoints" }
+                    p { "Every file reference is a CID plus an " code { "ipfs://<cid>" } " URI; bytes come from IPFS, not from us" }
+                    ul.list {
+                        @for e in ENDPOINTS { li { code { (e) } } }
+                    }
+                }
             }
         },
     )

@@ -1576,7 +1576,7 @@ const STYLE: &str = "
   --surface0:#313244; --surface1:#45475a; --surface2:#585b70;
   --overlay0:#6c7086; --overlay1:#7f849c;
   --text:#cdd6f4; --subtext1:#bac2de; --subtext0:#a6adc8;
-  --mauve:#cba6f7; --red:#f38ba8; --green:#a6e3a1;
+  --mauve:#cba6f7; --red:#f38ba8; --green:#a6e3a1; --yellow:#f9e2af;
   --accent:var(--mauve);
   color-scheme: dark;
 }
@@ -1850,6 +1850,11 @@ pre { white-space:pre-wrap; word-break:break-all; background:var(--mantle); bord
 .panel { background:var(--mantle); border:1px solid var(--surface0); border-radius:14px; padding:1.3rem 1.5rem; margin:1rem 0 }
 .panel h3 { margin:0 0 .5rem }
 .panel pre { margin:.5rem 0 0 }
+.panel .cidline { margin:.4rem 0 0; overflow-wrap:anywhere }
+.warnbox { display:flex; gap:.75rem; align-items:flex-start; margin:1rem 0; padding:.95rem 1.15rem; border-radius:12px;
+  background:color-mix(in srgb, var(--yellow) 12%, var(--mantle)); border:1px solid color-mix(in srgb, var(--yellow) 45%, var(--surface0)) }
+.warnbox svg { flex:none; width:20px; height:20px; color:var(--yellow); margin-top:.15rem }
+.warnbox p { margin:0; color:var(--subtext1) }
 .confirm { text-align:center }
 .confirm p { margin:.5rem 0 }
 .confirm .btn { margin-top:.7rem }
