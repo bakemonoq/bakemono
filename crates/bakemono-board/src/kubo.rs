@@ -3,7 +3,6 @@ use bakemono_core::manifest::{ADD_CHUNKER, ADD_CID_VERSION, ADD_HASH, ADD_RAW_LE
 
 pub struct Kubo {
     api: String,
-    gateway: String,
     // ipfs-cluster REST API; set = the fleet pinset is authoritative, unset = single-node board
     cluster: Option<String>,
     http: reqwest::Client,
@@ -13,7 +12,6 @@ impl Kubo {
     pub fn from_env() -> Self {
         Self {
             api: env_or("BAKEMONO_KUBO_API", "http://127.0.0.1:5001"),
-            gateway: env_or("BAKEMONO_KUBO_GATEWAY", "http://127.0.0.1:8080"),
             cluster: std::env::var("BAKEMONO_CLUSTER_API").ok().filter(|s| !s.is_empty()),
             http: reqwest::Client::new(),
         }
@@ -140,15 +138,6 @@ impl Kubo {
         Ok(())
     }
 
-    pub async fn fetch(&self, cid: &str, range: Option<&str>) -> Result<reqwest::Response> {
-        let mut req = self.http.get(format!("{}/ipfs/{cid}", self.gateway));
-        if let Some(range) = range {
-            req = req.header(reqwest::header::RANGE, range);
-        }
-        req.send()
-            .await
-            .with_context(|| format!("kubo gateway unreachable at {}", self.gateway))
-    }
 }
 
 fn env_or(key: &str, default: &str) -> String {

@@ -52,7 +52,7 @@ async fn serve() -> Result<()> {
 }
 
 // hand-feed one file into the catalog; unlike ingest it links no post, so the file is served
-// at /f/{cid} but never enters the manifest
+// at /ipfs/{cid} but never enters the manifest
 async fn cmd_add(paths: Vec<String>) -> Result<()> {
     if paths.is_empty() {
         bail!("usage: bakemono add <file>...");

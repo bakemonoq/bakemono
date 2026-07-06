@@ -343,7 +343,7 @@ async fn ingest_pair(pool: &PgPool, kubo: &Kubo, media: &Path, sidecar: &Path) -
     if let Some(reason) = db::sha_denied(pool, &sha256).await? {
         anyhow::bail!("revoked content ({reason}), refusing to re-ingest");
     }
-    // a thumb is archive content in its own right: it gets a catalog row so /f/{cid} serves it,
+    // a thumb is archive content in its own right: it gets a catalog row so /ipfs/{cid} serves it,
     // and later the pinset and shard entries carry it alongside the full file
     let thumb_cid = match thumb::generate(media, &mime).await {
         Some(bytes) => {

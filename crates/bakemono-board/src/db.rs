@@ -359,18 +359,6 @@ pub struct ManifestRow {
     pub cid: String,
 }
 
-// denylist beats catalog: a revoked cid must not serve even while a stale row still names it.
-// returns the mime the board recorded at ingest, never what kubo guesses
-pub async fn serveable_file(pool: &PgPool, cid: &str) -> Result<Option<String>> {
-    let mime = sqlx::query_scalar(
-        "SELECT mime FROM files
-         WHERE cid = $1 AND NOT EXISTS (SELECT 1 FROM denylist d WHERE d.cid = $1)",
-    )
-    .bind(cid)
-    .fetch_optional(pool)
-    .await?;
-    Ok(mime)
-}
 
 pub async fn insert_file(
     pool: &PgPool,

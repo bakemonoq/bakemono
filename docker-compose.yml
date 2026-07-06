@@ -52,7 +52,6 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgres://postgres:postgres@postgres:5432/bakemono?sslmode=disable}
       BAKEMONO_KUBO_API: ${BAKEMONO_KUBO_API:-http://kubo:5001}
-      BAKEMONO_KUBO_GATEWAY: ${BAKEMONO_KUBO_GATEWAY:-http://kubo:8080}
       BAKEMONO_CLUSTER_API: ${BAKEMONO_CLUSTER_API:-http://cluster:9094}
       # cluster config (mounted ro) that /follower.json is derived from, and the public multiaddr
       # keepers dial, e.g. /dns4/board.example/tcp/9096
