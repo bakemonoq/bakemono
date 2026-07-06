@@ -1016,6 +1016,7 @@ async fn keepers(headers: HeaderMap) -> Html<String> {
     let base = base_url(&headers);
     let script_url = REPO.replace("github.com", "raw.githubusercontent.com") + "/main/scripts/keeper-setup.sh";
     let quick_cmd = format!("curl -fsSL {script_url} | sudo bash -s -- {base}");
+    let quick_cmd_data = format!("curl -fsSL {script_url} | sudo bash -s -- {base} /mnt/keeper");
     render(
         "keepers",
         html! {
@@ -1028,6 +1029,8 @@ async fn keepers(headers: HeaderMap) -> Html<String> {
                     h3 { "Quick setup (Linux)" }
                     p.muted { "One command on a fresh Linux box. It installs IPFS and the cluster follower, wires up this board, and runs both under systemd:" }
                     pre { code { (quick_cmd) } }
+                    p.muted.small { "Storing the archive on a separate disk? Mount it first, then pass its path as a second argument so blocks and follower state land there instead of on the root disk:" }
+                    pre { code { (quick_cmd_data) } }
                     p.muted.small { "Want to read it first? Source: " a href=(script_url) rel="noopener noreferrer" target="_blank" { "keeper-setup.sh" } }
                 }
                 div.panel {

@@ -2,13 +2,14 @@
 # Bakemono keeper setup for Linux. Installs kubo + ipfs-cluster-follow from scratch,
 # points a follower at one board, and runs both under systemd. Safe to re-run.
 #
-#   curl -fsSL https://raw.githubusercontent.com/bakemonoq/bakemono/main/scripts/keeper-setup.sh | sudo bash -s -- https://board.example
+#   curl -fsSL https://raw.githubusercontent.com/bakemonoq/bakemono/main/scripts/keeper-setup.sh | sudo bash -s -- https://board.example [/data/dir]
+# pass a pre-mounted data dir as the 2nd arg to keep the archive (blocks + follower state) off the root disk
 set -euo pipefail
 
 BOARD_URL="${1:-${BAKEMONO_BOARD_URL:-}}"
 CLUSTER_NAME="${BAKEMONO_CLUSTER_NAME:-bakemono}"
 IPFS_USER="ipfs"
-IPFS_HOME="/var/lib/ipfs"
+IPFS_HOME="${2:-${BAKEMONO_IPFS_HOME:-/var/lib/ipfs}}"
 IPFS_PATH="${IPFS_HOME}/.ipfs"
 
 main() {
@@ -44,7 +45,8 @@ preflight() {
     i386|i686) ARCH="386" ;;
     *) die "unsupported architecture $(uname -m)" ;;
   esac
-  say "board $BOARD_URL, arch $ARCH"
+  case "$IPFS_HOME" in /*) ;; *) die "data dir must be an absolute path, got $IPFS_HOME" ;; esac
+  say "board $BOARD_URL, arch $ARCH, data $IPFS_HOME"
 }
 
 ensure_deps() {
@@ -114,10 +116,20 @@ init_ipfs() {
   # serve blocks to peers (recent kubo ships the bitswap server off) and answer wants without DHT luck
   as_ipfs env IPFS_PATH="$IPFS_PATH" ipfs config --json Bitswap.ServerEnabled true
   as_ipfs env IPFS_PATH="$IPFS_PATH" ipfs config --json Internal.Bitswap.BroadcastControl.Enable false
-  as_ipfs env IPFS_PATH="$IPFS_PATH" ipfs config --json Reprovider.Strategy '"roots"'
+  # kubo >= 0.38 renamed Reprovider.Strategy -> Provide.Strategy and FATALs if the deprecated key lingers
+  if as_ipfs env IPFS_PATH="$IPFS_PATH" ipfs config Provide.Strategy roots 2>/dev/null; then
+    as_ipfs env IPFS_PATH="$IPFS_PATH" ipfs config --json Reprovider '{}' 2>/dev/null || true
+  else
+    as_ipfs env IPFS_PATH="$IPFS_PATH" ipfs config Reprovider.Strategy roots
+  fi
   # your gateway must serve ONLY blocks you already hold - never fetch arbitrary CIDs from the network
   # on someone's behalf. this is what keeps it "our files only" and stops it becoming an open relay
   as_ipfs env IPFS_PATH="$IPFS_PATH" ipfs config --json Gateway.NoFetch true
+  # cap the datastore at ~90% of the disk holding the repo, so GC only kicks in near full instead of the 10G default
+  local total_kib max_gb
+  total_kib="$(df -Pk "$IPFS_HOME" | awk 'NR==2{print $2}')"
+  max_gb=$(( total_kib / 1024 / 1024 * 9 / 10 ))
+  [ "${max_gb:-0}" -ge 1 ] && as_ipfs env IPFS_PATH="$IPFS_PATH" ipfs config Datastore.StorageMax "${max_gb}GB"
   # nopfs reads denylists from here; the sync unit below keeps it current from the board's manifest, so
   # a taken-down CID is blocked at your gateway immediately, not only after GC frees the block. nopfs
   # only watches files that exist at daemon start, so seed an empty one now (the sync rewrites it live)
@@ -243,7 +255,7 @@ start_services() {
 
 wait_for_ipfs() {
   for _ in $(seq 1 30); do
-    if as_ipfs env IPFS_PATH="$IPFS_PATH" ipfs id >/dev/null 2>&1; then return; fi
+    if as_ipfs env IPFS_PATH="$IPFS_PATH" ipfs swarm peers >/dev/null 2>&1; then return; fi
     sleep 1
   done
   say "ipfs api slow to come up; the follower will retry on its own"
