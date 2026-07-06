@@ -474,9 +474,10 @@ pub fn sniff_mime(bytes: &[u8]) -> &'static str {
 }
 
 fn tier_of(meta: &Value) -> String {
-    // patreon: is_paid bool; fanbox: feeRequired (0 = free tier)
-    if let Some(paid) = meta.get("is_paid").and_then(Value::as_bool) {
-        return if paid { "subscriber" } else { "free" }.to_string();
+    // patreon: min_cents_pledged_to_view > 0 means patron-only (is_paid is a rare per-post billing
+    // flag, false on almost every post); fanbox: feeRequired (0 = free tier)
+    if let Some(cents) = meta.get("min_cents_pledged_to_view").and_then(Value::as_u64) {
+        return if cents > 0 { "subscriber" } else { "free" }.to_string();
     }
     if let Some(fee) = meta.get("feeRequired").and_then(Value::as_u64) {
         return if fee > 0 { "subscriber" } else { "free" }.to_string();
@@ -653,7 +654,8 @@ mod tests {
       "category": "patreon",
       "title": "Lana's Special Delivery ",
       "published_at": "2026-06-23T17:46:49.000+00:00",
-      "is_paid": true,
+      "is_paid": false,
+      "min_cents_pledged_to_view": 500,
       "content": "<p>body</p>",
       "creator": {"id": 8360519, "full_name": "BONI", "vanity": "bonifasko"}
     }"#;
