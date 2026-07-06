@@ -1010,10 +1010,13 @@ async fn keepers(headers: HeaderMap) -> Html<String> {
                         "ipfs config --json Bitswap.ServerEnabled true\n"
                         "ipfs config --json Internal.Bitswap.BroadcastControl.Enable false\n"
                         "ipfs config --json Reprovider.Strategy '\"roots\"'\n"
+                        "# gateway serves only blocks you hold, never fetches for strangers\n"
+                        "ipfs config --json Gateway.NoFetch true\n"
                         "ipfs daemon --enable-gc &\n\n"
                         "ipfs-cluster-follow bakemono init " (base) "/follower.json\n"
                         "ipfs-cluster-follow bakemono run"
                     } }
+                    p.muted.small { "The quick-setup script also installs a timer that keeps the takedown denylist current (see below); by hand, run periodically: " code { "ipfs cat /ipfs/$(ipfs cat " (base) "/head.json | jq -r .root | xargs -I@ ipfs cat /ipfs/@ | jq -r .denylist) > $IPFS_PATH/denylists/bakemono.deny" } }
                 }
                 section.faq {
                     h2 { "Questions" }
@@ -1032,6 +1035,11 @@ async fn keepers(headers: HeaderMap) -> Html<String> {
                             li { "Run kubo with " code { "--enable-gc" } " so unpinned files are actually freed from your disk" }
                             li { "Stopping is safe; nothing depends on your machine specifically" }
                         }
+                    }))
+                    (faq_item("How is a takedown enforced on my node?", html! {
+                        p { "Two layers, because they solve different problems. Unpinning drops the file from the pinset, so your node stops offering it and GC eventually frees the disk - but GC is not prompt (kubo only runs it near the storage cap), so the block can linger for a long time" }
+                        p { "So the block would still be reachable by its direct hash in the meantime. To stop that, your gateway runs " code { "NoFetch" } " (serves only what you hold, never fetches arbitrary hashes for others) and loads the board's signed takedown list into nopfs - a revoked hash returns 410 at once, independent of GC" }
+                        p { "That list lives in IPFS (referenced from the signed manifest), so it survives the board dying: the sync timer just pulls the latest one your node already replicates. This matters most for the categorically-illegal content the board actively moderates" }
                     }))
                 }
                 div.panel {

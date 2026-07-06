@@ -19,6 +19,9 @@ services:
       - "4001:4001/udp"
     volumes:
       - bakemono-ipfs:/data/ipfs
+      # nopfs auto-loads $IPFS_PATH/denylists/*.deny; the board writes bakemono.deny here so the
+      # gateway blocks revoked CIDs immediately, not just after GC
+      - bakemono-denylist:/data/ipfs/denylists
       - ./kubo-init.sh:/container-init.d/kubo-init.sh:ro
     restart: unless-stopped
 
@@ -72,12 +75,15 @@ services:
       # richer customization (mascot, welcome/about html, community links) lives in board.toml, mounted below;
       # deploy.sh ships ./board.toml and ./static from this dir. the env vars above still apply as a fallback
       BAKEMONO_CONFIG: /config/board.toml
+      # where the board writes bakemono.deny for the co-located Kubo's nopfs (shared volume below)
+      BAKEMONO_DENYLIST_DIR: /denylists
     ports:
       - "3000:3000"
     volumes:
       - bakemono-data:/data
       - bakemono-scrape:/scrape
       - bakemono-cluster:/cluster:ro
+      - bakemono-denylist:/denylists
       # board.toml + static assets shipped by deploy.sh; static_dir in board.toml should be /config/static
       - ./board.toml:/config/board.toml:ro
       - ./static:/config/static:ro
@@ -93,3 +99,4 @@ volumes:
   bakemono-cluster:
   bakemono-data:
   bakemono-scrape:
+  bakemono-denylist:

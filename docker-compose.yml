@@ -19,6 +19,8 @@ services:
       - "127.0.0.1:8081:8080"
     volumes:
       - bakemono-ipfs:/data/ipfs
+      # nopfs auto-loads $IPFS_PATH/denylists/*.deny; the board drops bakemono.deny here
+      - bakemono-denylist:/data/ipfs/denylists
       - ./defaults/kubo-init.sh:/container-init.d/kubo-init.sh:ro
     restart: unless-stopped
 
@@ -76,12 +78,14 @@ services:
       # richer customization (mascot, welcome/about html, accent, community links) lives in board.toml.
       # copy board.toml.example to ./board.toml, then uncomment BAKEMONO_CONFIG and the mount below
       # BAKEMONO_CONFIG: /config/board.toml
+      BAKEMONO_DENYLIST_DIR: /denylists
     ports:
       - "3000:3000"
     volumes:
       - bakemono-data:/data
       - bakemono-scrape:/scrape
       - bakemono-cluster:/cluster:ro
+      - bakemono-denylist:/denylists
       # - ./board.toml:/config/board.toml:ro
     depends_on:
       - postgres
@@ -95,3 +99,4 @@ volumes:
   bakemono-cluster:
   bakemono-data:
   bakemono-scrape:
+  bakemono-denylist:

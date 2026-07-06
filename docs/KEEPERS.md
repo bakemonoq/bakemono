@@ -30,11 +30,20 @@ if ipfs config Provide.Strategy roots 2>/dev/null; then
 else
   ipfs config Reprovider.Strategy roots
 fi
+# your gateway serves ONLY blocks you already hold - never fetches arbitrary hashes for strangers.
+# this keeps it "our files only" and, with the denylist below, blocks takedowns immediately
+ipfs config --json Gateway.NoFetch true
 ipfs daemon --enable-gc &
 
 # 2. install ipfs-cluster-follow and join
 ipfs-cluster-follow bakemono init https://board.example/follower.json
 ipfs-cluster-follow bakemono run
+
+# 3. keep the takedown denylist current (the quick-setup script installs a systemd timer for this).
+# nopfs reads $IPFS_PATH/denylists/*.deny; the board's signed list is referenced from the manifest:
+root=$(curl -fsSL https://board.example/head.json | jq -r .root)
+deny=$(ipfs cat /ipfs/$root | jq -r .denylist)
+[ -n "$deny" ] && ipfs cat /ipfs/$deny > $IPFS_PATH/denylists/bakemono.deny
 ```
 
 That is the whole job. The follower syncs the pinset, Kubo fetches and pins every CID in it, and new publishes flow in automatically. For anything long-lived run both under systemd, which is exactly what the quick-setup script wires up for you.
@@ -42,7 +51,7 @@ That is the whole job. The follower syncs the pinset, Kubo fetches and pins ever
 ## What following means
 
 - **You mirror everything.** The pinset is the whole archive; partial adoption (one creator, one platform) is on the roadmap but not built yet. Check the pinset size on `/keepers` before committing disk.
-- **Takedowns apply to you automatically.** When the board revokes content, its CIDs leave the pinset; your follower unpins them and your next GC frees the space. This is intentional: you are hosting a moderated archive, not a write-once mirror. The full reasoning and the transparency chain that lets you audit every removal are in `PROTOCOL.md`.
+- **Takedowns apply to you immediately, then clean up.** Unpinning removes revoked CIDs from the pinset, but GC is not prompt - kubo only frees blocks near the storage cap - so an unpinned block can stay on disk, and reachable by its direct hash, for a long time. So there are two layers: `Gateway.NoFetch` means your gateway only serves what you hold (never fetches hashes for strangers), and the board's signed denylist loaded into nopfs makes any revoked hash return 410 at once, independent of GC. The denylist lives in IPFS (referenced from the manifest), so it survives the board dying and the sync just pulls the copy you already replicate. This matters most for the categorically-illegal content the board actively moderates. The transparency chain that lets you audit every removal is in `PROTOCOL.md`.
 - **You also hold the index.** Manifest heads, roots, and shards are pinned alongside the content. In a disaster the operator fetches the latest head from you and rebuilds the board with `bakemono restore`.
 - **Stopping is safe.** Kill the processes whenever; nothing depends on your uptime individually. Rejoining resyncs from where the pinset stands.
 

@@ -40,6 +40,9 @@ async fn serve() -> Result<()> {
     let pool = db::connect(&database_url()).await?;
     let kubo = Arc::new(kubo::Kubo::from_env());
 
+    if let Err(e) = publish::sync_local_denylist(&pool).await {
+        tracing::warn!("local denylist sync failed: {e:#}");
+    }
     tokio::spawn(scrape::run_scheduler(pool.clone(), kubo.clone()));
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;

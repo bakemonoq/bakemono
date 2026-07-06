@@ -24,7 +24,9 @@ pub async fn publish_if_changed(pool: &PgPool, kubo: &Kubo) -> Result<Option<Hea
         kubo.pin_archive(&cid, &format!("shard {}", shard.key())).await?;
         root.shards.insert(shard.key(), ShardRef { cid, posts, bytes });
     }
+    let mut denied_cids = Vec::new();
     for (cid, sha256, reason, revoked_at) in db::revoked_entries(pool).await? {
+        denied_cids.push(cid.clone());
         root.revoked.push(RevokedEntry {
             cid: Some(cid),
             sha256,
@@ -32,6 +34,16 @@ pub async fn publish_if_changed(pool: &PgPool, kubo: &Kubo) -> Result<Option<Hea
             revoked_at,
             ..Default::default()
         });
+    }
+    // publish the machine-enforceable form of the takedowns: a nopfs `.deny` blob every fleet gateway
+    // fetches, so a revoked CID is blocked immediately instead of lingering until GC. its CID rides in
+    // the signed root, and the co-located Kubo gets it on disk now for instant local enforcement
+    if !denied_cids.is_empty() {
+        let deny = nopfs_denylist(&denied_cids);
+        write_local_denylist(&deny);
+        let deny_cid = kubo.add(deny.into_bytes(), "denylist").await?;
+        kubo.pin_archive(&deny_cid, "denylist").await?;
+        root.denylist = Some(deny_cid);
     }
 
     let root_cid = kubo.add(root.to_json()?, "manifest root").await?;
@@ -56,6 +68,41 @@ pub async fn publish_if_changed(pool: &PgPool, kubo: &Kubo) -> Result<Option<Hea
         "manifest published; DNSLink wants TXT dnslink=/ipfs/{head_cid}"
     );
     Ok(Some(head))
+}
+
+// write the current denylist to disk for the co-located Kubo on boot, so nopfs is correct after a
+// restart or a fresh denylists volume without waiting for the next publish
+pub async fn sync_local_denylist(pool: &PgPool) -> Result<()> {
+    let cids: Vec<String> =
+        db::revoked_entries(pool).await?.into_iter().map(|(cid, ..)| cid).collect();
+    if !cids.is_empty() {
+        write_local_denylist(&nopfs_denylist(&cids));
+    }
+    Ok(())
+}
+
+// nopfs `.deny` (v1): a header, then one `/ipfs/<cid>` rule per revoked CID. a gateway with this loaded
+// returns 410 for those paths regardless of whether the block is still on disk
+fn nopfs_denylist(cids: &[String]) -> String {
+    let mut out = String::from("version: 1\nname: bakemono\n---\n");
+    for cid in cids {
+        out.push_str("/ipfs/");
+        out.push_str(cid);
+        out.push('\n');
+    }
+    out
+}
+
+// drop the denylist where the co-located Kubo's nopfs reads it ($IPFS_PATH/denylists), so the board
+// host enforces takedowns the instant they publish, without waiting on the fleet sync
+fn write_local_denylist(content: &str) {
+    let Some(dir) = std::env::var("BAKEMONO_DENYLIST_DIR").ok().filter(|s| !s.trim().is_empty()) else {
+        return;
+    };
+    let path = std::path::Path::new(&dir).join("bakemono.deny");
+    if let Err(e) = std::fs::write(&path, content) {
+        tracing::warn!("writing local denylist {}: {e:#}", path.display());
+    }
 }
 
 // the whole new-stack takedown: denylist (gateway stops serving), unpin (GC frees bytes,

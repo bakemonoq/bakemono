@@ -67,13 +67,15 @@ The index of the archive at one version.
   ],
   "peers": [
     { "name": "board.example", "pubkey": "<hex>", "pointer": "https://board.example/head.json" }
-  ]
+  ],
+  "denylist": "bafy..."
 }
 ```
 
 - `shards` - keyed by `<platform>:<creator_id>`. A publish rewrites only shards whose content changed; an unchanged shard keeps its CID, so keepers and peer boards fetch only the delta.
 - `revoked` - content removed on purpose, as opposed to merely absent. Each entry carries `reason`, `revoked_at`, and at least one target: `cid` (one file), `sha256` (same file by byte hash), `post` (`platform:creator_id:post_id`), or `creator` (`platform:creator_id`). `reason` is free-form with conventional values: `dmca-us`, `eu-court-order`, `csam`, `spam`, `wrong-content`. The list is append-only across versions.
 - `peers` - other boards this board knows and trusts enough to name. This is the discovery gossip: importing one board's manifest teaches you about others.
+- `denylist` - CID of a [nopfs](https://github.com/ipfs-shipyard/nopfs) `.deny` blob listing every revoked CID as `/ipfs/<cid>` rules, machine-derived from `revoked`. Gateways in the fleet load it so a takedown is blocked at once (410) instead of lingering until GC frees the block. Omitted when nothing is revoked. It is pinned like a shard and signed transitively via the head, so it survives losing the board. `revoked` stays the human-readable, auditable record; `denylist` is its enforceable form.
 
 ## Shard
 
@@ -140,6 +142,7 @@ What the cluster pins, i.e. what keepers replicate:
 
 - every file CID and thumbnail CID referenced by the current version
 - every shard, root, and head, including all historical ones (they are small JSON; keeping them preserves the transparency chain)
+- the current `denylist` blob, so every keeper can enforce takedowns from a copy it already holds
 - NOT the file CIDs of revoked content: those leave the pinset in the same publish that revokes them
 
 Because JSON references are not IPLD links, pinned historical shards do not re-anchor revoked bytes; the hashes remain auditable while the content is gone from every honoring node.
@@ -151,7 +154,7 @@ Removing content from the archive:
 1. The entry disappears from its shard; the target lands in `revoked` with a reason.
 2. A new version publishes; the revoked CIDs leave the cluster pinset.
 3. The operator fleet and every follower unpin on their next sync; periodic GC frees the bytes.
-4. The board's gateway denylist gains the CID, so the gateway will not serve it even if some node still holds it.
+4. The publish rebuilds the `denylist` blob (referenced from the signed root) with the new CID. Every gateway in the fleet - board host, keepers - loads it into nopfs and returns 410 for that CID at once, without waiting for GC, since unpin alone leaves the block servable by its hash until GC runs (which kubo only does near the storage cap).
 5. Peer boards see the new `revoked` entries on their next import and apply them per local policy. `csam` entries are applied unconditionally by every board; a board that refuses is dropped from `peers` lists.
 
 What revocation cannot do: force a node outside the cluster that pinned the CID independently to drop it. The manifest records intent; enforcement ends at the trust boundary, as in any open network.

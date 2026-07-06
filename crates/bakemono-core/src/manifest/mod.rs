@@ -111,6 +111,11 @@ pub struct Root {
     pub revoked: Vec<RevokedEntry>,
     #[serde(default)]
     pub peers: Vec<Peer>,
+    // CID of the nopfs `.deny` blob built from `revoked`; every gateway in the fleet fetches and
+    // enforces it, so takedowns block access immediately instead of waiting on GC. absent when nothing
+    // is revoked. signed transitively via the head, so it survives losing the board
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denylist: Option<String>,
 }
 
 impl Root {

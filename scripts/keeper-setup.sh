@@ -20,6 +20,7 @@ main() {
   init_ipfs
   init_follower
   write_units
+  write_denylist_sync
   start_services
   done_message
 }
@@ -49,6 +50,7 @@ preflight() {
 ensure_deps() {
   need_cmd curl
   need_cmd tar
+  need_cmd jq
 }
 
 need_cmd() {
@@ -113,6 +115,12 @@ init_ipfs() {
   as_ipfs env IPFS_PATH="$IPFS_PATH" ipfs config --json Bitswap.ServerEnabled true
   as_ipfs env IPFS_PATH="$IPFS_PATH" ipfs config --json Internal.Bitswap.BroadcastControl.Enable false
   as_ipfs env IPFS_PATH="$IPFS_PATH" ipfs config --json Reprovider.Strategy '"roots"'
+  # your gateway must serve ONLY blocks you already hold - never fetch arbitrary CIDs from the network
+  # on someone's behalf. this is what keeps it "our files only" and stops it becoming an open relay
+  as_ipfs env IPFS_PATH="$IPFS_PATH" ipfs config --json Gateway.NoFetch true
+  # nopfs reads denylists from here; the sync unit below keeps it current from the board's manifest, so
+  # a taken-down CID is blocked at your gateway immediately, not only after GC frees the block
+  install -d -o "$IPFS_USER" -g "$IPFS_USER" "${IPFS_PATH}/denylists"
 }
 
 init_follower() {
@@ -163,6 +171,59 @@ WantedBy=multi-user.target
 UNIT
 }
 
+# a taken-down CID is unpinned fleet-wide, but stays servable from your gateway until GC frees the
+# block. this pulls the board's signed denylist (head -> root -> denylist CID, all in IPFS) into nopfs
+# so your gateway blocks it at once. if the board is gone there are no new takedowns, and the last
+# denylist you synced stays in place
+write_denylist_sync() {
+  say "writing denylist sync"
+  cat >/usr/local/bin/bakemono-denylist-sync <<SYNC
+#!/bin/sh
+set -eu
+BOARD_URL="${BOARD_URL}"
+export IPFS_PATH="${IPFS_PATH}"
+DENYDIR="\${IPFS_PATH}/denylists"
+mkdir -p "\$DENYDIR"
+head="\$(curl -fsSL "\${BOARD_URL}/head.json")" || exit 0
+root="\$(printf '%s' "\$head" | jq -r '.root // empty')"
+[ -n "\$root" ] || exit 0
+deny="\$(ipfs cat "/ipfs/\$root" | jq -r '.denylist // empty')" || exit 0
+[ -n "\$deny" ] || exit 0
+tmp="\$(mktemp)"
+if ipfs cat "/ipfs/\$deny" >"\$tmp" && [ -s "\$tmp" ]; then
+  mv "\$tmp" "\${DENYDIR}/bakemono.deny"
+else
+  rm -f "\$tmp"
+fi
+SYNC
+  chmod 0755 /usr/local/bin/bakemono-denylist-sync
+
+  cat >/etc/systemd/system/bakemono-denylist.service <<UNIT
+[Unit]
+Description=Sync Bakemono takedown denylist into nopfs
+After=ipfs.service
+Wants=ipfs.service
+
+[Service]
+Type=oneshot
+User=${IPFS_USER}
+ExecStart=/usr/local/bin/bakemono-denylist-sync
+UNIT
+
+  cat >/etc/systemd/system/bakemono-denylist.timer <<UNIT
+[Unit]
+Description=Refresh Bakemono denylist periodically
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+}
+
 start_services() {
   systemctl daemon-reload
   say "starting ipfs"
@@ -170,6 +231,9 @@ start_services() {
   wait_for_ipfs
   say "starting follower"
   systemctl enable --now ipfs-cluster-follow.service
+  say "enabling denylist sync"
+  systemctl enable --now bakemono-denylist.timer
+  systemctl start bakemono-denylist.service || true
 }
 
 wait_for_ipfs() {
@@ -186,9 +250,11 @@ done_message() {
 $(say "keeper is up")
   systemctl status ipfs ipfs-cluster-follow    # health
   ipfs-cluster-follow ${CLUSTER_NAME} list      # pinset the follower tracks
+  systemctl list-timers bakemono-denylist       # next denylist refresh
 
-Open port 4001 (TCP and UDP) so other peers can fetch from you. Removed content
-unpins automatically and is freed on the next GC
+Open port 4001 (TCP and UDP) so other peers can fetch from you. Your gateway is
+NoFetch (serves only what you hold) and loads the board's takedown denylist, so a
+revoked CID is blocked at once; it also unpins and is freed on the next GC
 MSG
 }
 
