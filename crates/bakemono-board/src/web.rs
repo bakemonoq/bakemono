@@ -718,8 +718,12 @@ fn carousel(files: &[db::ManifestRow]) -> Markup {
 async fn contribute() -> Html<String> {
     if crate::crypto::load_public_pem().is_none() {
         return render("contribute", html! {
-            h1 { "Contribute" }
-            p.muted { "Contributions are closed on this board right now" }
+            section.contribwrap {
+                div.contribintro {
+                    h1 { "Contribute" }
+                    p { "Contributions are closed on this board right now" }
+                }
+            }
         });
     }
     render("contribute", contribute_body(None))
@@ -727,32 +731,64 @@ async fn contribute() -> Html<String> {
 
 fn contribute_body(error: Option<&str>) -> Markup {
     html! {
-        h1 { "Contribute your subscriptions" }
-        p { "Paste the session cookie from a site you subscribe to. The board pulls every post you can reach and adds it to the archive for everyone. Your cookie is encrypted the moment it arrives and the archive never exposes it" }
-        @if let Some(e) = error { p.err { (e) } }
-        form.contribform method="post" action="/contribute" {
-            label { "Platform"
-                select name="platform" {
-                    @for p in crate::platform::live_platforms() {
-                        option value=(p.id) { (p.label) }
+        section.contribwrap {
+            div.contribintro {
+                h1 { "Contribute your subscriptions" }
+                p { "Paste one session cookie from a site you subscribe to. The board fetches every post you can already see and saves it to a shared archive - you never upload anything yourself, and your cookie is encrypted the moment it arrives" }
+            }
+            @if let Some(e) = error { p.err { (e) } }
+            form.contribform method="post" action="/contribute" {
+                label { "Platform"
+                    select name="platform" {
+                        @for p in crate::platform::live_platforms() {
+                            option value=(p.id) { (p.label) }
+                        }
                     }
                 }
+                label { "Session cookie value"
+                    input type="text" name="token" placeholder="paste the cookie value only" required autocomplete="off";
+                }
+                label.check { input type="checkbox" name="allow_autoimport" value="1" checked; span { "Keep importing my new posts every day " span.hint { "(stores the cookie encrypted)" } } }
+                label.check { input type="checkbox" name="allow_debug" value="1"; span { "Let the operator use my session to debug import problems" } }
+                button type="submit" { "Import my subscriptions" }
+                p.formnote { "Encrypted with RSA-4096 on arrival. The key that could unlock stored cookies stays offline, so a database breach can't expose it. Without daily import checked, the cookie is discarded right after the first run" }
             }
-            label { "Session cookie value"
-                input type="text" name="token" placeholder="paste the cookie value only" required autocomplete="off";
+            section.faq {
+                h2 { "Questions" }
+                (faq_item("How does it work?", html! {
+                    p { "Your browser proves you are subscribed with a small session cookie. You hand the board a copy, it signs in as you just long enough to download the posts you already have access to, and adds the files to an archive mirrored across many machines" }
+                    p { "The archive never contains your cookie - it is encrypted the instant it reaches the server and only ever used to fetch on your behalf" }
+                }))
+                (faq_item("What do I need to do?", html! {
+                    p { "Three things: pick the platform, paste the cookie value, press Import. No account, no upload, nothing to install" }
+                    p { "Leave \"keep importing my new posts\" checked if you want new posts pulled in automatically. Otherwise it is a one-time import and the cookie is thrown away" }
+                }))
+                (faq_item("How do I find my cookie?", html! {
+                    p { "Sign in to the site in your browser, then:" }
+                    ol {
+                        li { "Open developer tools (F12, or right-click and Inspect)" }
+                        li { "Go to Application (or Storage) -> Cookies -> the site's address" }
+                        li { "Copy the value of the cookie for your platform:"
+                            ul {
+                                @for p in crate::platform::live_platforms() {
+                                    li { (p.label) ": " code { (p.cookie_name) } }
+                                }
+                            }
+                        }
+                    }
+                    p.muted { "Paste only that value into the form above" }
+                }))
             }
-            label.check { input type="checkbox" name="allow_autoimport" value="1" checked; " Keep importing my new posts every day (stores the cookie encrypted)" }
-            label.check { input type="checkbox" name="allow_debug" value="1"; " Allow the operator to use my session for debugging import problems" }
-            button type="submit" { "Import" }
         }
-        h3 { "Where the cookie is" }
-        p { "Sign in to the site, open your browser's developer tools (F12), go to Application/Storage -> Cookies -> the site, and copy the value of:" }
-        ul.list {
-            @for p in crate::platform::live_platforms() {
-                li { (p.label) ": " code { (p.cookie_name) } }
-            }
+    }
+}
+
+fn faq_item(question: &str, body: Markup) -> Markup {
+    html! {
+        div.faqitem {
+            h3 { (question) }
+            (body)
         }
-        p.muted { "The value is used to fetch your paid posts, then discarded unless you opted into daily import. Encryption is RSA-4096; the key that could decrypt stored cookies is kept offline, so a database breach cannot expose them. Everything is at your own risk" }
     }
 }
 
@@ -804,11 +840,17 @@ async fn contribute_submit(
     spawn_import(&state, stored, platform.to_string(), token.to_string());
 
     render("contribute", html! {
-        h1 { "Thank you" }
-        p { "Your cookie checks out. Importing everything you are subscribed to now - it will appear in the archive shortly" }
-        @if allow_autoimport { p.muted { "Your cookie is stored encrypted and new posts will be imported daily" } }
-        @else { p.muted { "Your cookie was not stored; this was a one-time import" } }
-        p { a href="/" { "Back to the board" } }
+        section.contribwrap {
+            div.contribintro {
+                h1 { "Thanks!" }
+                p { "Your cookie checks out. The board is importing everything you are subscribed to now - it will show up in the archive shortly" }
+            }
+            div.panel.confirm {
+                @if allow_autoimport { p { "Your cookie is stored encrypted and new posts will be imported every day" } }
+                @else { p { "Nothing was stored - this was a one-time import" } }
+                p { a.btn href="/" { "Back to the board" } }
+            }
+        }
     }).into_response()
 }
 
@@ -852,31 +894,51 @@ async fn keepers(headers: HeaderMap) -> Html<String> {
     render(
         "keepers",
         html! {
-            h1 { "Become a keeper" }
-            p { "Keepers replicate this board's archive with two stock IPFS programs. No Bakemono software, no account. If this server dies, the archive is rebuilt from any keeper" }
-            h3 { "Quick start" }
-            pre { code {
-                "# 1. install and configure kubo (docs.ipfs.tech/install)\n"
-                "ipfs init\n"
-                "ipfs config --json Bitswap.ServerEnabled true\n"
-                "ipfs config --json Internal.Bitswap.BroadcastControl.Enable false\n"
-                "ipfs config --json Reprovider.Strategy '\"roots\"'\n"
-                "ipfs daemon --enable-gc &\n\n"
-                "# 2. follow this board's pinset (ipfscluster.io)\n"
-                "ipfs-cluster-follow bakemono init " (base) "/follower.json\n"
-                "ipfs-cluster-follow bakemono run"
-            } }
-            h3 { "What following means" }
-            ul.list {
-                li { "You mirror the whole archive: every file, preview, and the signed manifest history" }
-                li { "New publishes replicate automatically; takedowns unpin automatically - you host a moderated archive, not a write-once mirror" }
-                li { "Stopping is safe; nothing depends on your uptime individually" }
-                li { "Run kubo with " code { "--enable-gc" } " or removed content stays on your disk" }
-            }
-            h3 { "Pointers" }
-            ul.list {
-                li { a href="/follower.json" { "follower.json" } " - the cluster config your follower consumes" }
-                li { a href="/head.json" { "head.json" } " - the signed manifest head (the archive index)" }
+            section.keepwrap {
+                div.contribintro {
+                    h1 { "Become a keeper" }
+                    p { "Help the archive outlive any single server. Keepers mirror everything this board holds using two standard IPFS programs - no account, and nothing from Bakemono to install" }
+                }
+                div.panel {
+                    h3 { "Quick start" }
+                    p.muted { "Install kubo (docs.ipfs.tech/install), then run:" }
+                    pre { code {
+                        "ipfs init\n"
+                        "ipfs config --json Bitswap.ServerEnabled true\n"
+                        "ipfs config --json Internal.Bitswap.BroadcastControl.Enable false\n"
+                        "ipfs config --json Reprovider.Strategy '\"roots\"'\n"
+                        "ipfs daemon --enable-gc &\n\n"
+                        "# follow this board's pinset (ipfscluster.io)\n"
+                        "ipfs-cluster-follow bakemono init " (base) "/follower.json\n"
+                        "ipfs-cluster-follow bakemono run"
+                    } }
+                }
+                section.faq {
+                    h2 { "Questions" }
+                    (faq_item("How does it work?", html! {
+                        p { "IPFS addresses every file by a hash of its contents. This board publishes a signed list of those hashes; your keeper follows the list and pulls down each file, so you end up with a full copy of the archive" }
+                        p { "If this server ever dies, the whole board can be rebuilt from any keeper's copy" }
+                    }))
+                    (faq_item("What do I need to do?", html! {
+                        p { "Run the two commands above and leave them running. There is no board software, no account, and nothing to maintain by hand" }
+                        p { "You mirror the entire archive. Following just one creator or platform is not supported yet" }
+                    }))
+                    (faq_item("What happens over time?", html! {
+                        ul {
+                            li { "New posts replicate to you automatically" }
+                            li { "Removed content is unpinned automatically - you host a moderated mirror, not a write-once dump" }
+                            li { "Run kubo with " code { "--enable-gc" } " so unpinned files are actually freed from your disk" }
+                            li { "Stopping is safe; nothing depends on your machine specifically" }
+                        }
+                    }))
+                }
+                div.panel {
+                    h3 { "Pointers" }
+                    ul.list {
+                        li { a href="/follower.json" { "follower.json" } " - the cluster config your follower reads" }
+                        li { a href="/head.json" { "head.json" } " - the signed manifest head (the archive index)" }
+                    }
+                }
             }
         },
     )
@@ -1771,12 +1833,35 @@ pre { white-space:pre-wrap; word-break:break-all; background:var(--mantle); bord
 @media (max-width:400px) {
   .grid { grid-template-columns:repeat(2,1fr) }
 }
-.contribform { display:flex; flex-direction:column; gap:.8rem; max-width:560px; margin:1.2rem 0 1.6rem }
-.contribform label { display:flex; flex-direction:column; gap:.3rem; font-weight:600 }
-.contribform label.check { flex-direction:row; align-items:flex-start; gap:.5rem; font-weight:400; color:var(--subtext1) }
-.contribform input[type=text], .contribform select { padding:.5rem .6rem; border-radius:8px; border:1px solid var(--surface2); background:var(--surface0); color:var(--text); font:inherit }
-.contribform button { align-self:flex-start; padding:.5rem 1.2rem; border-radius:8px; border:0; background:var(--accent); color:var(--base); font-weight:600; cursor:pointer }
-p.err { color:var(--red); font-weight:600 }
+.contribwrap { max-width:640px; margin:0 auto }
+.keepwrap { max-width:760px; margin:0 auto }
+.contribintro { text-align:center; margin:.6rem 0 1.6rem }
+.contribintro h1 { margin:0 0 .5rem; font-size:1.7rem }
+.contribintro p { color:var(--subtext0); margin:0 auto; max-width:58ch }
+.panel { background:var(--mantle); border:1px solid var(--surface0); border-radius:14px; padding:1.3rem 1.5rem; margin:1rem 0 }
+.panel h3 { margin:0 0 .5rem }
+.panel pre { margin:.5rem 0 0 }
+.confirm { text-align:center }
+.confirm p { margin:.5rem 0 }
+.confirm .btn { margin-top:.7rem }
+.contribform { display:flex; flex-direction:column; gap:1rem; background:var(--mantle); border:1px solid var(--surface0); border-radius:14px; padding:1.4rem 1.5rem; margin:0 0 .5rem }
+.contribform label { display:flex; flex-direction:column; gap:.35rem; font-weight:600 }
+.contribform label.check { flex-direction:row; align-items:flex-start; gap:.55rem; font-weight:400; color:var(--subtext1) }
+.contribform label.check .hint { color:var(--subtext0) }
+.contribform input[type=text], .contribform select { padding:.6rem .65rem; border-radius:9px; border:1px solid var(--surface2); background:var(--surface0); color:var(--text); font:inherit }
+.contribform input[type=text]:focus, .contribform select:focus { outline:none; border-color:var(--accent) }
+.contribform button { align-self:stretch; padding:.7rem 1.2rem; border-radius:9px; border:0; background:var(--accent); color:var(--crust); font-weight:700; font-size:1rem; cursor:pointer }
+.contribform button:hover { filter:brightness(1.08) }
+.contribform .formnote { margin:0; font-size:.8rem; font-weight:400; color:var(--subtext0) }
+.faq { margin:1.7rem 0 .5rem }
+.faq h2 { font-size:1.1rem; margin:0 0 .8rem; text-align:center; color:var(--subtext1); font-weight:700 }
+.faqitem { border:1px solid var(--surface0); border-radius:12px; background:var(--mantle); padding:1rem 1.2rem; margin:.7rem 0 }
+.faqitem h3 { margin:0 0 .4rem; font-size:1rem; color:var(--accent) }
+.faqitem p { margin:.35rem 0; color:var(--subtext1) }
+.faqitem ol, .faqitem ul { margin:.5rem 0 .2rem; padding-left:1.2rem; color:var(--subtext1) }
+.faqitem li { margin:.35rem 0 }
+.faqitem code { color:var(--text) }
+p.err { color:var(--red); font-weight:600; text-align:center }
 ";
 
 // on mobile the search field is collapsed behind an icon; focus it the moment it opens
