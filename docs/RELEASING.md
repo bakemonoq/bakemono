@@ -14,8 +14,8 @@ The release is a draft. Review the artifacts, then publish it as latest.
 ## Cutting a release
 
 ```
-git tag v0.5.0
-git push origin main v0.5.0
+git tag v0.5.2
+git push origin main v0.5.2
 ```
 
 Bump `version` in the root `Cargo.toml` (and the lockfile) before tagging.

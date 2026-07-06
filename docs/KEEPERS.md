@@ -23,7 +23,13 @@ ipfs init
 # your node a leech; and full want broadcasts, so fleet peers hear you without DHT luck
 ipfs config --json Bitswap.ServerEnabled true
 ipfs config --json Internal.Bitswap.BroadcastControl.Enable false
-ipfs config --json Reprovider.Strategy '"roots"'
+# announce only the roots manifests reference. kubo >= 0.38 renamed this to Provide.Strategy and
+# FATALs if a deprecated Reprovider key lingers, so set the new key and drop the old one when present
+if ipfs config Provide.Strategy roots 2>/dev/null; then
+  ipfs config --json Reprovider '{}' 2>/dev/null || true
+else
+  ipfs config Reprovider.Strategy roots
+fi
 ipfs daemon --enable-gc &
 
 # 2. install ipfs-cluster-follow and join

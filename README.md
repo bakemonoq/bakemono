@@ -2,21 +2,21 @@
   <img src="assets/banner.png" alt="化け物 bakemono" width="680">
 </p>
 
-Keep the content you care about available even after the original site takes it down. A board archives sources itself, stores every file in IPFS, and publishes the whole archive as one signed manifest. Volunteer keepers replicate it with stock IPFS tools; if the board's server dies, the archive is rebuilt from any keeper.
+Keep the content you care about available even after the original site takes it down. A board archives sources itself, stores every file in IPFS, and publishes the whole archive as one signed manifest. Volunteers replicate it with stock IPFS tools; if the board's server dies, the archive is rebuilt from any one of them.
 
-- Browsing needs nothing: the board serves everything as ordinary HTTP, so `<img>` and `<video>` just work.
-- Keeping is two stock programs: Kubo + `ipfs-cluster-follow`. No Bakemono software, no account.
-- Takedowns are honest: every removal is recorded in a hash-linked, signed manifest history that keepers hold and anyone can audit.
+- **Browsing needs nothing.** The board serves every file over ordinary HTTP, so `<img>` and `<video>` just work in any browser.
+- **Keeping needs two stock programs.** Kubo and `ipfs-cluster-follow` - no Bakemono binary, no account - mirror the whole archive and honour every takedown automatically.
+- **Takedowns are honest.** Each removal is recorded in a hash-linked, signed manifest history that keepers hold and anyone can audit.
 
-Status: main implements this architecture; releases older than the pivot shipped a different (BitTorrent + Nostr) stack and are obsolete.
+Status: `main` implements this architecture. Releases older than the mid-2026 pivot shipped a different (BitTorrent + Nostr) stack and are obsolete; [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) explains why it was retired.
 
-## Try it
+## Browse
 
-Browse the reference board at [bakemono.app](https://bakemono.app) with nothing installed.
+The reference board runs at [bakemono.app](https://bakemono.app) - a normal website, nothing to install.
 
 ## Become a keeper
 
-Donate disk and bandwidth; the archive survives as long as one keeper does.
+Donate disk and bandwidth; the archive survives as long as one keeper does. On any machine with [Kubo](https://docs.ipfs.tech/install/command-line/) and [ipfs-cluster-follow](https://ipfscluster.io/documentation/deployment/setup/):
 
 ```sh
 ipfs daemon --enable-gc &
@@ -24,34 +24,34 @@ ipfs-cluster-follow bakemono init https://bakemono.app/follower.json
 ipfs-cluster-follow bakemono run
 ```
 
-Details, sizing, and what following commits you to: [`docs/KEEPERS.md`](docs/KEEPERS.md).
+On a fresh Linux box the one-liner in [`docs/KEEPERS.md`](docs/KEEPERS.md) installs both and runs them under systemd. That page also covers sizing and what following commits you to.
 
 ## Run your own board
 
-The stack is one compose file: the `bakemono` binary, postgres, Kubo, and `ipfs-cluster-service`.
+The whole stack is one compose file: the `bakemono` binary, postgres, Kubo, and `ipfs-cluster-service`.
 
-```
+```sh
 git clone https://github.com/bakemonoq/bakemono
 cd bakemono
 docker compose up -d --build
 ```
 
-The UI comes up at `http://localhost:3000`. Board name, domain, and moderation knobs are documented in `docker-compose.yml`; scraping needs source-platform cookies added through the admin UI.
+The UI comes up at `http://localhost:3000`. Basic knobs - board name, contacts, mod password, scrape proxy - are environment variables documented inline in [`docker-compose.yml`](docker-compose.yml). For richer customization - mascot, welcome and about text, accent colour, community links - copy [`board.toml.example`](board.toml.example) to `board.toml` and uncomment its mount in the compose file. Scraping needs source-platform cookies, added through the board's `/contribute` page.
 
 ## Build from source
 
 Single Cargo workspace, Rust stable:
 
-```
+```sh
 cargo build --workspace
 cargo test --workspace
 
-# the board binary is `bakemono` (needs postgres at DATABASE_URL and a local kubo)
+# the board binary is `bakemono`; serve needs postgres at DATABASE_URL and a local kubo
 cargo run -p bakemono-board -- serve
 ```
 
-Protocol and design details live in `docs/`.
+Design details live in [`docs/`](docs): [architecture](docs/ARCHITECTURE.md), [manifest protocol](docs/PROTOCOL.md), [glossary](docs/GLOSSARY.md). Code contributions are welcome ([`CONTRIBUTING.md`](CONTRIBUTING.md)); to report a vulnerability privately see [`SECURITY.md`](SECURITY.md).
 
-## Licence
+## License
 
-[AGPL-3.0-or-later](LICENSE). Viral copyleft is intentional: any modification that touches the network must also be open
+Copyright (c) 2026 Bakemono contributors. Licensed under [AGPL-3.0-or-later](LICENSE); the viral copyleft is intentional, so any modification reachable over the network must ship its source too

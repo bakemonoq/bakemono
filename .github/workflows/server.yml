@@ -75,11 +75,12 @@ jobs:
 
           Needs postgres (DATABASE_URL) and a local kubo daemon; ipfs-cluster-service for a fleet.
 
-          ./bakemono serve                       run the board
-          ./bakemono scrape <url> [cookies.txt]  one-off scrape into the archive
-          ./bakemono ingest <dir>                import an already-scraped directory
-          ./bakemono source add <url> [cookies]  put a source on the scheduler
-          ./bakemono restore <head-cid>          rebuild everything from a keeper
+          ./bakemono serve                          run the board
+          ./bakemono scrape <url> [cookies] [n]     one-off scrape into the archive
+          ./bakemono ingest <dir>                   import an already-scraped directory
+          ./bakemono keygen [dir]                   generate the cookie encryption keypair
+          ./bakemono autoimport < private.pem       run one keyed import round
+          ./bakemono restore <head-cid>             rebuild everything from a keeper
 
           macOS: clear quarantine once with  xattr -dr com.apple.quarantine .
           DOC

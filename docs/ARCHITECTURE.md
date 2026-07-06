@@ -33,22 +33,25 @@ End-to-end flow of one file, from source to a viewer's browser.
 
 ## Code layout
 
-Single Cargo workspace, two crates:
+Single Cargo workspace, three crates:
 
 ```
 Bakemono/
   crates/
     bakemono-core/     # manifest types (head/root/shard), canonical JSON, ed25519
                        # signing, frozen add parameters. Pure logic, zero I/O.
+    bakemono-scraper/  # thin gallery-dl wrapper: invocation, cookies, streaming, download archive
     bakemono-board/    # the `bakemono` binary
       serve            #   web UI, scrape worker, publisher, gateway proxy
-      scrape           #   one-off scrape of a creator into the archive
+      scrape           #   one-off scrape of a source url into the archive
       ingest           #   import a directory of already-scraped files + sidecars
       restore          #   rebuild postgres + pinset from a head CID
+      keygen           #   generate the cookie encryption keypair
+      autoimport       #   run one keyed import round (private key from stdin)
   docs/
 ```
 
-`serve` is the only long-running process. `scrape`/`ingest` exist for backfills without a running board; `restore` exists because on the day it is needed there is no web UI to click.
+`serve` is the only long-running process. `scrape`/`ingest`/`add` exist for backfills without a running board; `keygen`/`autoimport` drive the sealed-cookie import flow; `restore` exists because on the day it is needed there is no web UI to click.
 
 Alongside, on the board host: postgres, Kubo, `ipfs-cluster-service`. On the operator's other keeper hosts: Kubo + `ipfs-cluster-service` (trusted peers). Volunteers: Kubo + `ipfs-cluster-follow`.
 
@@ -131,7 +134,7 @@ Total loss of the board host:
 1. Provision a new host: postgres, Kubo, cluster-service, the `bakemono` binary.
 2. Restore the board key from offline backup.
 3. Obtain the latest head CID: DNSLink if DNS survived, otherwise any keeper.
-4. `bakemono restore --head <cid>`: verifies the chain, rebuilds postgres from the shards, re-pins the pinset. Bytes flow back from keepers.
+4. `bakemono restore <cid>`: verifies the chain, rebuilds postgres from the shards, re-pins the pinset. Bytes flow back from keepers.
 5. Point DNS at the new host; `serve` resumes. Source cookies are re-added by hand (operational state, never in the archive).
 
 If at least one keeper survives, the archive survives. The board key backup is the only thing that must never be lost - and losing it stops future publishes, not existing content.

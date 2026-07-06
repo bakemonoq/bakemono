@@ -9,7 +9,7 @@ The smallest demoable system on the IPFS architecture: one board scraping server
 3. The manifest head publishes and resolves through both `head.json` and DNSLink, and verifies against the board key.
 4. A second host running stock Kubo + `ipfs-cluster-follow` replicates the full pinset with no Bakemono software installed.
 5. A takedown removes a file: the next manifest version carries it in `revoked`, the follower unpins it, the gateway refuses to serve it.
-6. Kill the board host. On a fresh host, `bakemono restore --head <cid>` (head fetched from the follower) rebuilds postgres and re-pins everything; the board comes back complete.
+6. Kill the board host. On a fresh host, `bakemono restore <cid>` (head fetched from the follower) rebuilds postgres and re-pins everything; the board comes back complete.
 
 If all six work without intervention, MVP ships.
 

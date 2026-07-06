@@ -73,12 +73,16 @@ services:
       # DMCA and general contact shown on /info
       BAKEMONO_DMCA_CONTACT: ${BAKEMONO_DMCA_CONTACT:-}
       BAKEMONO_CONTACT: ${BAKEMONO_CONTACT:-}
+      # richer customization (mascot, welcome/about html, accent, community links) lives in board.toml.
+      # copy board.toml.example to ./board.toml, then uncomment BAKEMONO_CONFIG and the mount below
+      # BAKEMONO_CONFIG: /config/board.toml
     ports:
       - "3000:3000"
     volumes:
       - bakemono-data:/data
       - bakemono-scrape:/scrape
       - bakemono-cluster:/cluster:ro
+      # - ./board.toml:/config/board.toml:ro
     depends_on:
       - postgres
       - kubo

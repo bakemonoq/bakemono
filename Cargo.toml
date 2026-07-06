@@ -6,6 +6,7 @@ members = ["crates/*"]
 version = "0.5.1"
 edition = "2021"
 license = "AGPL-3.0-or-later"
+authors = ["Bakemono contributors"]
 repository = "https://github.com/bakemonoq/bakemono"
 
 [workspace.dependencies]

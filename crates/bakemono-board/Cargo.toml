@@ -4,6 +4,7 @@ description = "Self-hostable board: server-side scraping, IPFS archive, signed m
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
 repository.workspace = true
 
 [[bin]]

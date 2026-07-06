@@ -1,5 +1,7 @@
-# image-only: copy just this file to the box, no source needed.
-# build + push from a machine that has the source (see deploy.sh), then `docker compose -f docker-compose.deploy.yml up -d`
+# operator-only: image-only deploy, copy just this file to the box, no source checkout needed.
+# a machine with the source builds + pushes the image and ships board.toml/static/kubo-init.sh
+# alongside this file; a fresh clone should use docker-compose.yml instead. paths below are relative
+# to that shipped layout on the box, so they will not resolve from the repo root
 services:
   postgres:
     image: postgres:16
