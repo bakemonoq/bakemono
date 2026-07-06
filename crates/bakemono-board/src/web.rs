@@ -725,7 +725,7 @@ async fn contribute_submit(
 
     // validate while we still hold the plaintext: a quick feed probe tells live from dead. anything
     // past here treats the cookie as a live secret to protect
-    if !crate::scrape::probe_cookie(platform, token).await {
+    if !crate::scrape::probe_cookie(platform, token, &format!("submit-{platform}")).await {
         return render("contribute", contribute_body(Some("That cookie was rejected by the site - make sure you are signed in and copied the whole value"))).into_response();
     }
 
@@ -774,7 +774,8 @@ async fn seal_and_store(
 fn spawn_import(state: &AppState, cookie_id: Option<i64>, platform: String, token: String) {
     let (pool, kubo) = (state.pool.clone(), state.kubo.clone());
     tokio::spawn(async move {
-        match crate::scrape::scrape_feed(&pool, &kubo, &platform, &token).await {
+        let scope = format!("submit-{platform}");
+        match crate::scrape::scrape_feed(&pool, &kubo, &platform, &token, &scope).await {
             Ok((stats, creators)) => {
                 if let Some(id) = cookie_id {
                     db::set_cookie_creators(&pool, id, &platform, &creators).await.ok();

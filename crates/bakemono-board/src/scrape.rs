@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use futures::stream::StreamExt;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPool;
@@ -48,31 +49,14 @@ pub async fn run_scheduler(pool: PgPool, kubo: Arc<Kubo>) {
 pub async fn autoimport_round(pool: &PgPool, kubo: &Kubo, privkey_pem: &str) -> Result<()> {
     let cookies = db::autoimport_cookies(pool).await?;
     tracing::info!(count = cookies.len(), "autoimport round starting");
-    let mut ingested = 0usize;
-    for cookie in cookies {
-        let token = match crate::crypto::open(privkey_pem, &cookie.sealed) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-            Err(e) => {
-                tracing::error!(cookie = cookie.id, "decrypt failed: {e:#}");
-                continue;
-            }
-        };
-        if !probe_cookie(&cookie.platform, &token).await {
-            db::mark_cookie(pool, cookie.id, "dead", Some("cookie rejected by the platform")).await?;
-            continue;
-        }
-        match scrape_feed(pool, kubo, &cookie.platform, &token).await {
-            Ok((stats, creators)) => {
-                db::set_cookie_creators(pool, cookie.id, &cookie.platform, &creators).await.ok();
-                db::mark_cookie(pool, cookie.id, "live", None).await?;
-                ingested += stats.files;
-            }
-            Err(e) => {
-                tracing::error!(cookie = cookie.id, "feed scrape failed: {e:#}");
-                db::mark_cookie(pool, cookie.id, "live", Some(&format!("{e:#}"))).await?;
-            }
-        }
-    }
+    // scrape every cookie concurrently, each in its own staging scope, so a huge feed (patreon) never
+    // starves a smaller one (fanbox) behind it. bounded so a board with many cookies stays sane
+    let futs: Vec<_> =
+        cookies.iter().map(|cookie| scrape_cookie(pool, kubo, privkey_pem, cookie)).collect();
+    let ingested: usize = futures::stream::iter(futs)
+        .buffer_unordered(4)
+        .fold(0usize, |sum, n| async move { sum + n })
+        .await;
     if ingested > 0 {
         crate::publish::publish_if_changed(pool, kubo).await?;
     }
@@ -80,10 +64,38 @@ pub async fn autoimport_round(pool: &PgPool, kubo: &Kubo, privkey_pem: &str) -> 
     Ok(())
 }
 
+// decrypt one cookie, probe it, scrape its feed into an isolated staging scope; returns files ingested
+async fn scrape_cookie(pool: &PgPool, kubo: &Kubo, privkey_pem: &str, cookie: &db::SealedCookie) -> usize {
+    let token = match crate::crypto::open(privkey_pem, &cookie.sealed) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(e) => {
+            tracing::error!(cookie = cookie.id, "decrypt failed: {e:#}");
+            return 0;
+        }
+    };
+    let scope = cookie.id.to_string();
+    if !probe_cookie(&cookie.platform, &token, &scope).await {
+        db::mark_cookie(pool, cookie.id, "dead", Some("cookie rejected by the platform")).await.ok();
+        return 0;
+    }
+    match scrape_feed(pool, kubo, &cookie.platform, &token, &scope).await {
+        Ok((stats, creators)) => {
+            db::set_cookie_creators(pool, cookie.id, &cookie.platform, &creators).await.ok();
+            db::mark_cookie(pool, cookie.id, "live", None).await.ok();
+            stats.files
+        }
+        Err(e) => {
+            tracing::error!(cookie = cookie.id, "feed scrape failed: {e:#}");
+            db::mark_cookie(pool, cookie.id, "live", Some(&format!("{e:#}"))).await.ok();
+            0
+        }
+    }
+}
+
 // does this cookie still authenticate? a live cookie lets gallery-dl read the first feed item, a
 // dead one hits a login wall. unified across platforms, no per-platform API code
-pub async fn probe_cookie(platform: &str, token: &str) -> bool {
-    let staging = staging_dir();
+pub async fn probe_cookie(platform: &str, token: &str, scope: &str) -> bool {
+    let staging = staging_dir().join(scope);
     if std::fs::create_dir_all(&staging).is_err() {
         return false;
     }
@@ -111,8 +123,9 @@ pub async fn scrape_feed(
     kubo: &Kubo,
     platform: &str,
     token: &str,
+    scope: &str,
 ) -> Result<(IngestStats, Vec<CreatorSeen>)> {
-    let staging = staging_dir();
+    let staging = staging_dir().join(scope);
     std::fs::create_dir_all(&staging).with_context(|| format!("creating {}", staging.display()))?;
     let feed_url = crate::platform::feed_url(platform).context("platform has no feed")?;
     let cookie_txt = crate::platform::netscape_cookie(platform, token).context("no cookie name")?;
