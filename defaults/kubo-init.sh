@@ -21,3 +21,9 @@ fi
 # the gateway serves only blocks this node already holds; the board's catalog is always pinned
 # locally, and a taken-down CID must not be fetchable from the network through us
 ipfs config --json Gateway.NoFetch true
+
+# nopfs only watches denylist files that already exist when the daemon starts, so make sure ours is
+# there. the board rewrites it in place on every takedown, which nopfs then live-reloads (410 at once)
+DENY="${IPFS_PATH:-/data/ipfs}/denylists/bakemono.deny"
+mkdir -p "$(dirname "$DENY")"
+[ -f "$DENY" ] || printf 'version: 1\nname: bakemono\n---\n' > "$DENY"

@@ -119,8 +119,12 @@ init_ipfs() {
   # on someone's behalf. this is what keeps it "our files only" and stops it becoming an open relay
   as_ipfs env IPFS_PATH="$IPFS_PATH" ipfs config --json Gateway.NoFetch true
   # nopfs reads denylists from here; the sync unit below keeps it current from the board's manifest, so
-  # a taken-down CID is blocked at your gateway immediately, not only after GC frees the block
+  # a taken-down CID is blocked at your gateway immediately, not only after GC frees the block. nopfs
+  # only watches files that exist at daemon start, so seed an empty one now (the sync rewrites it live)
   install -d -o "$IPFS_USER" -g "$IPFS_USER" "${IPFS_PATH}/denylists"
+  local deny="${IPFS_PATH}/denylists/bakemono.deny"
+  [ -f "$deny" ] || printf 'version: 1\nname: bakemono\n---\n' > "$deny"
+  chown "$IPFS_USER":"$IPFS_USER" "$deny"
 }
 
 init_follower() {
@@ -190,11 +194,12 @@ root="\$(printf '%s' "\$head" | jq -r '.root // empty')"
 deny="\$(ipfs cat "/ipfs/\$root" | jq -r '.denylist // empty')" || exit 0
 [ -n "\$deny" ] || exit 0
 tmp="\$(mktemp)"
+# write in place (cp, not mv): nopfs watches this file's inode, and a rename would swap it out from
+# under the watch. stage to tmp first so a failed fetch never truncates the live list
 if ipfs cat "/ipfs/\$deny" >"\$tmp" && [ -s "\$tmp" ]; then
-  mv "\$tmp" "\${DENYDIR}/bakemono.deny"
-else
-  rm -f "\$tmp"
+  cp "\$tmp" "\${DENYDIR}/bakemono.deny"
 fi
+rm -f "\$tmp"
 SYNC
   chmod 0755 /usr/local/bin/bakemono-denylist-sync
 
