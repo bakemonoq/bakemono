@@ -92,64 +92,6 @@ async fn scrape_cookie(pool: &PgPool, kubo: &Kubo, privkey_pem: &str, cookie: &d
     }
 }
 
-// re-derive tiers from fresh metadata WITHOUT re-downloading media: gallery-dl -j enumerates every
-// post's metadata (API only), we recompute tier_of and update the row. cheap enough to rerun whenever
-// the tier logic changes, instead of clearing the archive and pulling the whole catalog again
-pub async fn reclassify_round(pool: &PgPool, privkey_pem: &str) -> Result<()> {
-    let cookies = db::autoimport_cookies(pool).await?;
-    tracing::info!(count = cookies.len(), "reclassify round starting");
-    let mut updated = 0usize;
-    for cookie in &cookies {
-        let token = match crate::crypto::open(privkey_pem, &cookie.sealed) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-            Err(e) => {
-                tracing::error!(cookie = cookie.id, "decrypt failed: {e:#}");
-                continue;
-            }
-        };
-        match reclassify_feed(pool, &cookie.platform, &token, &cookie.id.to_string()).await {
-            Ok(n) => {
-                tracing::info!(cookie = cookie.id, platform = %cookie.platform, tiers = n, "reclassified");
-                updated += n;
-            }
-            Err(e) => tracing::error!(cookie = cookie.id, "reclassify failed: {e:#}"),
-        }
-    }
-    tracing::info!(updated, "reclassify round done");
-    Ok(())
-}
-
-async fn reclassify_feed(pool: &PgPool, platform: &str, token: &str, scope: &str) -> Result<usize> {
-    let staging = staging_dir().join(format!("reclass-{scope}"));
-    std::fs::create_dir_all(&staging)?;
-    let feed_url = crate::platform::feed_url(platform).context("platform has no feed")?;
-    let cookie_txt = crate::platform::netscape_cookie(platform, token).context("no cookie name")?;
-    let cookie_file = CookieFile::write(&staging, &cookie_txt)?;
-
-    let json = scraper_for(platform)
-        .dump_json(feed_url, Some(&cookie_file.path), None, &scrape_options(platform))
-        .await?;
-    let entries: Value = serde_json::from_slice(&json).context("parsing gallery-dl -j output")?;
-
-    let mut seen = HashSet::new();
-    let mut updated = 0usize;
-    for entry in entries.as_array().into_iter().flatten() {
-        // each message is `[type, ..., kwdict]`; the metadata dict is always the last element
-        let Some(meta) = entry.as_array().and_then(|a| a.last()).filter(|v| v.is_object()) else {
-            continue;
-        };
-        let Ok(post) = post_meta_value(meta) else { continue };
-        if !seen.insert(post.post_key()) {
-            continue;
-        }
-        if db::update_tier(pool, &post.platform, &post.creator_id, &post.post_id, &post.tier).await? > 0 {
-            updated += 1;
-        }
-    }
-    let _ = std::fs::remove_dir_all(&staging);
-    Ok(updated)
-}
-
 // does this cookie still authenticate? a live cookie lets gallery-dl read the first feed item, a
 // dead one hits a login wall. unified across platforms, no per-platform API code
 pub async fn probe_cookie(platform: &str, token: &str, scope: &str) -> bool {
@@ -449,35 +391,31 @@ fn post_meta(sidecar: &Path) -> Result<PostMeta> {
     let raw = std::fs::read(sidecar).with_context(|| format!("reading {}", sidecar.display()))?;
     let meta: Value =
         serde_json::from_slice(&raw).with_context(|| format!("parsing {}", sidecar.display()))?;
-    post_meta_value(&meta)
-}
-
-fn post_meta_value(meta: &Value) -> Result<PostMeta> {
-    let platform = string_at(meta, &["category"]).unwrap_or_else(|| "patreon".to_string());
-    let creator_id = string_at(meta, &["creator", "id"]) // patreon
-        .or_else(|| string_at(meta, &["creatorId"])) // fanbox
-        .or_else(|| string_at(meta, &["user", "userId"])) // fanbox numeric
+    let platform = string_at(&meta, &["category"]).unwrap_or_else(|| "patreon".to_string());
+    let creator_id = string_at(&meta, &["creator", "id"]) // patreon
+        .or_else(|| string_at(&meta, &["creatorId"])) // fanbox
+        .or_else(|| string_at(&meta, &["user", "userId"])) // fanbox numeric
         .context("sidecar has no creator id")?;
     Ok(PostMeta {
-        creator: string_at(meta, &["creator", "full_name"])
-            .or_else(|| string_at(meta, &["creator", "vanity"]))
-            .or_else(|| string_at(meta, &["user", "name"])) // fanbox
+        creator: string_at(&meta, &["creator", "full_name"])
+            .or_else(|| string_at(&meta, &["creator", "vanity"]))
+            .or_else(|| string_at(&meta, &["user", "name"])) // fanbox
             .unwrap_or_else(|| creator_id.clone()),
-        creator_url: creator_url(meta, &platform, &creator_id),
+        creator_url: creator_url(&meta, &platform, &creator_id),
         creator_id,
         platform,
-        post_id: string_at(meta, &["id"]).context("sidecar missing id")?,
+        post_id: string_at(&meta, &["id"]).context("sidecar missing id")?,
         file_index: meta
             .get("num")
             .and_then(Value::as_u64)
             .map(|n| n.saturating_sub(1) as i32)
             .unwrap_or(0),
-        title: string_at(meta, &["title"]).map(|t| t.trim().to_string()).unwrap_or_default(),
-        body: string_at(meta, &["content"]).or_else(|| string_at(meta, &["text"])).unwrap_or_default(),
-        posted_at: string_at(meta, &["published_at"])
-            .or_else(|| string_at(meta, &["publishedDatetime"]))
-            .or_else(|| string_at(meta, &["date"])),
-        tier: tier_of(meta),
+        title: string_at(&meta, &["title"]).map(|t| t.trim().to_string()).unwrap_or_default(),
+        body: string_at(&meta, &["content"]).or_else(|| string_at(&meta, &["text"])).unwrap_or_default(),
+        posted_at: string_at(&meta, &["published_at"])
+            .or_else(|| string_at(&meta, &["publishedDatetime"]))
+            .or_else(|| string_at(&meta, &["date"])),
+        tier: tier_of(&meta),
     })
 }
 

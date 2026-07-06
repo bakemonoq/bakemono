@@ -133,42 +133,6 @@ impl Scraper {
         Ok(!output.stdout.iter().all(u8::is_ascii_whitespace))
     }
 
-    // enumerate the feed's metadata as JSON without downloading anything (gallery-dl -j). the output is
-    // a list of `[type, ..., kwdict]` messages; the last element of each is the item's metadata dict
-    pub async fn dump_json(
-        &self,
-        url: &str,
-        cookies: Option<&Path>,
-        proxy: Option<&str>,
-        options: &[String],
-    ) -> Result<Vec<u8>, Error> {
-        let mut args = vec!["-j".to_string()];
-        if let Some(proxy) = proxy {
-            args.push("--proxy".to_string());
-            args.push(proxy.to_string());
-        }
-        for opt in options {
-            args.push("-o".to_string());
-            args.push(opt.clone());
-        }
-        if let Some(path) = cookies {
-            args.push("--cookies".to_string());
-            args.push(path.to_string_lossy().into_owned());
-        }
-        args.push(url.to_string());
-        let mut cmd = tokio::process::Command::new(&self.binary);
-        cmd.args(&args).stdout(Stdio::piped()).stderr(Stdio::null());
-        #[cfg(unix)]
-        cmd.process_group(0);
-        #[cfg(windows)]
-        cmd.creation_flags(0x0800_0000);
-        let output = cmd.output().await.map_err(|source| Error::Spawn {
-            binary: self.binary.to_string_lossy().into_owned(),
-            source,
-        })?;
-        Ok(output.stdout)
-    }
-
     pub fn scrape(&self, request: &ScrapeRequest) -> Result<ScrapeOutcome, Error> {
         std::fs::create_dir_all(&request.dest).map_err(|source| Error::Io {
             path: request.dest.clone(),
