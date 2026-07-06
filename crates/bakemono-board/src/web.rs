@@ -730,14 +730,15 @@ fn nav_btn(
     }
 }
 
-// full media (not the tiny preview) streamed straight from the gateway, one at a time and centered - content
-// is the point of the page. each item loads only when shown, so a many-image post does not fetch it all at once
+// full media (not the tiny preview) served straight from the local IPFS gateway (/ipfs/{cid}), one at a
+// time and centered - content is the point of the page. loading direct from Kubo keeps the board out of
+// the byte path; each item loads only when shown, so a many-image post does not fetch it all at once
 fn carousel(files: &[db::ManifestRow]) -> Markup {
     let items: Vec<String> = files
         .iter()
         .map(|f| {
             let video = f.mime.starts_with("video/");
-            format!("{{\"u\":\"/f/{}\",\"v\":{video}}}", f.cid)
+            format!("{{\"u\":\"/ipfs/{}\",\"v\":{video}}}", f.cid)
         })
         .collect();
     if items.is_empty() {

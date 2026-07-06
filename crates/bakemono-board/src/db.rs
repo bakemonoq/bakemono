@@ -893,7 +893,7 @@ SELECT EXTRACT(EPOCH FROM f.added_at)::bigint AS created_at,
        f.size, f.mime, f.filename,
        p.platform, c.creator, p.creator_id, p.post_id, pf.file_index,
        NULLIF(p.title, '') AS post_title, p.posted_at, p.tier, p.body AS content,
-       CASE WHEN f.thumb_cid IS NOT NULL THEN '/f/' || f.thumb_cid END AS thumb,
+       CASE WHEN f.thumb_cid IS NOT NULL THEN '/ipfs/' || f.thumb_cid END AS thumb,
        f.cid
 FROM post_files pf
 JOIN posts p ON (p.platform, p.creator_id, p.post_id) = (pf.platform, pf.creator_id, pf.post_id)

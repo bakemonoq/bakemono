@@ -233,7 +233,7 @@ fn tier_db(raw: Option<&str>) -> &'static str {
 }
 
 fn cover_cid(thumb: Option<&str>) -> Option<String> {
-    thumb.and_then(|t| t.strip_prefix("/f/")).map(str::to_string)
+    thumb.and_then(|t| t.strip_prefix("/ipfs/")).map(str::to_string)
 }
 
 #[derive(Serialize)]
