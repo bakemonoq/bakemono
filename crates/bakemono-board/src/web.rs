@@ -50,6 +50,7 @@ pub fn router(state: AppState) -> Router {
         .route("/f/{cid}", get(ipfs_file))
         .route("/head.json", get(head_json))
         .route("/follower.json", get(follower_json))
+        .merge(crate::api::routes())
         .with_state(state)
 }
 
