@@ -91,6 +91,7 @@ pub async fn list_posts(
     sort: SortField,
     desc: bool,
     q: &str,
+    tier: &str,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<PostCard>> {
@@ -98,11 +99,12 @@ pub async fn list_posts(
         "SELECT t.*, COALESCE(pv.views, 0) AS views FROM (
              SELECT DISTINCT ON (platform, creator_id, post_id)
                     platform, creator_id, post_id, creator, post_title, posted_at, created_at,
-                    mime, thumb,
+                    mime, thumb, tier,
                     COUNT(*) OVER (PARTITION BY platform, creator_id, post_id) AS files
              FROM visible_content
              WHERE ($1 = '' OR post_title ILIKE '%' || $1 || '%' OR creator ILIKE '%' || $1 || '%')
                AND ($4 = '' OR platform = $4)
+               AND ($5 = '' OR tier = $5)
              ORDER BY platform, creator_id, post_id, (thumb IS NULL), file_index
          ) t
          LEFT JOIN post_views pv USING (platform, creator_id, post_id)
@@ -114,6 +116,7 @@ pub async fn list_posts(
         .bind(limit)
         .bind(offset)
         .bind(source)
+        .bind(tier)
         .fetch_all(pool)
         .await?;
     Ok(rows)
@@ -167,6 +170,7 @@ pub async fn creator_posts(
     pool: &PgPool,
     platform: &str,
     creator_id: &str,
+    tier: &str,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<PostCard>> {
@@ -174,17 +178,19 @@ pub async fn creator_posts(
         "SELECT t.*, COALESCE(pv.views, 0) AS views FROM (
              SELECT DISTINCT ON (platform, creator_id, post_id)
                     platform, creator_id, post_id, creator, post_title, posted_at, created_at,
-                    mime, thumb,
+                    mime, thumb, tier,
                     COUNT(*) OVER (PARTITION BY platform, creator_id, post_id) AS files
              FROM visible_content
              WHERE platform = $1 AND creator_id = $2
+               AND ($3 = '' OR tier = $3)
              ORDER BY platform, creator_id, post_id, (thumb IS NULL), file_index
          ) t
          LEFT JOIN post_views pv USING (platform, creator_id, post_id)
-         ORDER BY posted_at DESC NULLS LAST, created_at DESC LIMIT $3 OFFSET $4",
+         ORDER BY posted_at DESC NULLS LAST, created_at DESC LIMIT $4 OFFSET $5",
     )
     .bind(platform)
     .bind(creator_id)
+    .bind(tier)
     .bind(limit)
     .bind(offset)
     .fetch_all(pool)
@@ -269,6 +275,7 @@ pub struct PostCard {
     pub posted_at: Option<String>,
     pub mime: String,
     pub thumb: Option<String>,
+    pub tier: Option<String>,
     pub files: i64,
     pub views: i64,
 }

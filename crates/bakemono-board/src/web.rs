@@ -58,7 +58,7 @@ const PAGE: i64 = 36;
 
 async fn home(State(pool): State<PgPool>) -> Html<String> {
     // 12 keeps Recent to two rows on a wide screen
-    let posts = db::list_posts(&pool, "", db::SortField::Created, true, "", 12, 0)
+    let posts = db::list_posts(&pool, "", db::SortField::Created, true, "", "", 12, 0)
         .await
         .unwrap_or_default();
     let creators = db::list_creators(&pool, "", db::SortField::Views, true, "", 12, 0)
@@ -87,9 +87,9 @@ async fn home(State(pool): State<PgPool>) -> Html<String> {
 }
 
 async fn posts_index(State(pool): State<PgPool>, Query(query): Query<BrowseQuery>) -> Html<String> {
-    let (q, source, sort, desc, page) = query.parts();
+    let (q, source, sort, desc, tier, page) = query.parts();
     let platforms = db::platforms(&pool).await.unwrap_or_default();
-    let mut posts = db::list_posts(&pool, &source, sort, desc, &q, PAGE + 1, page * PAGE)
+    let mut posts = db::list_posts(&pool, &source, sort, desc, &q, tier_db(&tier), PAGE + 1, page * PAGE)
         .await
         .unwrap_or_default();
     let has_next = posts.len() as i64 > PAGE;
@@ -98,11 +98,12 @@ async fn posts_index(State(pool): State<PgPool>, Query(query): Query<BrowseQuery
         "posts",
         html! {
             h1.pagetitle { "Posts" }
-            (filter_bar("/posts", &q, &source, sort, desc, &platforms, None))
-            (pager("/posts", &q, &source, sort, desc, None, page, has_next, true))
+            (filter_bar("/posts", &q, &source, sort, desc, &tier, &platforms, None))
+            (tier_tabs("/posts", &q, &source, sort, desc, &tier))
+            (pager("/posts", &q, &source, sort, desc, &tier, None, page, has_next, true))
             @if posts.is_empty() { p.muted { "No posts match" } }
             (posts_grid(&posts))
-            (pager("/posts", &q, &source, sort, desc, None, page, has_next, false))
+            (pager("/posts", &q, &source, sort, desc, &tier, None, page, has_next, false))
         },
     )
 }
@@ -111,7 +112,7 @@ async fn creators_index(
     State(pool): State<PgPool>,
     Query(query): Query<BrowseQuery>,
 ) -> Html<String> {
-    let (q, source, sort, desc, page) = query.parts();
+    let (q, source, sort, desc, _tier, page) = query.parts();
     let platforms = db::platforms(&pool).await.unwrap_or_default();
     let mut creators = db::list_creators(&pool, &source, sort, desc, &q, PAGE + 1, page * PAGE)
         .await
@@ -122,11 +123,11 @@ async fn creators_index(
         "creators",
         html! {
             h1.pagetitle { "Creators" }
-            (filter_bar("/creators", &q, &source, sort, desc, &platforms, None))
-            (pager("/creators", &q, &source, sort, desc, None, page, has_next, true))
+            (filter_bar("/creators", &q, &source, sort, desc, "", &platforms, None))
+            (pager("/creators", &q, &source, sort, desc, "", None, page, has_next, true))
             @if creators.is_empty() { p.muted { "No creators match" } }
             (creators_grid(&creators))
-            (pager("/creators", &q, &source, sort, desc, None, page, has_next, false))
+            (pager("/creators", &q, &source, sort, desc, "", None, page, has_next, false))
         },
     )
 }
@@ -149,6 +150,8 @@ async fn search_index(State(pool): State<PgPool>, Query(query): Query<SearchQuer
     let creators_tab = query.tab.as_deref() == Some("creators");
     let page = query.page.unwrap_or(0).max(0);
     let tab = if creators_tab { "creators" } else { "posts" };
+    // tier is a post-only filter, so it never rides the creators tab
+    let tier = if creators_tab { String::new() } else { tier_param(query.tier.as_deref()) };
     let platforms = db::platforms(&pool).await.unwrap_or_default();
 
     let mut posts = Vec::new();
@@ -161,7 +164,7 @@ async fn search_index(State(pool): State<PgPool>, Query(query): Query<SearchQuer
         has_next = creators.len() as i64 > PAGE;
         creators.truncate(PAGE as usize);
     } else if !q.is_empty() {
-        posts = db::list_posts(&pool, &source, sort, desc, &q, PAGE + 1, page * PAGE)
+        posts = db::list_posts(&pool, &source, sort, desc, &q, tier_db(&tier), PAGE + 1, page * PAGE)
             .await
             .unwrap_or_default();
         has_next = posts.len() as i64 > PAGE;
@@ -173,11 +176,12 @@ async fn search_index(State(pool): State<PgPool>, Query(query): Query<SearchQuer
         html! {
             h1.pagetitle { "Search" }
             div.tabs {
-                a.tab.active[!creators_tab] href=(browse_url("/search", &q, &source, sort, desc, Some("posts"), 0)) { "Posts" }
-                a.tab.active[creators_tab] href=(browse_url("/search", &q, &source, sort, desc, Some("creators"), 0)) { "Creators" }
+                a.tab.active[!creators_tab] href=(browse_url("/search", &q, &source, sort, desc, &tier, Some("posts"), 0)) { "Posts" }
+                a.tab.active[creators_tab] href=(browse_url("/search", &q, &source, sort, desc, "", Some("creators"), 0)) { "Creators" }
             }
-            (filter_bar("/search", &q, &source, sort, desc, &platforms, Some(tab)))
-            @if !q.is_empty() { (pager("/search", &q, &source, sort, desc, Some(tab), page, has_next, true)) }
+            (filter_bar("/search", &q, &source, sort, desc, &tier, &platforms, Some(tab)))
+            @if !creators_tab { (tier_tabs("/search", &q, &source, sort, desc, &tier)) }
+            @if !q.is_empty() { (pager("/search", &q, &source, sort, desc, &tier, Some(tab), page, has_next, true)) }
             @if q.is_empty() {
                 p.muted { "Type something to search posts and creators" }
             } @else if creators_tab {
@@ -187,7 +191,7 @@ async fn search_index(State(pool): State<PgPool>, Query(query): Query<SearchQuer
                 @if posts.is_empty() { p.muted { "No posts match \"" (q) "\"" } }
                 (posts_grid(&posts))
             }
-            @if !q.is_empty() { (pager("/search", &q, &source, sort, desc, Some(tab), page, has_next, false)) }
+            @if !q.is_empty() { (pager("/search", &q, &source, sort, desc, &tier, Some(tab), page, has_next, false)) }
         },
     )
 }
@@ -198,6 +202,7 @@ struct SearchQuery {
     source: Option<String>,
     sort: Option<String>,
     dir: Option<String>,
+    tier: Option<String>,
     tab: Option<String>,
     page: Option<i64>,
 }
@@ -208,19 +213,59 @@ struct BrowseQuery {
     source: Option<String>,
     sort: Option<String>,
     dir: Option<String>,
+    tier: Option<String>,
     page: Option<i64>,
 }
 
 impl BrowseQuery {
-    // (query, source, sort field, desc, page); desc unless dir=asc
-    fn parts(self) -> (String, String, db::SortField, bool, i64) {
+    // (query, source, sort field, desc, tier, page); desc unless dir=asc. tier is "" | "free" | "paid"
+    fn parts(self) -> (String, String, db::SortField, bool, String, i64) {
         (
             self.q.unwrap_or_default().trim().to_string(),
             self.source.unwrap_or_default().trim().to_string(),
             db::SortField::parse(self.sort.as_deref()),
             self.dir.as_deref() != Some("asc"),
+            tier_param(self.tier.as_deref()),
             self.page.unwrap_or(0).max(0),
         )
+    }
+}
+
+// the UI tier value ("free"/"paid"), or "" for all; anything else is ignored
+fn tier_param(raw: Option<&str>) -> String {
+    match raw.map(str::trim) {
+        Some("free") => "free".to_string(),
+        Some("paid") => "paid".to_string(),
+        _ => String::new(),
+    }
+}
+
+// map the UI tier to the stored tier value; "paid" is stored as "subscriber"
+fn tier_db(tier: &str) -> &str {
+    match tier {
+        "free" => "free",
+        "paid" => "subscriber",
+        _ => "",
+    }
+}
+
+// All / Free / Paid pills for a post listing, preserving the current query and sort
+fn tier_tabs(base: &str, q: &str, source: &str, sort: db::SortField, desc: bool, tier: &str) -> Markup {
+    html! {
+        div.tabs {
+            @for (val, label) in [("", "All"), ("free", "Free"), ("paid", "Paid")] {
+                a.tab.active[tier == val] href=(browse_url(base, q, source, sort, desc, val, None, 0)) { (label) }
+            }
+        }
+    }
+}
+
+// the free/paid chip for a post card, or nothing when the tier is unknown
+fn tier_badge(tier: Option<&str>) -> Option<Markup> {
+    match tier {
+        Some("free") => Some(html! { span.chip.ok { "free" } }),
+        Some("subscriber") => Some(html! { span.chip.paid { "paid" } }),
+        _ => None,
     }
 }
 
@@ -242,6 +287,7 @@ fn post_card(p: &db::PostCard) -> Markup {
                 div.cardtitle { (title) }
                 div.cardsub {
                     span.strong { (p.creator) }
+                    @if let Some(b) = tier_badge(p.tier.as_deref()) { " " (b) }
                     br;
                     (p.files) @if p.files == 1 { " file" } @else { " files" }
                     @if let Some(at) = &p.posted_at { " - " (pretty_date(at)) }
@@ -304,12 +350,14 @@ fn filter_bar(
     source: &str,
     sort: db::SortField,
     desc: bool,
+    tier: &str,
     platforms: &[String],
     tab: Option<&str>,
 ) -> Markup {
     html! {
         form.filters method="get" action=(base) {
             @if let Some(t) = tab { input type="hidden" name="tab" value=(t); }
+            @if !tier.is_empty() { input type="hidden" name="tier" value=(tier); }
             input type="hidden" name="dir" value=(if desc { "desc" } else { "asc" });
             div.searchfield {
                 span.sicon { (PreEscaped(ICON_SEARCH)) }
@@ -330,7 +378,7 @@ fn filter_bar(
                     }
                 }
             }
-            a.dirtoggle href=(browse_url(base, q, source, sort, !desc, tab, 0))
+            a.dirtoggle href=(browse_url(base, q, source, sort, !desc, tier, tab, 0))
                 title=(if desc { "Sorted descending" } else { "Sorted ascending" })
                 aria-label="Toggle sort direction" {
                 (PreEscaped(if desc { ICON_SORT_DESC } else { ICON_SORT_ASC }))
@@ -345,6 +393,7 @@ fn pager(
     source: &str,
     sort: db::SortField,
     desc: bool,
+    tier: &str,
     tab: Option<&str>,
     page: i64,
     has_next: bool,
@@ -354,13 +403,13 @@ fn pager(
         @if page > 0 || has_next {
             div.pager.top[top] {
                 @if page > 0 {
-                    a.btn.ghost href=(browse_url(base, q, source, sort, desc, tab, page - 1)) { "prev" }
+                    a.btn.ghost href=(browse_url(base, q, source, sort, desc, tier, tab, page - 1)) { "prev" }
                 } @else {
                     span.btn.ghost.off { "prev" }
                 }
                 span.muted { "page " (page + 1) }
                 @if has_next {
-                    a.btn.ghost href=(browse_url(base, q, source, sort, desc, tab, page + 1)) { "next" }
+                    a.btn.ghost href=(browse_url(base, q, source, sort, desc, tier, tab, page + 1)) { "next" }
                 } @else {
                     span.btn.ghost.off { "next" }
                 }
@@ -375,6 +424,7 @@ fn browse_url(
     source: &str,
     sort: db::SortField,
     desc: bool,
+    tier: &str,
     tab: Option<&str>,
     page: i64,
 ) -> String {
@@ -388,6 +438,9 @@ fn browse_url(
     parts.push(format!("sort={}", sort.as_str()));
     if !desc {
         parts.push("dir=asc".to_string());
+    }
+    if !tier.is_empty() {
+        parts.push(format!("tier={}", qs_encode(tier)));
     }
     if let Some(t) = tab {
         if t != "posts" {
@@ -514,7 +567,8 @@ async fn creator_page(
     headers: HeaderMap,
 ) -> Html<String> {
     let page = query.page.unwrap_or(0).max(0);
-    let mut posts = db::creator_posts(&pool, &platform, &creator_id, PAGE + 1, page * PAGE)
+    let tier = tier_param(query.tier.as_deref());
+    let mut posts = db::creator_posts(&pool, &platform, &creator_id, tier_db(&tier), PAGE + 1, page * PAGE)
         .await
         .unwrap_or_default();
     let has_next = posts.len() as i64 > PAGE;
@@ -535,9 +589,10 @@ async fn creator_page(
                 span.muted { (total) @if total == 1 { " post" } @else { " posts" } }
             }
             @if is_mod(&headers) { (mod_bar_creator(&platform, &creator_id)) }
+            (tier_tabs(&base, "", "", db::SortField::Created, true, &tier))
             @if posts.is_empty() { p.muted { "Nothing here yet" } }
             (posts_grid(&posts))
-            (pager(&base, "", "", db::SortField::Created, true, None, page, has_next, false))
+            (pager(&base, "", "", db::SortField::Created, true, &tier, None, page, has_next, false))
         },
     )
 }
@@ -1524,6 +1579,7 @@ main { max-width:1240px; margin:0 auto; padding:1.4rem 1.1rem 3rem }
 .chip.platform { background:color-mix(in srgb, var(--accent) 22%, var(--surface1)); color:var(--text) }
 .chip.danger { background:color-mix(in srgb, var(--red) 26%, var(--surface1)); color:var(--text); font-weight:700 }
 .chip.ok { background:color-mix(in srgb, var(--green) 22%, var(--surface1)); color:var(--text) }
+.chip.paid { background:color-mix(in srgb, var(--yellow) 26%, var(--surface1)); color:var(--text) }
 
 .filters { display:flex; flex-wrap:wrap; align-items:center; gap:.6rem; margin:0 0 1rem }
 .searchfield { position:relative; display:flex; align-items:center; flex:1; min-width:220px }
