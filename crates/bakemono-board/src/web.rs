@@ -50,6 +50,8 @@ pub fn router(state: AppState) -> Router {
         .route("/p/{platform}/{creator_id}/{post_id}", get(post_page))
         .route("/mod", get(mod_page))
         .route("/mod/deny-cid", post(mod_deny_cid))
+        .route("/mod/cookie-autoimport", post(mod_cookie_autoimport))
+        .route("/mod/cookie-delete", post(mod_cookie_delete))
         .route("/mod/remove-post", post(mod_remove_post))
         .route("/mod/remove-creator", post(mod_remove_creator))
         .route("/head.json", get(head_json))
@@ -1144,40 +1146,152 @@ async fn mod_page(State(state): State<AppState>, headers: HeaderMap) -> Response
     if let Err(denied) = require_mod(&headers) {
         return denied;
     }
+    let keys = db::cookie_overview(&state.pool).await.unwrap_or_default();
+    let creators = db::cookie_creator_rows(&state.pool).await.unwrap_or_default();
     let denied = db::denylist(&state.pool).await.unwrap_or_default();
-    let cookies = db::cookie_overview(&state.pool).await.unwrap_or_default();
-    let live = cookies.iter().filter(|c| c.2 == "live").count();
-    let page = render(
-        "mod",
-        html! {
-            h1 { "Moderation" }
-            h3 { "Take down a file" }
-            p.muted { "Denies the CID (and its preview), unpins it fleet-wide, republishes the manifest with a revoked entry. Post and creator removal buttons live on their pages" }
-            form method="post" action="/mod/deny-cid" {
+    let page = render("mod", mod_body(&keys, &creators, &denied));
+    with_mod_cookie(page.into_response())
+}
+
+fn mod_body(
+    keys: &[db::CookieRow],
+    creators: &[(i64, String, String, String, bool)],
+    denied: &[(String, String, String)],
+) -> Markup {
+    let live = keys.iter().filter(|k| k.status == "live").count();
+    let paused = keys.iter().filter(|k| !k.allow_autoimport).count();
+    let reach: i64 = keys.iter().map(|k| k.creators).sum();
+    html! {
+        div.modhead {
+            h1.pagetitle { "Contributor keys" }
+            a.viewlink href="#takedowns" { "Takedowns" }
+        }
+        div.stats {
+            (stat_card(keys.len() as i64, "keys"))
+            (stat_card(live as i64, "live"))
+            (stat_card(paused as i64, "paused"))
+            (stat_card(reach, "creators reached"))
+            (stat_card(denied.len() as i64, "revoked"))
+        }
+        section.block {
+            p.muted { "Keys are the encrypted session cookies contributors hand the board. Tokens stay sealed with the offline key: pause skips a key on the next round, drop deletes its token for good. Rounds run with " code { "bakemono autoimport < cookie-private.pem" } }
+            (keys_list(keys, creators))
+        }
+        (takedown_panel(denied))
+    }
+}
+
+fn keys_list(keys: &[db::CookieRow], creators: &[(i64, String, String, String, bool)]) -> Markup {
+    html! {
+        @if keys.is_empty() {
+            p.muted { "No contributor keys yet - they arrive through the /contribute form" }
+        } @else {
+            ul.list.rows {
+                @for k in keys { (key_row(k, creators)) }
+            }
+        }
+    }
+}
+
+fn key_row(k: &db::CookieRow, creators: &[(i64, String, String, String, bool)]) -> Markup {
+    let has_creators = creators.iter().any(|c| c.0 == k.id);
+    html! {
+        li {
+            div.rowmain {
+                div.rowtitle {
+                    span.chip.platform { (crate::platform::label(&k.platform)) }
+                    " " (key_status_chip(k)) " key #" (k.id)
+                }
+                div.rowmeta.muted {
+                    (k.creators) @if k.creators == 1 { " creator" } @else { " creators" }
+                    " - added " (short_date(k.added.as_deref()))
+                    " - last ok " (short_date(k.last_ok.as_deref()))
+                    @if k.status == "dead" { " - last tried " (short_date(k.last_checked.as_deref())) }
+                    @if k.allow_debug { " - debug allowed" }
+                }
+                @if let Some(e) = &k.error { div.rowmeta.error { (e) } }
+                @if has_creators { (creator_sublist(&k.platform, k.id, creators)) }
+            }
+            div.rowactions {
+                form.modform method="post" action="/mod/cookie-autoimport" {
+                    input type="hidden" name="id" value=(k.id);
+                    input type="hidden" name="enable" value=(if k.allow_autoimport { "0" } else { "1" });
+                    button.ok[!k.allow_autoimport] type="submit" { (if k.allow_autoimport { "Pause" } else { "Resume" }) }
+                }
+                form.modform method="post" action="/mod/cookie-delete"
+                    onsubmit="return confirm('Drop this contributor key? Its stored token is deleted and it stops importing')" {
+                    input type="hidden" name="id" value=(k.id);
+                    button.danger type="submit" { "Drop key" }
+                }
+            }
+        }
+    }
+}
+
+fn key_status_chip(k: &db::CookieRow) -> Markup {
+    html! {
+        @match k.status.as_str() {
+            "live" if k.allow_autoimport => span.chip.ok { "live" },
+            "live" => span.chip { "paused" },
+            "dead" => span.chip.danger { "dead" },
+            other => span.chip { (other) },
+        }
+    }
+}
+
+fn creator_sublist(platform: &str, key_id: i64, creators: &[(i64, String, String, String, bool)]) -> Markup {
+    let mine: Vec<_> = creators.iter().filter(|c| c.0 == key_id).collect();
+    let active = mine.iter().filter(|c| c.4).count();
+    html! {
+        details.spoiler.keycreators {
+            summary { "Creators reached (" (active) ")" }
+            div.spbody {
+                ul.list {
+                    @for c in &mine {
+                        @let name = if c.2.is_empty() { c.1.as_str() } else { c.2.as_str() };
+                        li {
+                            @if c.4 {
+                                a href=(format!("/c/{}/{}", platform, c.1)) { (name) }
+                            } @else {
+                                span.muted { (name) " (unsubscribed)" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn takedown_panel(denied: &[(String, String, String)]) -> Markup {
+    html! {
+        section.block id="takedowns" {
+            div.blockhead { h2 { "Takedowns" } }
+            p.muted { "Denies a CID and its preview, unpins it fleet-wide, and republishes the manifest with a revoked entry. Per-post and per-creator buttons live on their own pages" }
+            form.takedown method="post" action="/mod/deny-cid" {
                 input type="text" name="cid" placeholder="bafy..." required;
                 input type="text" name="reason" placeholder="reason (dmca-us, csam, wrong-content...)";
                 button type="submit" { "Take down" }
             }
             h3 { "Revoked (" (denied.len()) ")" }
-            @if denied.is_empty() { p.muted { "Nothing revoked" } }
-            @for d in &denied {
-                p { code { (d.0) } " - " (d.1) " - " (pretty_date(&d.2)) }
-            }
-            h3 { "Contributor cookies (" (live) " live / " (cookies.len()) ")" }
-            p.muted { "Tokens are encrypted; run an import round with `bakemono autoimport < cookie-private.pem`" }
-            @if cookies.is_empty() { p.muted { "No cookies submitted yet" } }
-            @for (id, platform, status, creators, last_ok, error) in &cookies {
-                p {
-                    @if status == "live" { span.chip { "live" } } @else { span.chip.muted { (status) } }
-                    " #" (id) " " (crate::platform::label(platform))
-                    " - " (creators) " creators"
-                    " - last ok: " (last_ok.clone().unwrap_or_else(|| "never".into()))
-                    @if let Some(e) = error { span.muted { " - " (e) } }
+            @if denied.is_empty() {
+                p.muted { "Nothing revoked" }
+            } @else {
+                ul.list {
+                    @for d in denied {
+                        li { code { (d.0) } " " span.chip.danger { (d.1) } " " span.muted { (pretty_date(&d.2)) } }
+                    }
                 }
             }
-        },
-    );
-    with_mod_cookie(page.into_response())
+        }
+    }
+}
+
+fn short_date(raw: Option<&str>) -> String {
+    match raw {
+        Some(s) => pretty_date(s),
+        None => "never".to_string(),
+    }
 }
 
 fn mod_bar_post(platform: &str, creator_id: &str, post_id: &str) -> Markup {
@@ -1289,6 +1403,51 @@ async fn mod_deny_cid(
         Ok(()) => Redirect::to("/mod").into_response(),
         Err(e) => {
             tracing::error!("deny-cid failed: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CookieToggleForm {
+    id: i64,
+    enable: String,
+}
+
+async fn mod_cookie_autoimport(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CookieToggleForm>,
+) -> Response {
+    if let Err(denied) = require_mod(&headers) {
+        return denied;
+    }
+    match db::set_cookie_autoimport(&state.pool, form.id, form.enable == "1").await {
+        Ok(()) => Redirect::to("/mod").into_response(),
+        Err(e) => {
+            tracing::error!("cookie autoimport toggle failed: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CookieIdForm {
+    id: i64,
+}
+
+async fn mod_cookie_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CookieIdForm>,
+) -> Response {
+    if let Err(denied) = require_mod(&headers) {
+        return denied;
+    }
+    match db::delete_cookie(&state.pool, form.id).await {
+        Ok(()) => Redirect::to("/mod").into_response(),
+        Err(e) => {
+            tracing::error!("cookie delete failed: {e:#}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1886,6 +2045,9 @@ li.report.csam { border-left:3px solid var(--red); padding-left:.6rem }
 .rowactions { display:flex; gap:.5rem; flex-wrap:wrap; align-items:center; margin-left:auto }
 .takedown { display:flex; flex-wrap:wrap; gap:.4rem; margin:.6rem 0 1rem }
 .takedown input, .takedown select { flex:1 1 12rem; padding:.5rem .7rem; border-radius:9px; border:1px solid var(--surface1); background:var(--surface0); color:var(--text) }
+.keycreators { max-width:34rem; margin:.55rem 0 .1rem; flex-basis:100% }
+.keycreators .spbody { padding:.1rem .8rem .5rem }
+.keycreators .list li { padding:.32rem 0; font-size:.9rem }
 code { background:var(--surface0); padding:.1rem .35rem; border-radius:5px; word-break:break-all; font-size:.85em }
 pre { white-space:pre-wrap; word-break:break-all; background:var(--mantle); border:1px solid var(--surface0); padding:.7rem .9rem; border-radius:10px }
 
@@ -2143,5 +2305,55 @@ mod tests {
         assert_eq!(pretty_date("2026-03-14T10:00:00.000+00:00"), "Mar 14, 2026");
         assert_eq!(pretty_date("2026-03-14"), "Mar 14, 2026");
         assert_eq!(pretty_date("not a date"), "not a date");
+    }
+
+    #[test]
+    fn key_management_page_reflects_each_key_state() {
+        use super::{mod_body, render};
+        use crate::db::CookieRow;
+        let keys = vec![
+            CookieRow {
+                id: 7, platform: "patreon".into(), status: "live".into(), creators: 12,
+                allow_autoimport: true, allow_debug: false,
+                last_ok: Some("2026-07-05 16:59:00+00".into()),
+                last_checked: Some("2026-07-06 04:00:00+00".into()),
+                added: Some("2026-06-20 11:00:00+00".into()), error: None,
+            },
+            CookieRow {
+                id: 5, platform: "fanbox".into(), status: "live".into(), creators: 3,
+                allow_autoimport: false, allow_debug: true,
+                last_ok: Some("2026-07-01 09:00:00+00".into()),
+                last_checked: Some("2026-07-01 09:00:00+00".into()),
+                added: Some("2026-06-28 08:00:00+00".into()), error: None,
+            },
+            CookieRow {
+                id: 2, platform: "patreon".into(), status: "dead".into(), creators: 0,
+                allow_autoimport: true, allow_debug: false,
+                last_ok: Some("2026-06-15 10:00:00+00".into()),
+                last_checked: Some("2026-07-06 04:00:00+00".into()),
+                added: Some("2026-06-10 10:00:00+00".into()),
+                error: Some("cookie rejected by the platform".into()),
+            },
+        ];
+        let creators = vec![
+            (7, "alice".into(), "Alice Draws".into(), "https://patreon.com/alice".into(), true),
+            (7, "bob".into(), "Bob Makes".into(), "https://patreon.com/bob".into(), true),
+            (7, "carol".into(), "Carol Retired".into(), "https://patreon.com/carol".into(), false),
+            (5, "dave".into(), "Dave Art".into(), "https://fanbox.cc/dave".into(), true),
+        ];
+        let denied = vec![
+            ("bafkreiexamplecidexamplecidexample".into(), "dmca-us".into(), "2026-07-02T00:00:00+00:00".into()),
+        ];
+        let html = render("mod", mod_body(&keys, &creators, &denied)).0;
+        assert!(html.contains("key #7"));
+        assert!(html.contains("Pause"), "an autoimport-on key offers Pause");
+        assert!(html.contains("Resume"), "an autoimport-off key offers Resume");
+        assert!(html.contains("Drop key"));
+        assert!(html.contains(">dead<"));
+        assert!(html.contains("cookie rejected by the platform"));
+        assert!(html.contains("last tried"));
+        assert!(html.contains("Creators reached"));
+        assert!(html.contains("(unsubscribed)"));
+        assert!(html.contains("Takedowns"));
     }
 }

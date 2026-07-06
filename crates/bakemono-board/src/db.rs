@@ -542,17 +542,65 @@ pub async fn mark_cookie(pool: &PgPool, cookie_id: i64, status: &str, error: Opt
     Ok(())
 }
 
-// mod-page view: one row per cookie with its live-creator count, no secrets
-pub async fn cookie_overview(pool: &PgPool) -> Result<Vec<(i64, String, String, i64, Option<String>, Option<String>)>> {
+#[derive(sqlx::FromRow)]
+pub struct CookieRow {
+    pub id: i64,
+    pub platform: String,
+    pub status: String,
+    pub creators: i64,
+    pub allow_autoimport: bool,
+    pub allow_debug: bool,
+    pub last_ok: Option<String>,
+    pub last_checked: Option<String>,
+    pub added: Option<String>,
+    pub error: Option<String>,
+}
+
+// mod-page view: one row per contributor key with its live-creator count, never any secret material
+pub async fn cookie_overview(pool: &PgPool) -> Result<Vec<CookieRow>> {
     let rows = sqlx::query_as(
         "SELECT c.id, c.platform, c.status,
-                (SELECT COUNT(*) FROM cookie_creators cc WHERE cc.cookie_id = c.id AND cc.active),
-                c.last_ok_at::text, c.last_error
+                (SELECT COUNT(*) FROM cookie_creators cc WHERE cc.cookie_id = c.id AND cc.active) AS creators,
+                c.allow_autoimport, c.allow_debug,
+                c.last_ok_at::text AS last_ok, c.last_checked_at::text AS last_checked,
+                c.created_at::text AS added, c.last_error AS error
          FROM cookies c ORDER BY c.created_at DESC",
     )
     .fetch_all(pool)
     .await?;
     Ok(rows)
+}
+
+// every key's reachable creators for the mod-page expandable list; inactive rows are creators the
+// contributor has since unsubscribed from
+pub async fn cookie_creator_rows(pool: &PgPool) -> Result<Vec<(i64, String, String, String, bool)>> {
+    let rows = sqlx::query_as(
+        "SELECT cookie_id, creator_id, creator, url, active FROM cookie_creators
+         ORDER BY cookie_id, active DESC, creator",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+// drop a contributor key: deletes the sealed token outright (cookie_creators cascades), so the board
+// keeps nothing for it and every future round skips it
+pub async fn delete_cookie(pool: &PgPool, id: i64) -> Result<()> {
+    sqlx::query("DELETE FROM cookies WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+// pause or resume a key without dropping it: an off cookie stays sealed but no round decrypts it
+pub async fn set_cookie_autoimport(pool: &PgPool, id: i64, on: bool) -> Result<()> {
+    sqlx::query("UPDATE cookies SET allow_autoimport = $2 WHERE id = $1")
+        .bind(id)
+        .bind(on)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 // sha256 rides along so a later re-scrape of the same bytes is refused before anything re-pins;
