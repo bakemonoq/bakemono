@@ -78,8 +78,8 @@ services:
       # copy board.toml.example to ./board.toml, then uncomment BAKEMONO_CONFIG and the mount below
       # BAKEMONO_CONFIG: /config/board.toml
       BAKEMONO_DENYLIST_DIR: /denylists
-    ports:
-      - "3000:3000"
+    expose:
+      - "3000"
     volumes:
       - bakemono-data:/data
       - bakemono-scrape:/scrape
@@ -92,6 +92,19 @@ services:
       - cluster
     restart: unless-stopped
 
+  # single origin for browsers: /ipfs/* -> kubo gateway (media), everything else -> board
+  caddy:
+    image: caddy:2
+    depends_on:
+      - board
+      - kubo
+    ports:
+      - "3000:80"
+    volumes:
+      - ./defaults/Caddyfile:/etc/caddy/Caddyfile:ro
+      - bakemono-caddy:/data
+    restart: unless-stopped
+
 volumes:
   bakemono-pg:
   bakemono-ipfs:
@@ -99,3 +112,4 @@ volumes:
   bakemono-data:
   bakemono-scrape:
   bakemono-denylist:
+  bakemono-caddy:

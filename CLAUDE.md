@@ -16,7 +16,7 @@ The IPFS stack is implemented and the Nostr/BitTorrent code is deleted (crates b
 
 - `bakemono-core` - shared library crate. Manifest types (head / root / shard), canonical JSON, ed25519 signing and verification, frozen `ipfs add` parameter constants. Pure logic, zero I/O. Unit-tested in isolation.
 - `bakemono-scraper` - thin gallery-dl wrapper library (invocation, cookies, streaming output, download archive).
-- `bakemono-board` - the `bakemono` binary. Subcommands: `serve` (web UI + `/contribute` intake + scrape worker + manifest publisher + `/f/{cid}` gateway proxy - the only long-running process), `scrape` (one-off creator scrape with a cookies.txt), `ingest` (import a directory of already-scraped files + sidecars), `keygen` (generate the cookie RSA keypair), `autoimport` (run one keyed import round, private key from stdin), `restore` (rebuild postgres and pinset from a head CID). Rust: axum + sqlx + maud + Postgres.
+- `bakemono-board` - the `bakemono` binary. Subcommands: `serve` (web UI + `/contribute` intake + scrape worker + manifest publisher + nopfs denylist writer - the only long-running process; media is served at `/ipfs/{cid}` by the local Kubo gateway, not proxied through the board), `scrape` (one-off creator scrape with a cookies.txt), `ingest` (import a directory of already-scraped files + sidecars), `keygen` (generate the cookie RSA keypair), `autoimport` (run one keyed import round, private key from stdin), `restore` (rebuild postgres and pinset from a head CID). Rust: axum + sqlx + maud + Postgres.
 
 ## Contributor cookies
 
@@ -38,7 +38,7 @@ Alongside on the board host: postgres, Kubo, `ipfs-cluster-service`. Operator ke
 | Source retrieval | gallery-dl, yt-dlp invoked server-side by the scrape worker; ffmpeg for thumbnails |
 | Async runtime | tokio |
 | HTTP client | reqwest |
-| Browser delivery | board proxies its local Kubo gateway (`Gateway.NoFetch`, nopfs denylist), plain HTTP with `Range` |
+| Browser delivery | media served at `/ipfs/{cid}` by the local Kubo gateway (`Gateway.NoFetch`, nopfs denylist) behind a reverse proxy, plain HTTP with `Range`; the board is out of the byte path |
 | Fleet connectivity | cluster bootstrap + `Peering.Peers`; public DHT best-effort with `Reprovider.Strategy=roots` |
 
 ## What is in MVP v0

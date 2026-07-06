@@ -11,7 +11,7 @@ Quick reference for terms used throughout the Bakemono docs and code.
 - **UnixFS**: IPFS's file encoding. Manifest objects are plain JSON stored as UnixFS files; CID references inside them are strings, not IPLD links, so pinning an object does not pin what it names.
 - **Pin**: instruction to a node to keep a CID and protect it from GC. Unpinned blocks are garbage, not deleted; GC deletes them.
 - **GC (garbage collection)**: `ipfs repo gc`, the pass that actually frees unpinned blocks. Nodes must run it periodically or "removed" content stays on disk.
-- **Gateway**: an HTTP door into an IPFS node. The board proxies its local Kubo gateway at `/f/{cid}` with `Gateway.NoFetch=true`, so it serves only blocks it already holds.
+- **Gateway**: an HTTP door into an IPFS node. Browsers load media at `/ipfs/{cid}` directly from the board host's local Kubo gateway (`Gateway.NoFetch=true`, so it serves only blocks it already holds); a reverse proxy routes `/ipfs/*` to it. The board is not in the byte path.
 - **NoFetch**: gateway setting preventing the node from fetching arbitrary CIDs from the network on request. Without it a public gateway will happily serve anything, including content the board took down.
 - **Denylist / nopfs**: Kubo's block-by-CID mechanism. The board writes revoked CIDs into it so the gateway refuses them regardless of what is on disk.
 - **DHT**: the distributed lookup table mapping CIDs to providers. Provider records expire (~36h) and must be reannounced; at archive scale nodes run `Reprovider.Strategy=roots` and rely on direct peering inside the fleet.
@@ -34,7 +34,7 @@ Quick reference for terms used throughout the Bakemono docs and code.
 - **Shard**: one creator's posts on one platform, keyed `<platform>:<creator_id>`. Unchanged shards keep their CID across versions, so syncs fetch only deltas.
 - **Pointer**: any channel resolving "current head CID": `head.json` over HTTPS, DNSLink, or the pinned head at any keeper. Untrusted transport; the head's signature carries the trust.
 - **Revoked**: the append-only list of content removed on purpose, with reasons. Drives automatic unpinning at keepers and denylisting at gateways.
-- **Board**: a self-hostable web instance: postgres index, scrape worker, publisher, gateway proxy, admin UI. One binary (`bakemono`) plus Kubo, cluster-service, and postgres.
+- **Board**: a self-hostable web instance: postgres index, scrape worker, publisher, admin UI. One binary (`bakemono`) plus Kubo (whose gateway serves the media), cluster-service, and postgres.
 - **Keeper**: someone donating disk and bandwidth by replicating the pinset. Runs stock Kubo + `ipfs-cluster-follow`; no Bakemono software. See `KEEPERS.md`.
 - **Fleet**: the operator's own keeper hosts, run as trusted cluster peers across failure domains.
 - **Board key**: the ed25519 keypair that signs heads. The board's identity; its offline backup is the recovery lynchpin.

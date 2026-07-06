@@ -15,7 +15,7 @@ Expect an acknowledgement within a few days. Once a fix is out, credit is offere
 The board runs untrusted-facing code, so these areas are the ones most worth probing:
 
 - **`/contribute`** accepts a platform and a session cookie from anonymous visitors and drives server-side `gallery-dl`. Cookie handling, abuse and resource exhaustion, and process invocation all live here.
-- **`/f/{cid}`** proxies the local Kubo gateway. It is meant to serve only already-pinned, catalogued, non-denylisted content.
+- **Media serving** at `/ipfs/{cid}` is the local Kubo gateway, fronted by a reverse proxy, not a board route. It relies on `Gateway.NoFetch=true` (serve only already-held blocks) and the nopfs denylist to refuse taken-down CIDs; a misconfigured gateway or a stale denylist is the risk here.
 - **Cookie sealing** (`crypto.rs`): contributor tokens are sealed with per-cookie AES-256-GCM wrapped by RSA-4096; the private key stays offline. Anything that would expose plaintext at rest or in logs matters.
 - **`/mod`** endpoints mutate the manifest and pinset and are gated by a single Basic-auth token.
 

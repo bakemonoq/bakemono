@@ -27,8 +27,8 @@ End-to-end flow of one file, from source to a viewer's browser.
 3. **Add.** Each file is hashed (sha256), thumbnailed (ffmpeg, ~400px JPEG), and added to the local Kubo with the frozen parameters from `PROTOCOL.md`, yielding a CID. Metadata rows land in postgres.
 4. **Publish.** The publisher rebuilds the shards whose content changed, writes a new root, signs a new head (version+1, prev = old head), updates the pointer (head.json + DNSLink), and updates the cluster pinset: new CIDs in, revoked CIDs out.
 5. **Replicate.** Cluster peers and followers see the pinset change and fetch the new CIDs from the board's node (and from each other). Within minutes the file exists on every keeper.
-6. **Browse.** A viewer hits the board's web UI (axum + maud over postgres). The grid renders thumbnails, the post page renders `<img src="/f/{cid}">` / `<video>`.
-7. **Serve.** The `/f/{cid}` route checks the catalog and the denylist, then proxies the local Kubo gateway (`Gateway.NoFetch=true`, so only local blocks are ever served). `Range` passes through; the browser does no P2P and needs no connectivity to anything but the board. A CDN can sit in front; every URL is immutable.
+6. **Browse.** A viewer hits the board's web UI (axum + maud over postgres). The grid renders thumbnails, the post page renders `<img src="/ipfs/{cid}">` / `<video>`.
+7. **Serve.** Media URLs are `/ipfs/{cid}`, served directly by the local Kubo gateway (`Gateway.NoFetch=true`, so only blocks this node already holds ever leave), not proxied through the board - a reverse proxy on the board host routes `/ipfs/*` to the gateway and everything else to `serve`. Takedowns are enforced at the gateway by the nopfs denylist (the board writes `bakemono.deny`; nopfs refuses a revoked CID even if the block is still present). `Range` and immutable caching come from the gateway; the browser does no P2P. A CDN can sit in front; every URL is immutable.
 8. **Persist.** The file stays available as long as any node pins it. The board host dying does not remove it from the fleet; every keeper serves it to any IPFS peer, and a resurrected board re-pins everything from them.
 
 ## Code layout
@@ -42,7 +42,7 @@ Bakemono/
                        # signing, frozen add parameters. Pure logic, zero I/O.
     bakemono-scraper/  # thin gallery-dl wrapper: invocation, cookies, streaming, download archive
     bakemono-board/    # the `bakemono` binary
-      serve            #   web UI, scrape worker, publisher, gateway proxy
+      serve            #   web UI, scrape worker, publisher, denylist writer
       scrape           #   one-off scrape of a source url into the archive
       ingest           #   import a directory of already-scraped files + sidecars
       restore          #   rebuild postgres + pinset from a head CID
@@ -61,12 +61,14 @@ Alongside, on the board host: postgres, Kubo, `ipfs-cluster-service`. On the ope
 +----------------------------------------------+
 | board host                                   |
 |----------------------------------------------|
+| reverse proxy: /ipfs/* -> kubo, else -> serve|
 | bakemono serve                               |
 |   axum web UI  <- postgres (derived index)   |
 |   scrape worker (gallery-dl / yt-dlp)        |
 |   publisher (shards, head, pointer, pinset)  |
-|   /f/{cid} proxy -> local Kubo gateway       |
-| kubo (NoFetch, denylist)                     |
+|   writes nopfs .deny for the gateway         |
+| kubo gateway (NoFetch, nopfs denylist)       |
+|   serves /ipfs/{cid} to browsers directly    |
 | ipfs-cluster-service (trusted peer)          |
 +---------------------+------------------------+
                       | cluster pinset sync + bitswap
@@ -78,7 +80,7 @@ Alongside, on the board host: postgres, Kubo, `ipfs-cluster-service`. On the ope
 | service (trusted)|       | follow               |
 +------------------+       +----------------------+
 
-viewer's browser -> board web UI + /f/{cid} over plain HTTP (Range, immutable cache)
+viewer's browser -> board web UI (html/api) + kubo gateway /ipfs/{cid} over plain HTTP (Range, immutable cache)
 peer board       -> GET /head.json, verify sig, import shards, apply revoked
 ```
 

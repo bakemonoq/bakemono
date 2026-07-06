@@ -5,7 +5,7 @@ The smallest demoable system on the IPFS architecture: one board scraping server
 ## Acceptance criteria
 
 1. Operator adds a creator and cookies; the scrape worker retrieves the posts; they appear on the board with thumbnails.
-2. A browser previews images and short video straight off `/f/{cid}` with `Range` working.
+2. A browser previews images and short video straight off `/ipfs/{cid}` (the local Kubo gateway) with `Range` working.
 3. The manifest head publishes and resolves through both `head.json` and DNSLink, and verifies against the board key.
 4. A second host running stock Kubo + `ipfs-cluster-follow` replicates the full pinset with no Bakemono software installed.
 5. A takedown removes a file: the next manifest version carries it in `revoked`, the follower unpins it, the gateway refuses to serve it.
@@ -19,7 +19,7 @@ If all six work without intervention, MVP ships.
 - `bakemono-board` as the single `bakemono` binary: `serve`, `scrape`, `ingest`, `restore`
 - Scrape worker inside `serve`: gallery-dl / yt-dlp invocation, cookie store, ffmpeg thumbnails
 - Publisher: shard diffing, head signing, pointer update (head.json + DNSLink), cluster pinset update
-- Gateway proxy `/f/{cid}` to local Kubo with catalog check and denylist; `Gateway.NoFetch` posture
+- Media served at `/ipfs/{cid}` by the local Kubo gateway (`Gateway.NoFetch` + nopfs denylist); the board writes `bakemono.deny`, a reverse proxy routes `/ipfs/*` to the gateway
 - Kubo + `ipfs-cluster-service` deployment on the board host and 1-2 operator keeper hosts
 - Published follower config so volunteers can join with `ipfs-cluster-follow`
 - Takedown flow end to end (admin UI button -> revoked -> unpin -> denylist)
@@ -39,7 +39,7 @@ If all six work without intervention, MVP ships.
 Each step ships something demoable.
 
 1. **Rewrite `bakemono-core`.** Head/root/shard types, canonical JSON serializer, ed25519 sign + verify, frozen add-parameter constants. Unit tests: sign/verify roundtrip; canonical form byte-stability; version monotonicity rejection; unchanged shard -> unchanged CID (delta stability); unknown-field tolerance.
-2. **Kubo integration in the board.** Add pipeline over the Kubo HTTP API with the frozen parameters; `/f/{cid}` proxy route with catalog + denylist checks and `Range` passthrough. Demo: add a file by hand, view it through the board.
+2. **Kubo integration in the board.** Add pipeline over the Kubo HTTP API with the frozen parameters; media served at `/ipfs/{cid}` by the local Kubo gateway (`Range` passthrough, NoFetch). Demo: add a file by hand, view it through the board.
 3. **Fold scraping into the board.** Move the engine/scraper code from `bakemono-engine` / `bakemono-scraper` into `bakemono-board`; per-creator scrape jobs, cookie store in postgres, thumbnail generation. `bakemono scrape <creator>` works headless; `serve` runs the same jobs on schedule.
 4. **Publisher.** Build shards from postgres, diff against the previous version, sign and publish the head, write `head.json`, update DNSLink. Demo: `curl head.json | jq`, walk the DAG by hand.
 5. **Cluster.** `ipfs-cluster-service` on the board host + one operator keeper host; publisher updates the pinset through the cluster API. Demo: acceptance criterion 4.
