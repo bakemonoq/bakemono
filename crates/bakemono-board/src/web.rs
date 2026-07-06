@@ -891,24 +891,31 @@ fn spawn_import(state: &AppState, cookie_id: Option<i64>, platform: String, toke
 
 async fn keepers(headers: HeaderMap) -> Html<String> {
     let base = base_url(&headers);
+    let script_url = REPO.replace("github.com", "raw.githubusercontent.com") + "/main/scripts/keeper-setup.sh";
+    let quick_cmd = format!("curl -fsSL {script_url} | sudo bash -s -- {base}");
     render(
         "keepers",
         html! {
             section.keepwrap {
                 div.contribintro {
                     h1 { "Become a keeper" }
-                    p { "Help the archive outlive any single server. Keepers mirror everything this board holds using two standard IPFS programs - no account, and nothing from Bakemono to install" }
+                    p { "Help the archive outlive any single server. A keeper mirrors everything this board holds - every file, thumbnail, and the signed manifest history. If the board dies, it is rebuilt from any keeper" }
                 }
                 div.panel {
-                    h3 { "Quick start" }
-                    p.muted { "Install kubo (docs.ipfs.tech/install), then run:" }
+                    h3 { "Quick setup (Linux)" }
+                    p.muted { "One command on a fresh Linux box. It installs IPFS and the cluster follower, wires up this board, and runs both under systemd:" }
+                    pre { code { (quick_cmd) } }
+                    p.muted.small { "Want to read it first? Source: " a href=(script_url) rel="noopener noreferrer" target="_blank" { "keeper-setup.sh" } }
+                }
+                div.panel {
+                    h3 { "Manual setup" }
+                    p.muted { "Prefer to install by hand, or not on Linux? Install kubo (docs.ipfs.tech/install) and ipfs-cluster-follow, then:" }
                     pre { code {
                         "ipfs init\n"
                         "ipfs config --json Bitswap.ServerEnabled true\n"
                         "ipfs config --json Internal.Bitswap.BroadcastControl.Enable false\n"
                         "ipfs config --json Reprovider.Strategy '\"roots\"'\n"
                         "ipfs daemon --enable-gc &\n\n"
-                        "# follow this board's pinset (ipfscluster.io)\n"
                         "ipfs-cluster-follow bakemono init " (base) "/follower.json\n"
                         "ipfs-cluster-follow bakemono run"
                     } }
@@ -920,7 +927,7 @@ async fn keepers(headers: HeaderMap) -> Html<String> {
                         p { "If this server ever dies, the whole board can be rebuilt from any keeper's copy" }
                     }))
                     (faq_item("What do I need to do?", html! {
-                        p { "Run the two commands above and leave them running. There is no board software, no account, and nothing to maintain by hand" }
+                        p { "On Linux: paste the quick-setup command and leave it. It installs everything, points the follower at this board, and keeps both running across reboots. There is no board software, no account, and nothing to maintain by hand" }
                         p { "You mirror the entire archive. Following just one creator or platform is not supported yet" }
                     }))
                     (faq_item("What happens over time?", html! {
@@ -1473,7 +1480,6 @@ pub(crate) fn render(title: &str, body: Markup) -> Html<String> {
                                 a href="/posts" { (PreEscaped(ICON_POSTS)) span { "Posts" } }
                                 a href="/contribute" { (PreEscaped(ICON_CONTRIBUTE)) span { "Contribute" } }
                                 a href="/keepers" { (PreEscaped(ICON_KEEPERS)) span { "Keepers" } }
-                                a href="/api" { (PreEscaped(ICON_API)) span { "API" } }
                             }
                         }
                     }
@@ -2028,5 +2034,17 @@ mod tests {
         assert_eq!(pretty_date("2026-03-14T10:00:00.000+00:00"), "Mar 14, 2026");
         assert_eq!(pretty_date("2026-03-14"), "Mar 14, 2026");
         assert_eq!(pretty_date("not a date"), "not a date");
+    }
+
+    #[test]
+    fn dump_pages() {
+        let dir = "/tmp/scratch";
+        std::fs::write(format!("{dir}/style.css"), super::STYLE).unwrap();
+        std::fs::write(format!("{dir}/contribute.html"), super::render("contribute", super::contribute_body(None)).0).unwrap();
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(axum::http::header::HOST, "bake.example".parse().unwrap());
+        h.insert("x-forwarded-proto", "https".parse().unwrap());
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        std::fs::write(format!("{dir}/keepers.html"), rt.block_on(super::keepers(h)).0).unwrap();
     }
 }
