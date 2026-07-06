@@ -554,19 +554,25 @@ fn scraper_for(platform: &str) -> Scraper {
 }
 
 // two global scrape proxies: BAKEMONO_SCRAPE_PROXY carries the api, _MEDIA_PROXY the bulk media
-// (defaults to the api proxy). they apply to every platform's scrape so the box IP is never exposed
-// to a source, and the tiny api can ride an expensive proxy while media takes a cheap one. session
-// rotation only applies to a proxy that actually carries a `session-<token>` segment
+// (defaults to the api proxy). they apply only to platforms that need one (Cloudflare-gated), so
+// direct-reachable sources like Patreon keep the box's full bandwidth. session rotation only applies
+// to a proxy that actually carries a `session-<token>` segment
 fn scrape_proxy() -> Option<String> {
     std::env::var("BAKEMONO_SCRAPE_PROXY").ok().filter(|s| !s.trim().is_empty())
 }
 
-// proxy for the probe (api only, no downloads)
-fn platform_proxy(_platform: &str) -> Option<String> {
+// proxy for the probe (api only, no downloads); none for platforms that scrape direct
+fn platform_proxy(platform: &str) -> Option<String> {
+    if !crate::platform::needs_proxy(platform) {
+        return None;
+    }
     scrape_proxy().map(|t| rotate_session(&t))
 }
 
 fn scrape_options(platform: &str) -> Vec<String> {
+    if !crate::platform::needs_proxy(platform) {
+        return Vec::new();
+    }
     let Some(api) = scrape_proxy() else {
         return Vec::new();
     };

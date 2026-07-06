@@ -49,12 +49,19 @@ pub fn is_live(id: &str) -> bool {
     find(id).is_some_and(|p| p.live && runtime_ready(p.id))
 }
 
-// a platform can be code-ready (live) but need runtime config before it actually works. Fanbox is
-// behind Cloudflare, so it only works once a scrape proxy is configured
+// only Cloudflare-gated sources need the scrape proxy; everyone else scrapes direct (full bandwidth, no
+// proxy traffic). Fanbox is behind Cloudflare, so it needs the firefox-impersonating proxy
+pub fn needs_proxy(id: &str) -> bool {
+    matches!(id, "fanbox")
+}
+
+// a platform can be code-ready (live) but need runtime config before it actually works: a proxy-gated
+// source only works once a scrape proxy is configured
 fn runtime_ready(id: &str) -> bool {
-    match id {
-        "fanbox" => std::env::var("BAKEMONO_SCRAPE_PROXY").is_ok_and(|v| !v.trim().is_empty()),
-        _ => true,
+    if needs_proxy(id) {
+        std::env::var("BAKEMONO_SCRAPE_PROXY").is_ok_and(|v| !v.trim().is_empty())
+    } else {
+        true
     }
 }
 
