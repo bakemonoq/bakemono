@@ -1,18 +1,31 @@
+use std::collections::BTreeMap;
+use std::sync::{Mutex, OnceLock};
+
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
+use maud::html;
 use serde::Serialize;
 use sqlx::postgres::PgPool;
 
 use crate::db;
+use crate::web::AppState;
 
-// read-only JSON index. file references are IPFS CIDs, never bytes: a scraper reads structure here and
+// read-only JSON index. file references are IPFS CIDs, never bytes: a consumer reads structure here and
 // fetches content from any IPFS node, so browsing us over HTML and proxying media through our gateway
-// both drop off once other keepers hold the pinset
+// both fall away once other keepers hold the pinset
 const API_PAGE: i64 = 100;
+const GUIDE: &str = "https://docs.ipfs.tech/how-to/command-line-quick-start/";
+const NOTICE: &str = "Please don't scrape these pages. This API hands out IPFS CIDs, not bytes - fetch content with IPFS tooling instead. Any node or public gateway serves the same CID, it keeps load off this board, and the more you pull over IPFS the less any single host matters.";
+const ENDPOINTS: &[&str] = &[
+    "/api/posts?source=&tier=&q=&sort=&dir=&page=",
+    "/api/posts/{platform}/{creator_id}/{post_id}",
+    "/api/creators?source=&sort=&dir=&page=",
+    "/api/creators/{platform}/{creator_id}?tier=&page=",
+];
 
-pub fn routes() -> axum::Router<crate::web::AppState> {
+pub fn routes() -> axum::Router<AppState> {
     use axum::routing::get;
     axum::Router::new()
         .route("/api", get(index))
@@ -22,19 +35,60 @@ pub fn routes() -> axum::Router<crate::web::AppState> {
         .route("/api/creators/{platform}/{creator_id}", get(creator))
 }
 
-async fn index() -> Json<ApiIndex> {
-    let cfg = crate::config::get();
+// browsers get a human page with the notice and guide, tools get the JSON index; both carry the head and
+// root CIDs so a consumer can walk the whole signed manifest (head -> root -> shards) straight from IPFS
+async fn index(State(pool): State<PgPool>, headers: HeaderMap) -> Response {
+    let (head, root) =
+        db::last_head(&pool).await.ok().flatten().map(|h| (h.head_cid, h.root_cid)).unzip();
+    if wants_html(&headers) {
+        return page(head.as_deref(), root.as_deref()).into_response();
+    }
     Json(ApiIndex {
-        board: cfg.name.clone(),
-        note: "file references are IPFS CIDs, not bytes; fetch content from any IPFS node or gateway, e.g. ipfs://<cid>",
-        head: "/head.json",
-        endpoints: &[
-            "/api/posts?source=&tier=&q=&sort=&dir=&page=",
-            "/api/posts/{platform}/{creator_id}/{post_id}",
-            "/api/creators?source=&sort=&dir=&page=",
-            "/api/creators/{platform}/{creator_id}?tier=&page=",
-        ],
+        board: crate::config::get().name.clone(),
+        notice: NOTICE,
+        guide: GUIDE,
+        head,
+        root,
+        endpoints: ENDPOINTS,
     })
+    .into_response()
+}
+
+fn wants_html(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| a.contains("text/html"))
+}
+
+fn page(head: Option<&str>, root: Option<&str>) -> Html<String> {
+    crate::web::render(
+        "API",
+        html! {
+            h1.pagetitle { "API" }
+            div.aboutblock {
+                p { (NOTICE) }
+                p {
+                    "New to IPFS? "
+                    a href=(GUIDE) rel="noopener noreferrer" target="_blank" { "a short how-to" }
+                    ". In short: fetch a CID with " code { "ipfs get <cid>" } ", or open "
+                    code { "https://dweb.link/ipfs/<cid>" } " in a browser"
+                }
+            }
+            h3 { "Manifest" }
+            p {
+                "The whole signed index lives in IPFS as head -> root -> per-creator shards. Start from "
+                a href="/head.json" { "/head.json" } " and walk it; no per-post request touches this board"
+            }
+            @if let Some(h) = head { p { "head " code { (h) } } }
+            @if let Some(r) = root { p { "root " code { (r) } } }
+            h3 { "Endpoints" }
+            p { "Every file reference is a CID plus an " code { "ipfs://<cid>" } " URI; bytes come from IPFS, not from us" }
+            div.aboutblock {
+                @for e in ENDPOINTS { p { code { (e) } } }
+            }
+        },
+    )
 }
 
 async fn posts(State(pool): State<PgPool>, Query(q): Query<Browse>) -> Response {
@@ -78,28 +132,53 @@ async fn creators(State(pool): State<PgPool>, Query(q): Query<Browse>) -> Respon
     Json(CreatorList { page, has_next, creators: rows.iter().map(ApiCreator::from_card).collect() }).into_response()
 }
 
-async fn creator(State(pool): State<PgPool>, Path((platform, creator_id)): Path<(String, String)>, Query(q): Query<CreatorQuery>) -> Response {
+async fn creator(State(state): State<AppState>, Path((platform, creator_id)): Path<(String, String)>, Query(q): Query<CreatorQuery>) -> Response {
     let tier = tier_db(q.tier.as_deref());
     let page = q.page.unwrap_or(0).max(0);
-    let total = db::creator_post_count(&pool, &platform, &creator_id).await.unwrap_or(0);
-    let mut rows = db::creator_posts(&pool, &platform, &creator_id, tier, API_PAGE + 1, page * API_PAGE).await.unwrap_or_default();
+    let total = db::creator_post_count(&state.pool, &platform, &creator_id).await.unwrap_or(0);
+    let mut rows = db::creator_posts(&state.pool, &platform, &creator_id, tier, API_PAGE + 1, page * API_PAGE).await.unwrap_or_default();
     if rows.is_empty() && page == 0 && total == 0 {
         return StatusCode::NOT_FOUND.into_response();
     }
     let has_next = rows.len() as i64 > API_PAGE;
     rows.truncate(API_PAGE as usize);
     let name = rows.first().map(|p| p.creator.clone()).unwrap_or_else(|| creator_id.clone());
+    let shard_cid = shard_cid(&state, &platform, &creator_id).await;
     Json(CreatorDetail {
         platform,
         creator_id,
         creator: name,
         posts: total,
+        shard_cid,
         page,
         has_next,
         items: rows.iter().map(ApiPost::from_card).collect(),
     })
     .into_response()
 }
+
+// a creator's whole post index is one IPFS object (their shard); its CID lives in the signed Root. cache
+// the Root's shard map per manifest version so a lookup is a map hit, not a kubo fetch, past the first call
+async fn shard_cid(state: &AppState, platform: &str, creator_id: &str) -> Option<String> {
+    let root_cid = db::last_head(&state.pool).await.ok().flatten()?.root_cid;
+    let key = format!("{platform}:{creator_id}");
+    let cache = SHARD_CACHE.get_or_init(|| Mutex::new((String::new(), BTreeMap::new())));
+    if let Ok(g) = cache.lock() {
+        if g.0 == root_cid {
+            return g.1.get(&key).cloned();
+        }
+    }
+    let bytes = state.kubo.cat(&root_cid).await.ok()?;
+    let root: bakemono_core::Root = serde_json::from_slice(&bytes).ok()?;
+    let map: BTreeMap<String, String> = root.shards.into_iter().map(|(k, v)| (k, v.cid)).collect();
+    let found = map.get(&key).cloned();
+    if let Ok(mut g) = cache.lock() {
+        *g = (root_cid, map);
+    }
+    found
+}
+
+static SHARD_CACHE: OnceLock<Mutex<(String, BTreeMap<String, String>)>> = OnceLock::new();
 
 // browse params shared by the posts and creators listings; tier ("free"/"paid") only bites on posts
 #[derive(serde::Deserialize)]
@@ -147,8 +226,10 @@ fn cover_cid(thumb: Option<&str>) -> Option<String> {
 #[derive(Serialize)]
 struct ApiIndex {
     board: String,
-    note: &'static str,
-    head: &'static str,
+    notice: &'static str,
+    guide: &'static str,
+    head: Option<String>,
+    root: Option<String>,
     endpoints: &'static [&'static str],
 }
 
@@ -172,6 +253,8 @@ struct CreatorDetail {
     creator_id: String,
     creator: String,
     posts: i64,
+    // the creator's whole post index as a single IPFS object; fetch it instead of paging this endpoint
+    shard_cid: Option<String>,
     page: i64,
     has_next: bool,
     items: Vec<ApiPost>,

@@ -1430,7 +1430,7 @@ fn pretty_date(raw: &str) -> String {
     raw.to_string()
 }
 
-fn render(title: &str, body: Markup) -> Html<String> {
+pub(crate) fn render(title: &str, body: Markup) -> Html<String> {
     let cfg = config::get();
     let tab = if title.is_empty() {
         cfg.name.clone()
@@ -1473,6 +1473,7 @@ fn render(title: &str, body: Markup) -> Html<String> {
                                 a href="/posts" { (PreEscaped(ICON_POSTS)) span { "Posts" } }
                                 a href="/contribute" { (PreEscaped(ICON_CONTRIBUTE)) span { "Contribute" } }
                                 a href="/keepers" { (PreEscaped(ICON_KEEPERS)) span { "Keepers" } }
+                                a href="/api" { (PreEscaped(ICON_API)) span { "API" } }
                             }
                         }
                     }
@@ -1501,6 +1502,7 @@ fn footer(cfg: &config::BoardConfig) -> Markup {
                 }
                 nav.footlinks {
                     a href="/info" { (PreEscaped(ICON_INFO)) span { "Info" } }
+                    a href="/api" { (PreEscaped(ICON_API)) span { "API" } }
                     a href="/keepers" { (PreEscaped(ICON_KEEPERS)) span { "Keepers" } }
                     a href="/contribute" { (PreEscaped(ICON_CONTRIBUTE)) span { "Contribute" } }
                     @if let Some(email) = &cfg.contact { a href=(format!("mailto:{email}")) { (PreEscaped(ICON_MAIL)) span { "Contact" } } }
@@ -1546,6 +1548,7 @@ const ICON_POSTS: &str = "<svg viewBox='0 0 24 24' width='18' height='18' fill='
 const ICON_CONTRIBUTE: &str = "<svg viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.6l-1-1a5.5 5.5 0 1 0-7.8 7.8l1 1L12 21l7.8-7.6 1-1a5.5 5.5 0 0 0 0-7.8z'/></svg>";
 const ICON_IMAGE: &str = "<svg viewBox='0 0 24 24' width='30' height='30' fill='none' stroke='currentColor' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'><rect x='3' y='3' width='18' height='18' rx='2'/><circle cx='8.5' cy='8.5' r='1.5'/><path d='M21 15l-5-5L5 21'/></svg>";
 const ICON_INFO: &str = "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='9'/><path d='M12 16v-4M12 8h.01'/></svg>";
+const ICON_API: &str = "<svg viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M8 6l-6 6 6 6'/><path d='M16 6l6 6-6 6'/></svg>";
 const ICON_KEEPERS: &str = "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z'/></svg>";
 const ICON_MAIL: &str = "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><rect x='3' y='5' width='18' height='14' rx='2'/><path d='M3 7l9 6 9-6'/></svg>";
 const ICON_SORT_DESC: &str = "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M12 5v14M6 13l6 6 6-6'/></svg>";
