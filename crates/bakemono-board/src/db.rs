@@ -150,7 +150,9 @@ pub async fn list_creators(
          LEFT JOIN LATERAL (
              SELECT thumb, mime FROM visible_content vm
              WHERE vm.platform = c.platform AND vm.creator_id = c.creator_id
-             ORDER BY (thumb IS NULL), created_at DESC LIMIT 1
+             -- pin the cover to the newest post by content date, not ingest time, so a re-scrape that
+             -- rewrites added_at never reshuffles it; deterministic tiebreak keeps it stable per post
+             ORDER BY (thumb IS NULL), posted_at DESC NULLS LAST, post_id DESC, file_index LIMIT 1
          ) cov ON true
          ORDER BY {} LIMIT $2 OFFSET $3",
         sort.creator_order(desc)
@@ -198,12 +200,47 @@ pub async fn creator_posts(
     Ok(rows)
 }
 
-pub async fn creator_post_count(pool: &PgPool, platform: &str, creator_id: &str) -> Result<i64> {
+pub async fn creator_post_count(pool: &PgPool, platform: &str, creator_id: &str, tier: &str) -> Result<i64> {
     let n = sqlx::query_scalar(
-        "SELECT COUNT(DISTINCT post_id) FROM visible_content WHERE platform = $1 AND creator_id = $2",
+        "SELECT COUNT(DISTINCT post_id) FROM visible_content
+         WHERE platform = $1 AND creator_id = $2 AND ($3 = '' OR tier = $3)",
     )
     .bind(platform)
     .bind(creator_id)
+    .bind(tier)
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
+}
+
+// how many distinct posts match a browse filter, for the "N posts" count next to the pager
+pub async fn count_posts(pool: &PgPool, source: &str, q: &str, tier: &str) -> Result<i64> {
+    let n = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM (
+             SELECT DISTINCT platform, creator_id, post_id FROM visible_content
+             WHERE ($1 = '' OR post_title ILIKE '%' || $1 || '%' OR creator ILIKE '%' || $1 || '%')
+               AND ($2 = '' OR platform = $2)
+               AND ($3 = '' OR tier = $3)
+         ) t",
+    )
+    .bind(q)
+    .bind(source)
+    .bind(tier)
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
+}
+
+pub async fn count_creators(pool: &PgPool, source: &str, q: &str) -> Result<i64> {
+    let n = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM (
+             SELECT DISTINCT platform, creator_id FROM visible_content
+             WHERE ($1 = '' OR creator ILIKE '%' || $1 || '%')
+               AND ($2 = '' OR platform = $2)
+         ) t",
+    )
+    .bind(q)
+    .bind(source)
     .fetch_one(pool)
     .await?;
     Ok(n)

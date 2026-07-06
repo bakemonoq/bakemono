@@ -148,7 +148,7 @@ async fn creators(State(pool): State<PgPool>, Query(q): Query<Browse>) -> Respon
 async fn creator(State(state): State<AppState>, Path((platform, creator_id)): Path<(String, String)>, Query(q): Query<CreatorQuery>) -> Response {
     let tier = tier_db(q.tier.as_deref());
     let page = q.page.unwrap_or(0).max(0);
-    let total = db::creator_post_count(&state.pool, &platform, &creator_id).await.unwrap_or(0);
+    let total = db::creator_post_count(&state.pool, &platform, &creator_id, "").await.unwrap_or(0);
     let mut rows = db::creator_posts(&state.pool, &platform, &creator_id, tier, API_PAGE + 1, page * API_PAGE).await.unwrap_or_default();
     if rows.is_empty() && page == 0 && total == 0 {
         return StatusCode::NOT_FOUND.into_response();

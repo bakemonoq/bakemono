@@ -96,16 +96,17 @@ async fn posts_index(State(pool): State<PgPool>, Query(query): Query<BrowseQuery
         .unwrap_or_default();
     let has_next = posts.len() as i64 > PAGE;
     posts.truncate(PAGE as usize);
+    let total = db::count_posts(&pool, &source, &q, tier_db(&tier)).await.ok();
     render(
         "posts",
         html! {
             h1.pagetitle { "Posts" }
             (filter_bar("/posts", &q, &source, sort, desc, &tier, &platforms, None))
             (tier_tabs("/posts", &q, &source, sort, desc, &tier))
-            (pager("/posts", &q, &source, sort, desc, &tier, None, page, has_next, true))
+            (pager("/posts", &q, &source, sort, desc, &tier, None, page, has_next, true, total, "post"))
             @if posts.is_empty() { p.muted { "No posts match" } }
             (posts_grid(&posts))
-            (pager("/posts", &q, &source, sort, desc, &tier, None, page, has_next, false))
+            (pager("/posts", &q, &source, sort, desc, &tier, None, page, has_next, false, total, "post"))
         },
     )
 }
@@ -121,15 +122,16 @@ async fn creators_index(
         .unwrap_or_default();
     let has_next = creators.len() as i64 > PAGE;
     creators.truncate(PAGE as usize);
+    let total = db::count_creators(&pool, &source, &q).await.ok();
     render(
         "creators",
         html! {
             h1.pagetitle { "Creators" }
             (filter_bar("/creators", &q, &source, sort, desc, "", &platforms, None))
-            (pager("/creators", &q, &source, sort, desc, "", None, page, has_next, true))
+            (pager("/creators", &q, &source, sort, desc, "", None, page, has_next, true, total, "creator"))
             @if creators.is_empty() { p.muted { "No creators match" } }
             (creators_grid(&creators))
-            (pager("/creators", &q, &source, sort, desc, "", None, page, has_next, false))
+            (pager("/creators", &q, &source, sort, desc, "", None, page, has_next, false, total, "creator"))
         },
     )
 }
@@ -172,6 +174,13 @@ async fn search_index(State(pool): State<PgPool>, Query(query): Query<SearchQuer
         has_next = posts.len() as i64 > PAGE;
         posts.truncate(PAGE as usize);
     }
+    let (total, noun) = if q.is_empty() {
+        (None, "post")
+    } else if creators_tab {
+        (db::count_creators(&pool, &source, &q).await.ok(), "creator")
+    } else {
+        (db::count_posts(&pool, &source, &q, tier_db(&tier)).await.ok(), "post")
+    };
 
     render(
         "search",
@@ -183,7 +192,7 @@ async fn search_index(State(pool): State<PgPool>, Query(query): Query<SearchQuer
             }
             (filter_bar("/search", &q, &source, sort, desc, &tier, &platforms, Some(tab)))
             @if !creators_tab { (tier_tabs("/search", &q, &source, sort, desc, &tier)) }
-            @if !q.is_empty() { (pager("/search", &q, &source, sort, desc, &tier, Some(tab), page, has_next, true)) }
+            @if !q.is_empty() { (pager("/search", &q, &source, sort, desc, &tier, Some(tab), page, has_next, true, total, noun)) }
             @if q.is_empty() {
                 p.muted { "Type something to search posts and creators" }
             } @else if creators_tab {
@@ -193,7 +202,7 @@ async fn search_index(State(pool): State<PgPool>, Query(query): Query<SearchQuer
                 @if posts.is_empty() { p.muted { "No posts match \"" (q) "\"" } }
                 (posts_grid(&posts))
             }
-            @if !q.is_empty() { (pager("/search", &q, &source, sort, desc, &tier, Some(tab), page, has_next, false)) }
+            @if !q.is_empty() { (pager("/search", &q, &source, sort, desc, &tier, Some(tab), page, has_next, false, total, noun)) }
         },
     )
 }
@@ -400,19 +409,26 @@ fn pager(
     page: i64,
     has_next: bool,
     top: bool,
+    total: Option<i64>,
+    noun: &str,
 ) -> Markup {
+    let paged = page > 0 || has_next;
     html! {
-        @if page > 0 || has_next {
+        @if paged || total.is_some() {
             div.pager.top[top] {
-                @if page > 0 {
+                @if paged && page > 0 {
                     a.btn.ghost href=(browse_url(base, q, source, sort, desc, tier, tab, page - 1)) { "prev" }
-                } @else {
+                } @else if paged {
                     span.btn.ghost.off { "prev" }
                 }
-                span.muted { "page " (page + 1) }
-                @if has_next {
+                span.muted {
+                    @if paged { "page " (page + 1) }
+                    @if paged && total.is_some() { " - " }
+                    @if let Some(t) = total { (t) " " (noun) @if t != 1 { "s" } }
+                }
+                @if paged && has_next {
                     a.btn.ghost href=(browse_url(base, q, source, sort, desc, tier, tab, page + 1)) { "next" }
-                } @else {
+                } @else if paged {
                     span.btn.ghost.off { "next" }
                 }
             }
@@ -593,7 +609,12 @@ async fn creator_page(
         .unwrap_or_default();
     let has_next = posts.len() as i64 > PAGE;
     posts.truncate(PAGE as usize);
-    let total = db::creator_post_count(&pool, &platform, &creator_id).await.unwrap_or(0);
+    let total = db::creator_post_count(&pool, &platform, &creator_id, "").await.unwrap_or(0);
+    let matching = if tier.is_empty() {
+        total
+    } else {
+        db::creator_post_count(&pool, &platform, &creator_id, tier_db(&tier)).await.unwrap_or(0)
+    };
     let name = posts
         .first()
         .map(|p| p.creator.clone())
@@ -612,7 +633,7 @@ async fn creator_page(
             (tier_tabs(&base, "", "", db::SortField::Created, true, &tier))
             @if posts.is_empty() { p.muted { "Nothing here yet" } }
             (posts_grid(&posts))
-            (pager(&base, "", "", db::SortField::Created, true, &tier, None, page, has_next, false))
+            (pager(&base, "", "", db::SortField::Created, true, &tier, None, page, has_next, false, Some(matching), "post"))
         },
     )
 }

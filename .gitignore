@@ -18,3 +18,4 @@ board.toml
 /static/
 /target-linux
 board.key
+.DS_Store
