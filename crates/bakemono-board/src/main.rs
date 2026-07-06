@@ -28,8 +28,9 @@ async fn main() -> Result<()> {
         Some("restore") => cmd_restore(args.next()).await,
         Some("keygen") => cmd_keygen(args.next()).await,
         Some("autoimport") => cmd_autoimport().await,
+        Some("reclassify") => cmd_reclassify().await,
         Some(other) => {
-            bail!("unknown command `{other}` (expected serve, add, ingest, scrape, restore, keygen or autoimport)")
+            bail!("unknown command `{other}` (expected serve, add, ingest, scrape, restore, keygen, autoimport or reclassify)")
         }
     }
 }
@@ -144,6 +145,23 @@ async fn cmd_autoimport() -> Result<()> {
     let pool = db::connect(&database_url()).await?;
     let kubo = kubo::Kubo::from_env();
     scrape::autoimport_round(&pool, &kubo, privkey.trim()).await
+}
+
+// re-derive every post's tier from fresh metadata without downloading any media, then republish if the
+// manifest shards changed. private key from stdin, same as autoimport:
+// ssh box 'docker exec -i bakemono-board-1 bakemono reclassify' < cookie-private.pem
+async fn cmd_reclassify() -> Result<()> {
+    use std::io::Read;
+    let mut privkey = String::new();
+    std::io::stdin().read_to_string(&mut privkey)?;
+    if privkey.trim().is_empty() {
+        bail!("pipe the private key PEM to stdin: bakemono reclassify < cookie-private.pem");
+    }
+    crypto::validate_private_pem(privkey.trim())?;
+    let pool = db::connect(&database_url()).await?;
+    let kubo = kubo::Kubo::from_env();
+    scrape::reclassify_round(&pool, privkey.trim()).await?;
+    publish_and_report(&pool, &kubo).await
 }
 
 async fn cmd_restore(head_cid: Option<String>) -> Result<()> {

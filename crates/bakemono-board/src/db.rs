@@ -213,6 +213,19 @@ pub async fn creator_post_count(pool: &PgPool, platform: &str, creator_id: &str,
     Ok(n)
 }
 
+// overwrite a post's tier in place (metadata-only reclassify); returns rows touched so a caller can
+// tell a real update from a post it no longer holds
+pub async fn update_tier(pool: &PgPool, platform: &str, creator_id: &str, post_id: &str, tier: &str) -> Result<u64> {
+    let r = sqlx::query("UPDATE posts SET tier = $4 WHERE platform = $1 AND creator_id = $2 AND post_id = $3")
+        .bind(platform)
+        .bind(creator_id)
+        .bind(post_id)
+        .bind(tier)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
 // how many distinct posts match a browse filter, for the "N posts" count next to the pager
 pub async fn count_posts(pool: &PgPool, source: &str, q: &str, tier: &str) -> Result<i64> {
     let n = sqlx::query_scalar(
