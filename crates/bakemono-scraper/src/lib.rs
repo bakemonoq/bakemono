@@ -161,7 +161,7 @@ impl Scraper {
             source,
         })?;
         let args = build_args(request);
-        tracing::info!(binary = %self.binary.to_string_lossy(), ?args, "running gallery-dl");
+        tracing::info!(binary = %self.binary.to_string_lossy(), args = ?redact_args(&args), "running gallery-dl");
 
         let mut cmd = tokio::process::Command::new(&self.binary);
         cmd.args(&args).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -406,6 +406,20 @@ fn build_args(request: &ScrapeRequest) -> Vec<String> {
     }
     args.push(creator_url(&request.creator));
     args
+}
+
+// proxy args carry residential-proxy credentials (user:pass@host); mask them before they hit logs
+fn redact_args(args: &[String]) -> Vec<String> {
+    args.iter().map(|a| redact_creds(a)).collect()
+}
+
+fn redact_creds(arg: &str) -> String {
+    match (arg.find("//"), arg.rfind('@')) {
+        (Some(scheme), Some(at)) if scheme + 2 < at => {
+            format!("{}//***@{}", &arg[..scheme], &arg[at + 1..])
+        }
+        _ => arg.to_string(),
+    }
 }
 
 fn creator_url(creator: &str) -> String {

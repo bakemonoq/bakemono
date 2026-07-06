@@ -2,6 +2,7 @@
 # everything else to the board UI/API. a production deploy swaps this for a proxy with TLS + a real domain
 :80 {
 	handle /ipfs/* {
+		header X-Content-Type-Options nosniff
 		reverse_proxy kubo:8080
 	}
 	handle {

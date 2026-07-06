@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use maud::{html, Markup, PreEscaped, DOCTYPE};
 use chrono::Utc;
 use sqlx::postgres::PgPool;
+use tokio::sync::Semaphore;
 
 use crate::config;
 use crate::db;
@@ -19,6 +20,10 @@ use crate::db;
 pub struct AppState {
     pub pool: PgPool,
     pub kubo: Arc<crate::kubo::Kubo>,
+    // bound gallery-dl work started by anonymous /contribute: a probe or import each spawns a
+    // subprocess, so a flood of posts must shed load rather than exhaust processes/FDs on the box
+    pub probe_gate: Arc<Semaphore>,
+    pub import_gate: Arc<Semaphore>,
 }
 
 // lets handlers that only need the pool keep extracting State<PgPool> unchanged
@@ -909,9 +914,23 @@ async fn contribute_submit(
     };
     let token = token.as_str();
 
+    // bound concurrent probes: each spawns a gallery-dl subprocess and this endpoint is anonymous,
+    // so shed load past the cap instead of letting a flood spawn unbounded processes
+    let Ok(probe_permit) = state.probe_gate.clone().try_acquire_owned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            render("contribute", contribute_body(Some("The board is busy checking other submissions - please try again in a minute"))),
+        ).into_response();
+    };
+
     // validate while we still hold the plaintext: a quick feed probe tells live from dead. anything
-    // past here treats the cookie as a live secret to protect
-    if !crate::scrape::probe_cookie(platform, token, &format!("submit-{platform}")).await {
+    // past here treats the cookie as a live secret to protect. a private scope keeps concurrent
+    // submissions from sharing a cookie file or archive
+    let scope = crate::scrape::new_submit_scope(platform);
+    let live = crate::scrape::probe_cookie(platform, token, &scope).await;
+    drop(probe_permit);
+    if !live {
+        crate::scrape::cleanup_scope(&scope);
         return render("contribute", contribute_body(Some("That cookie was rejected by the site - make sure you are signed in and copied the whole value"))).into_response();
     }
 
@@ -931,7 +950,7 @@ async fn contribute_submit(
     } else {
         None
     };
-    spawn_import(&state, stored, platform.to_string(), token.to_string());
+    spawn_import(&state, stored, platform.to_string(), token.to_string(), scope);
 
     render("contribute", html! {
         section.contribwrap {
@@ -963,10 +982,17 @@ async fn seal_and_store(
 
 // scrape the whole feed with the plaintext; the token lives only in this task. if the cookie was
 // stored, record which creators it reached for the mod page
-fn spawn_import(state: &AppState, cookie_id: Option<i64>, platform: String, token: String) {
+fn spawn_import(state: &AppState, cookie_id: Option<i64>, platform: String, token: String, scope: String) {
+    // cap concurrent full-feed scrapes; past the cap a stored cookie still imports on the next daily
+    // round, so drop the one-off rather than queue unbounded multi-GB downloads
+    let Ok(permit) = state.import_gate.clone().try_acquire_owned() else {
+        tracing::warn!(platform, "import deferred: too many concurrent imports");
+        crate::scrape::cleanup_scope(&scope);
+        return;
+    };
     let (pool, kubo) = (state.pool.clone(), state.kubo.clone());
     tokio::spawn(async move {
-        let scope = format!("submit-{platform}");
+        let _permit = permit;
         match crate::scrape::scrape_feed(&pool, &kubo, &platform, &token, &scope).await {
             Ok((stats, creators)) => {
                 if let Some(id) = cookie_id {
@@ -980,6 +1006,7 @@ fn spawn_import(state: &AppState, cookie_id: Option<i64>, platform: String, toke
             }
             Err(e) => tracing::error!(platform, "import failed: {e:#}"),
         }
+        crate::scrape::cleanup_scope(&scope);
     });
 }
 
@@ -1008,7 +1035,8 @@ async fn keepers(headers: HeaderMap) -> Html<String> {
                         "ipfs init\n"
                         "ipfs config --json Bitswap.ServerEnabled true\n"
                         "ipfs config --json Internal.Bitswap.BroadcastControl.Enable false\n"
-                        "ipfs config --json Reprovider.Strategy '\"roots\"'\n"
+                        "# kubo >= 0.38 renamed this to Provide.Strategy and FATALs on the old key\n"
+                        "ipfs config Provide.Strategy roots 2>/dev/null || ipfs config Reprovider.Strategy roots\n"
                         "# gateway serves only blocks you hold, never fetches for strangers\n"
                         "ipfs config --json Gateway.NoFetch true\n"
                         "ipfs daemon --enable-gc &\n\n"
@@ -1382,8 +1410,16 @@ fn is_mod(headers: &HeaderMap) -> bool {
     if token.is_empty() {
         return false;
     }
-    basic_auth_password(headers).as_deref() == Some(token.as_str())
+    basic_auth_password(headers).is_some_and(|pw| ct_eq(pw.as_bytes(), token.as_bytes()))
         || valid_mod_cookie(headers, now_secs())
+}
+
+// constant-time compare so the mod token can't be recovered by timing the Basic-auth check
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 const MOD_SESSION_TTL: i64 = 8 * 3600;

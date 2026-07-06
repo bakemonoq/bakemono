@@ -13,7 +13,12 @@ impl Kubo {
         Self {
             api: env_or("BAKEMONO_KUBO_API", "http://127.0.0.1:5001"),
             cluster: std::env::var("BAKEMONO_CLUSTER_API").ok().filter(|s| !s.is_empty()),
-            http: reqwest::Client::new(),
+            // connect timeout only: a stalled kubo must not hang a handler forever, but `add`
+            // streams large bodies so no overall request timeout
+            http: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
         }
     }
 

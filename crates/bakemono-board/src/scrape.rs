@@ -534,6 +534,19 @@ pub fn staging_dir() -> PathBuf {
     }
 }
 
+// a fresh staging scope per anonymous submission, monotonic so two concurrent contributors never
+// share a cookie file or archive. pair every call with cleanup_scope once the work is done
+pub fn new_submit_scope(platform: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("submit-{platform}-{}-{n}", std::process::id())
+}
+
+pub fn cleanup_scope(scope: &str) {
+    let _ = std::fs::remove_dir_all(staging_dir().join(scope));
+}
+
 fn scraper() -> Scraper {
     match std::env::var_os("BAKEMONO_GALLERY_DL").filter(|s| !s.is_empty()) {
         Some(bin) => Scraper::with_binary(bin),

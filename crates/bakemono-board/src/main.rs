@@ -14,6 +14,7 @@ mod web;
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
+use tokio::sync::Semaphore;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -46,7 +47,12 @@ async fn serve() -> Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!("board on http://{bind}");
-    let state = web::AppState { pool, kubo };
+    let state = web::AppState {
+        pool,
+        kubo,
+        probe_gate: Arc::new(Semaphore::new(env_usize("BAKEMONO_PROBE_CONCURRENCY", 4))),
+        import_gate: Arc::new(Semaphore::new(env_usize("BAKEMONO_IMPORT_CONCURRENCY", 2))),
+    };
     axum::serve(listener, web::router(state)).await?;
     Ok(())
 }
@@ -189,4 +195,8 @@ fn init_tracing() {
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key).ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(default)
 }
