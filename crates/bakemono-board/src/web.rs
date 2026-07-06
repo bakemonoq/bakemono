@@ -34,6 +34,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(home))
         .route("/style.css", get(style_css))
         .route("/static/{file}", get(static_file))
+        .route("/assets/{file}", get(asset_file))
         .route("/posts", get(posts_index))
         .route("/creators", get(creators_index))
         .route("/search", get(search_index))
@@ -521,6 +522,23 @@ async fn static_file(Path(file): Path<String>) -> Response {
     }
 }
 
+// guide images bundled into the binary so every board serves them with no operator setup
+async fn asset_file(Path(file): Path<String>) -> Response {
+    let bytes: &'static [u8] = match file.as_str() {
+        "devtools_pick_application.png" => include_bytes!("../../../assets/devtools_pick_application.png"),
+        "copy_cookie_patreon.png" => include_bytes!("../../../assets/copy_cookie_patreon.png"),
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
 fn content_type_for(name: &str) -> &'static str {
     match name.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
         "png" => "image/png",
@@ -764,19 +782,41 @@ fn contribute_body(error: Option<&str>) -> Markup {
                     p { "Leave \"keep importing my new posts\" checked if you want new posts pulled in automatically. Otherwise it is a one-time import and the cookie is thrown away" }
                 }))
                 (faq_item("How do I find my cookie?", html! {
-                    p { "Sign in to the site in your browser, then:" }
-                    ol {
-                        li { "Open developer tools (F12, or right-click and Inspect)" }
-                        li { "Go to Application (or Storage) -> Cookies -> the site's address" }
-                        li { "Copy the value of the cookie for your platform:"
-                            ul {
-                                @for p in crate::platform::live_platforms() {
-                                    li { (p.label) ": " code { (p.cookie_name) } }
-                                }
-                            }
+                    p { "Sign in to the site in your browser, then copy the value of the cookie named for your platform:" }
+                    ul.cookienames {
+                        @for p in crate::platform::live_platforms() {
+                            li { (p.label) ": " code { (p.cookie_name) } }
                         }
                     }
-                    p.muted { "Paste that value into the form above - or, if it is easier, the whole cookies.txt you export from a browser extension. We pull out the one cookie we need" }
+                    p.muted { "Not sure where cookies live? Pick your browser:" }
+                    (browser_spoiler("Chrome, Edge, Brave", true, html! {
+                        ol {
+                            li { "Press " code { "F12" } " to open developer tools, or right-click the page and choose Inspect" }
+                            li { "In the row of tabs at the top open " strong { "Application" } " - click " code { ">>" } " if you do not see it"
+                                img.guideimg src="/assets/devtools_pick_application.png" alt="Opening the Application tab in developer tools" loading="lazy";
+                            }
+                            li { "In the left sidebar open " strong { "Storage -> Cookies" } " and select the site's address" }
+                            li { "Click the cookie named for your platform, then copy its " strong { "Cookie Value" } " from the panel at the bottom"
+                                img.guideimg src="/assets/copy_cookie_patreon.png" alt="Copying the session_id cookie value on Patreon" loading="lazy";
+                            }
+                        }
+                    }))
+                    (browser_spoiler("Safari", false, html! {
+                        ol {
+                            li { "Turn on developer features: " strong { "Settings -> Advanced" } ", check " strong { "Show features for web developers" } }
+                            li { "Open the Web Inspector with " code { "Cmd+Option+I" } }
+                            li { "Go to " strong { "Storage -> Cookies" } " and pick the site" }
+                            li { "Double-click the cookie named for your platform and copy its " strong { "Value" } }
+                        }
+                    }))
+                    (browser_spoiler("Firefox", false, html! {
+                        ol {
+                            li { "Press " code { "F12" } " and open the " strong { "Storage" } " tab" }
+                            li { "Expand " strong { "Cookies" } " and pick the site" }
+                            li { "Right-click the cookie named for your platform and choose " strong { "Copy" } }
+                        }
+                    }))
+                    p.muted { "Paste the value into the form above - or, if it is easier, the whole cookies.txt you export from a browser extension. We pull out the one cookie we need" }
                 }))
             }
         }
@@ -788,6 +828,15 @@ fn faq_item(question: &str, body: Markup) -> Markup {
         div.faqitem {
             h3 { (question) }
             (body)
+        }
+    }
+}
+
+fn browser_spoiler(name: &str, open: bool, body: Markup) -> Markup {
+    html! {
+        details.spoiler open[open] {
+            summary { (name) }
+            div.spbody { (body) }
         }
     }
 }
@@ -1884,6 +1933,18 @@ pre { white-space:pre-wrap; word-break:break-all; background:var(--mantle); bord
 .faqitem ol, .faqitem ul { margin:.5rem 0 .2rem; padding-left:1.2rem; color:var(--subtext1) }
 .faqitem li { margin:.35rem 0 }
 .faqitem code { color:var(--text) }
+.cookienames { margin:.5rem 0 .8rem }
+.spoiler { border:1px solid var(--surface0); border-radius:10px; background:var(--base); margin:.55rem 0; overflow:hidden }
+.spoiler > summary { cursor:pointer; list-style:none; padding:.65rem .95rem; font-weight:600; color:var(--text); display:flex; align-items:center; justify-content:space-between; gap:.6rem }
+.spoiler > summary::-webkit-details-marker { display:none }
+.spoiler > summary::after { content:'+'; color:var(--accent); font-weight:800; font-size:1.2rem; line-height:1 }
+.spoiler[open] > summary::after { content:'-' }
+.spoiler > summary:hover { color:var(--accent) }
+.spbody { padding:.1rem .95rem .9rem }
+.spbody ol { margin:.2rem 0; padding-left:1.3rem; color:var(--subtext1) }
+.spbody li { margin:.55rem 0 }
+.spbody strong { color:var(--text); font-weight:600 }
+.guideimg { display:block; max-width:100%; border-radius:8px; border:1px solid var(--surface1); margin:.55rem 0 .1rem }
 p.err { color:var(--red); font-weight:600; text-align:center }
 ";
 
