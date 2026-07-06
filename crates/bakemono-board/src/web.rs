@@ -746,7 +746,7 @@ fn contribute_body(error: Option<&str>) -> Markup {
                     }
                 }
                 label { "Session cookie value"
-                    input type="text" name="token" placeholder="paste the cookie value only" required autocomplete="off";
+                    textarea name="token" rows="2" maxlength=(crate::platform::MAX_COOKIE_PASTE) placeholder="paste the cookie value, or the whole cookies.txt" required autocomplete="off" spellcheck="false" {}
                 }
                 label.check { input type="checkbox" name="allow_autoimport" value="1" checked; span { "Keep importing my new posts every day " span.hint { "(stores the cookie encrypted)" } } }
                 label.check { input type="checkbox" name="allow_debug" value="1"; span { "Let the operator use my session to debug import problems" } }
@@ -776,7 +776,7 @@ fn contribute_body(error: Option<&str>) -> Markup {
                             }
                         }
                     }
-                    p.muted { "Paste only that value into the form above" }
+                    p.muted { "Paste that value into the form above - or, if it is easier, the whole cookies.txt you export from a browser extension. We pull out the one cookie we need" }
                 }))
             }
         }
@@ -810,10 +810,18 @@ async fn contribute_submit(
         return (StatusCode::SERVICE_UNAVAILABLE, "contributions closed").into_response();
     };
     let platform = form.platform.trim();
-    let token = form.token.trim();
-    if !crate::platform::is_live(platform) || token.is_empty() {
+    let raw = form.token.trim();
+    if !crate::platform::is_live(platform) || raw.is_empty() {
         return render("contribute", contribute_body(Some("Pick a platform and paste a cookie value"))).into_response();
     }
+    if raw.len() > crate::platform::MAX_COOKIE_PASTE {
+        return render("contribute", contribute_body(Some("That is far more than a cookie - paste just the cookie value or your cookies.txt, not a whole page"))).into_response();
+    }
+    // people paste the whole cookies.txt, a Cookie header, or `name=value`; pull out the one value we need
+    let Some(token) = crate::platform::extract_token(platform, raw) else {
+        return render("contribute", contribute_body(Some("We couldn't find your session cookie in that. Paste just the cookie value, or the whole cookies.txt file you exported"))).into_response();
+    };
+    let token = token.as_str();
 
     // validate while we still hold the plaintext: a quick feed probe tells live from dead. anything
     // past here treats the cookie as a live secret to protect
@@ -1862,8 +1870,9 @@ pre { white-space:pre-wrap; word-break:break-all; background:var(--mantle); bord
 .contribform label { display:flex; flex-direction:column; gap:.35rem; font-weight:600 }
 .contribform label.check { flex-direction:row; align-items:flex-start; gap:.55rem; font-weight:400; color:var(--subtext1) }
 .contribform label.check .hint { color:var(--subtext0) }
-.contribform input[type=text], .contribform select { padding:.6rem .65rem; border-radius:9px; border:1px solid var(--surface2); background:var(--surface0); color:var(--text); font:inherit }
-.contribform input[type=text]:focus, .contribform select:focus { outline:none; border-color:var(--accent) }
+.contribform input[type=text], .contribform textarea, .contribform select { padding:.6rem .65rem; border-radius:9px; border:1px solid var(--surface2); background:var(--surface0); color:var(--text); font:inherit }
+.contribform textarea { resize:vertical; min-height:2.6rem; font-family:var(--mono, monospace); font-size:.85rem; line-height:1.4; word-break:break-all }
+.contribform input[type=text]:focus, .contribform textarea:focus, .contribform select:focus { outline:none; border-color:var(--accent) }
 .contribform button { align-self:stretch; padding:.7rem 1.2rem; border-radius:9px; border:0; background:var(--accent); color:var(--crust); font-weight:700; font-size:1rem; cursor:pointer }
 .contribform button:hover { filter:brightness(1.08) }
 .contribform .formnote { margin:0; font-size:.8rem; font-weight:400; color:var(--subtext0) }

@@ -474,10 +474,11 @@ pub fn sniff_mime(bytes: &[u8]) -> &'static str {
 }
 
 fn tier_of(meta: &Value) -> String {
-    // patreon: min_cents_pledged_to_view > 0 means patron-only (is_paid is a rare per-post billing
-    // flag, false on almost every post); fanbox: feeRequired (0 = free tier)
-    if let Some(cents) = meta.get("min_cents_pledged_to_view").and_then(Value::as_u64) {
-        return if cents > 0 { "subscriber" } else { "free" }.to_string();
+    // patreon posts always carry min_cents_pledged_to_view: 0 is a public post, null or a cents
+    // threshold means patron-only (it stays null when access is by tier, not a cents floor). is_paid is
+    // a rare per-post billing flag, false on almost every post. fanbox: feeRequired (0 = free tier)
+    if let Some(cents) = meta.get("min_cents_pledged_to_view") {
+        return if cents.as_u64() == Some(0) { "free" } else { "subscriber" }.to_string();
     }
     if let Some(fee) = meta.get("feeRequired").and_then(Value::as_u64) {
         return if fee > 0 { "subscriber" } else { "free" }.to_string();
@@ -707,6 +708,19 @@ mod tests {
         assert_eq!(meta.tier, "subscriber");
         assert_eq!(meta.body, "body text");
         assert_eq!(meta.creator_url.as_deref(), Some("https://anna-anon.fanbox.cc"));
+    }
+
+    #[test]
+    fn tier_of_classifies() {
+        use serde_json::json;
+        // patreon: 0 cents is public, null or a threshold is patron-only
+        assert_eq!(tier_of(&json!({"min_cents_pledged_to_view": 0})), "free");
+        assert_eq!(tier_of(&json!({"min_cents_pledged_to_view": null})), "subscriber");
+        assert_eq!(tier_of(&json!({"min_cents_pledged_to_view": 500})), "subscriber");
+        // fanbox
+        assert_eq!(tier_of(&json!({"feeRequired": 0})), "free");
+        assert_eq!(tier_of(&json!({"feeRequired": 500})), "subscriber");
+        assert_eq!(tier_of(&json!({"other": 1})), "unknown");
     }
 
     #[test]
