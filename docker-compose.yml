@@ -31,8 +31,9 @@ services:
     environment:
       CLUSTER_PEERNAME: ${CLUSTER_PEERNAME:-board}
       # 32-byte hex; the libp2p network fence all cluster peers and followers must share.
-      # the default is a fixed dev value - set your own for anything reachable from outside
-      CLUSTER_SECRET: ${CLUSTER_SECRET:-a9b7ce34c1064c2c0c4f2b26e0d8ac532e2f5b9c6a1de08fbf1cf4a530d76301}
+      # this default is a throwaway for local single-node use - generate your own with
+      # `openssl rand -hex 32` and set CLUSTER_SECRET before exposing the cluster port to anyone
+      CLUSTER_SECRET: ${CLUSTER_SECRET:-61255a25c121abcfbc61e59ff58b338ff4b04667e18b0d5f570ce44a1ab6b436}
       CLUSTER_IPFSHTTP_NODEMULTIADDRESS: /dns4/kubo/tcp/5001
       CLUSTER_CRDT_TRUSTEDPEERS: ${CLUSTER_TRUSTED_PEERS:-*}
       CLUSTER_RESTAPI_HTTPLISTENMULTIADDRESS: /ip4/0.0.0.0/tcp/9094
