@@ -15,10 +15,14 @@ RUN apt-get update \
     && pipx install gallery-dl \
     && pipx install yt-dlp \
     && pipx install --suffix=-fanbox "git+https://codeberg.org/RavenYin/gallery-dl.git@pr/fanbox-curl-cffi" \
-    && pipx inject gallery-dl-fanbox curl_cffi
+    && pipx inject gallery-dl-fanbox curl_cffi \
+    && pipx install --suffix=-mirror "git+https://codeberg.org/mikf/gallery-dl.git@51aa6cf87ef01acdb50dc1a00648ad75d15dd206"
 COPY --from=builder /src/target/release/bakemono /usr/local/bin/bakemono
 ENV BAKEMONO_BIND=0.0.0.0:3000
 # scrape staging + gallery-dl download archive; mount a volume so re-scrapes stay incremental
 ENV BAKEMONO_SCRAPE_DIR=/scrape
+# mirrors ride a pinned gallery-dl master: pawchive's file host moved to file.pawchive.pw and no
+# release carries the new extractor roots yet (v1.32.5 still dials the dead .st host)
+ENV BAKEMONO_GALLERY_DL_MIRROR=gallery-dl-mirror
 EXPOSE 3000
 ENTRYPOINT ["bakemono"]

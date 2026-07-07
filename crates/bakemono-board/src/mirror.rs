@@ -139,7 +139,7 @@ async fn mirror_creator(
     if posts > 0 {
         request.options.push(format!("max-posts={posts}"));
     }
-    match scrape::stream_ingest(pool, kubo, &scrape::scraper(), &request, &scope).await {
+    match scrape::stream_ingest(pool, kubo, &mirror_scraper(), &request, &scope).await {
         Ok((stats, _)) => {
             if stats.files > 0 {
                 tracing::info!(url, files = stats.files, posts = stats.posts, "mirrored creator");
@@ -150,6 +150,15 @@ async fn mirror_creator(
             tracing::warn!(url, "mirror creator failed: {e:#}");
             IngestStats { skipped: 1, ..Default::default() }
         }
+    }
+}
+
+// mirrors get their own gallery-dl (the image pins a master build there while the released
+// extractor still dials pawchive's dead .st file host); unset falls back to the stock binary
+fn mirror_scraper() -> bakemono_scraper::Scraper {
+    match std::env::var_os("BAKEMONO_GALLERY_DL_MIRROR").filter(|s| !s.is_empty()) {
+        Some(bin) => bakemono_scraper::Scraper::with_binary(bin),
+        None => scrape::scraper(),
     }
 }
 
