@@ -136,20 +136,29 @@ pub async fn scrape_feed(
     request.cookies = Some(Cookies::File(cookie_file.path.clone()));
     request.options = scrape_options(platform);
 
-    // ingest each file the moment gallery-dl finishes downloading it, streaming paths over a channel
-    // to a concurrent consumer. content shows up as it downloads, and a restart mid-scrape only loses
-    // the one file in flight - everything already ingested is safe in the catalog
+    stream_ingest(pool, kubo, &scraper_for(platform), &request, &staging).await
+}
+
+// ingest each file the moment gallery-dl finishes downloading it, streaming paths over a channel
+// to a concurrent consumer. content shows up as it downloads, a restart mid-scrape only loses the
+// one file in flight, and deleting each file as it lands keeps staging bounded
+pub async fn stream_ingest(
+    pool: &PgPool,
+    kubo: &Kubo,
+    scraper: &Scraper,
+    request: &ScrapeRequest,
+    staging: &Path,
+) -> Result<(IngestStats, Vec<CreatorSeen>)> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
-    let scraper = scraper_for(platform);
     let scrape = async {
         let r = scraper
-            .scrape_streaming(&request, CancellationToken::new(), move |p| {
+            .scrape_streaming(request, CancellationToken::new(), move |p| {
                 let _ = tx.send(p);
             })
             .await;
         if let Err(e) = r {
-            // partial errors (a gated post, a dead CDN link) are normal for a big feed
-            tracing::warn!(platform, "feed scrape reported errors: {e:#}");
+            // partial errors (a gated post, a dead CDN link) are normal for a big run
+            tracing::warn!(url = %request.creator, "scrape reported errors: {e:#}");
         }
     };
     let consume = async {
@@ -181,7 +190,7 @@ pub async fn scrape_feed(
     let (_, mut acc) = tokio::join!(scrape, consume);
 
     // final sweep: files whose sidecar was slow, plus orphans a prior interrupted run left behind
-    let (sweep_stats, sweep_creators) = ingest_staging(pool, kubo, &staging).await?;
+    let (sweep_stats, sweep_creators) = ingest_staging(pool, kubo, staging).await?;
     acc.merge_sweep(sweep_stats, sweep_creators);
     Ok(acc.finish())
 }
@@ -386,20 +395,27 @@ impl PostMeta {
 }
 
 // gallery-dl's per-platform sidecars differ (Patreon nests creator.{id,full_name}; Fanbox uses
-// creatorId + user.name). read each field through a fallback chain so any supported platform maps
+// creatorId + user.name; kemono-family mirrors like pawchive put the origin platform in `service`
+// and the creator in flat `user`/`username`). read each field through a fallback chain so any
+// supported shape maps, and mirrored posts land under their origin platform so they merge and
+// dedupe with directly scraped content
 fn post_meta(sidecar: &Path) -> Result<PostMeta> {
     let raw = std::fs::read(sidecar).with_context(|| format!("reading {}", sidecar.display()))?;
     let meta: Value =
         serde_json::from_slice(&raw).with_context(|| format!("parsing {}", sidecar.display()))?;
-    let platform = string_at(&meta, &["category"]).unwrap_or_else(|| "patreon".to_string());
+    let platform = string_at(&meta, &["service"]) // kemono-family mirror
+        .or_else(|| string_at(&meta, &["category"]))
+        .unwrap_or_else(|| "patreon".to_string());
     let creator_id = string_at(&meta, &["creator", "id"]) // patreon
         .or_else(|| string_at(&meta, &["creatorId"])) // fanbox
         .or_else(|| string_at(&meta, &["user", "userId"])) // fanbox numeric
+        .or_else(|| string_at(&meta, &["user"])) // kemono-family (plain string, not the fanbox object)
         .context("sidecar has no creator id")?;
     Ok(PostMeta {
         creator: string_at(&meta, &["creator", "full_name"])
             .or_else(|| string_at(&meta, &["creator", "vanity"]))
             .or_else(|| string_at(&meta, &["user", "name"])) // fanbox
+            .or_else(|| string_at(&meta, &["username"])) // kemono-family
             .unwrap_or_else(|| creator_id.clone()),
         creator_url: creator_url(&meta, &platform, &creator_id),
         creator_id,
@@ -414,6 +430,7 @@ fn post_meta(sidecar: &Path) -> Result<PostMeta> {
         body: string_at(&meta, &["content"]).or_else(|| string_at(&meta, &["text"])).unwrap_or_default(),
         posted_at: string_at(&meta, &["published_at"])
             .or_else(|| string_at(&meta, &["publishedDatetime"]))
+            .or_else(|| string_at(&meta, &["published"])) // kemono-family
             .or_else(|| string_at(&meta, &["date"])),
         tier: tier_of(&meta),
     })
@@ -423,9 +440,14 @@ fn creator_url(meta: &Value, platform: &str, creator_id: &str) -> Option<String>
     if let Some(url) = string_at(meta, &["creator", "url"]) {
         return Some(url);
     }
+    // mirrored sidecars carry only the numeric origin id, so fall back to the id-based page
     match platform {
-        "patreon" => string_at(meta, &["creator", "vanity"]).map(|v| format!("https://www.patreon.com/{v}")),
-        "fanbox" => string_at(meta, &["creatorId"]).map(|c| format!("https://{c}.fanbox.cc")),
+        "patreon" => string_at(meta, &["creator", "vanity"])
+            .map(|v| format!("https://www.patreon.com/{v}"))
+            .or_else(|| Some(format!("https://www.patreon.com/user?u={creator_id}"))),
+        "fanbox" => string_at(meta, &["creatorId"])
+            .map(|c| format!("https://{c}.fanbox.cc"))
+            .or_else(|| Some(format!("https://www.pixiv.net/fanbox/creator/{creator_id}"))),
         _ => Some(format!("https://{creator_id}")),
     }
 }
@@ -547,7 +569,7 @@ pub fn cleanup_scope(scope: &str) {
     let _ = std::fs::remove_dir_all(staging_dir().join(scope));
 }
 
-fn scraper() -> Scraper {
+pub(crate) fn scraper() -> Scraper {
     match std::env::var_os("BAKEMONO_GALLERY_DL").filter(|s| !s.is_empty()) {
         Some(bin) => Scraper::with_binary(bin),
         None => Scraper::new(),
@@ -727,6 +749,41 @@ mod tests {
         assert_eq!(meta.tier, "subscriber");
         assert_eq!(meta.body, "body text");
         assert_eq!(meta.creator_url.as_deref(), Some("https://anna-anon.fanbox.cc"));
+    }
+
+    const PAWCHIVE_SIDECAR: &str = r#"{
+      "id": "162854990",
+      "num": 2,
+      "category": "pawchive",
+      "subcategory": "patreon",
+      "service": "patreon",
+      "user": "9919437",
+      "username": "Afrobull",
+      "title": "HD pack 100",
+      "content": "<p>We made it to 100!</p>",
+      "published": "2026-07-04T03:23:31",
+      "has_full": true,
+      "filename": "HD pack 97",
+      "extension": "zip"
+    }"#;
+
+    #[test]
+    fn maps_kemono_family_sidecar_to_origin_platform() {
+        let dir = std::env::temp_dir().join(format!("bakemono-pwmeta-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sidecar = dir.join("x.zip.json");
+        std::fs::write(&sidecar, PAWCHIVE_SIDECAR).unwrap();
+        let meta = post_meta(&sidecar).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(meta.platform, "patreon");
+        assert_eq!(meta.creator, "Afrobull");
+        assert_eq!(meta.creator_id, "9919437");
+        assert_eq!(meta.post_id, "162854990");
+        assert_eq!(meta.file_index, 1);
+        assert_eq!(meta.posted_at.as_deref(), Some("2026-07-04T03:23:31"));
+        assert_eq!(meta.creator_url.as_deref(), Some("https://www.patreon.com/user?u=9919437"));
+        assert_eq!(meta.post_key(), "patreon:9919437:162854990");
     }
 
     #[test]

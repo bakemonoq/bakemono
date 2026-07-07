@@ -3,6 +3,7 @@ mod config;
 mod crypto;
 mod db;
 mod kubo;
+mod mirror;
 mod platform;
 mod publish;
 mod restore;
@@ -26,11 +27,12 @@ async fn main() -> Result<()> {
         Some("add") => cmd_add(args.collect()).await,
         Some("ingest") => cmd_ingest(args.next()).await,
         Some("scrape") => cmd_scrape(args.collect()).await,
+        Some("mirror") => cmd_mirror(args.collect()).await,
         Some("restore") => cmd_restore(args.next()).await,
         Some("keygen") => cmd_keygen(args.next()).await,
         Some("autoimport") => cmd_autoimport().await,
         Some(other) => {
-            bail!("unknown command `{other}` (expected serve, add, ingest, scrape, restore, keygen or autoimport)")
+            bail!("unknown command `{other}` (expected serve, add, ingest, scrape, mirror, restore, keygen or autoimport)")
         }
     }
 }
@@ -44,6 +46,7 @@ async fn serve() -> Result<()> {
         tracing::warn!("local denylist sync failed: {e:#}");
     }
     tokio::spawn(scrape::run_scheduler(pool.clone(), kubo.clone()));
+    tokio::spawn(mirror::run_scheduler(pool.clone(), kubo.clone()));
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!("board on http://{bind}");
@@ -117,6 +120,36 @@ async fn cmd_scrape(args: Vec<String>) -> Result<()> {
     let pool = db::connect(&database_url()).await?;
     let kubo = kubo::Kubo::from_env();
     let stats = scrape::scrape_source(&pool, &kubo, &url, cookies.as_deref(), limit).await?;
+    println!("{} files across {} posts ({} skipped)", stats.files, stats.posts, stats.skipped);
+    publish_and_report(&pool, &kubo).await
+}
+
+// one-off round against a kemono-style archive; caps override the BAKEMONO_MIRROR_* env defaults
+async fn cmd_mirror(args: Vec<String>) -> Result<()> {
+    let mut url = None;
+    let mut caps = Vec::new();
+    for arg in args {
+        if let Ok(n) = arg.parse::<u64>() {
+            caps.push(n);
+        } else if url.is_none() {
+            url = Some(arg);
+        } else {
+            bail!("unexpected argument `{arg}`");
+        }
+    }
+    let Some(url) = url else {
+        bail!("usage: bakemono mirror <base-url> [creators] [posts]");
+    };
+    let mut limits = mirror::Limits::from_env();
+    if let Some(n) = caps.first() {
+        limits.creators = *n as usize;
+    }
+    if let Some(n) = caps.get(1) {
+        limits.posts = *n as u32;
+    }
+    let pool = db::connect(&database_url()).await?;
+    let kubo = kubo::Kubo::from_env();
+    let stats = mirror::mirror_round(&pool, &kubo, &url, &limits).await?;
     println!("{} files across {} posts ({} skipped)", stats.files, stats.posts, stats.skipped);
     publish_and_report(&pool, &kubo).await
 }

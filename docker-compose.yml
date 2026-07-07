@@ -68,6 +68,16 @@ services:
       # proxy (Cloudflare) so _PROXY must be set for it to appear in /contribute; unset = scrape direct
       BAKEMONO_SCRAPE_PROXY: ${BAKEMONO_SCRAPE_PROXY:-}
       BAKEMONO_SCRAPE_MEDIA_PROXY: ${BAKEMONO_SCRAPE_MEDIA_PROXY:-}
+      # kemono-style archives to mirror, comma-separated bases (e.g. https://pawchive.st); empty = off.
+      # per-creator gallery-dl archives in the scrape volume keep every re-run incremental
+      BAKEMONO_MIRROR_URLS: ${BAKEMONO_MIRROR_URLS:-}
+      BAKEMONO_MIRROR_INTERVAL_SECS: ${BAKEMONO_MIRROR_INTERVAL_SECS:-86400}
+      # creators per round (most-favorited first) and newest posts per creator; 0 = everything
+      BAKEMONO_MIRROR_CREATORS: ${BAKEMONO_MIRROR_CREATORS:-0}
+      BAKEMONO_MIRROR_POSTS: ${BAKEMONO_MIRROR_POSTS:-0}
+      BAKEMONO_MIRROR_CONCURRENCY: ${BAKEMONO_MIRROR_CONCURRENCY:-2}
+      # stop starting new creators when the staging disk drops below this many GiB free
+      BAKEMONO_MIRROR_MIN_FREE_GB: ${BAKEMONO_MIRROR_MIN_FREE_GB:-25}
       # mod password (HTTP Basic auth); leave unset to disable /mod
       BAKEMONO_MOD_TOKEN: ${BAKEMONO_MOD_TOKEN:-}
       # board title shown in the header, browser tab and /info; unset keeps the default wordmark
