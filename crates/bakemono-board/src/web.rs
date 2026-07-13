@@ -68,7 +68,7 @@ async fn home(State(pool): State<PgPool>) -> Html<String> {
     let posts = db::list_posts(&pool, "", db::SortField::Created, true, "", "", 12, 0)
         .await
         .unwrap_or_default();
-    let creators = db::list_creators(&pool, "", db::SortField::Views, true, "", 12, 0)
+    let creators = db::list_creators(&pool, "", db::SortField::Views, true, "", 8, 0)
         .await
         .unwrap_or_default();
     let cfg = config::get();
