@@ -1,4 +1,5 @@
 mod api;
+mod booru;
 mod config;
 mod crypto;
 mod db;
@@ -47,6 +48,7 @@ async fn serve() -> Result<()> {
     }
     tokio::spawn(scrape::run_scheduler(pool.clone(), kubo.clone()));
     tokio::spawn(mirror::run_scheduler(pool.clone(), kubo.clone()));
+    tokio::spawn(thumb::backfill_dims(pool.clone()));
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!("board on http://{bind}");
@@ -80,8 +82,9 @@ async fn cmd_add(paths: Vec<String>) -> Result<()> {
             .file_name()
             .and_then(|n| n.to_str())
             .map(str::to_owned);
+        let dims = thumb::dimensions(&path).await;
         let cid = kubo.add(bytes, &path).await?;
-        db::insert_file(&pool, &cid, &sha256, size, mime, filename.as_deref(), None).await?;
+        db::insert_file(&pool, &cid, &sha256, size, mime, filename.as_deref(), None, dims).await?;
         println!("{cid}  {path}");
     }
     Ok(())

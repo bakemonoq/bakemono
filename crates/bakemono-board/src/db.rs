@@ -368,10 +368,15 @@ pub async fn insert_file(
     mime: &str,
     filename: Option<&str>,
     thumb_cid: Option<&str>,
+    dims: Option<(i32, i32)>,
 ) -> Result<()> {
     sqlx::query(
-        "INSERT INTO files (cid, sha256, size, mime, filename, thumb_cid) VALUES ($1,$2,$3,$4,$5,$6)
-         ON CONFLICT (cid) DO UPDATE SET thumb_cid = COALESCE(files.thumb_cid, EXCLUDED.thumb_cid)",
+        "INSERT INTO files (cid, sha256, size, mime, filename, thumb_cid, width, height)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+         ON CONFLICT (cid) DO UPDATE SET
+             thumb_cid = COALESCE(files.thumb_cid, EXCLUDED.thumb_cid),
+             width = COALESCE(files.width, EXCLUDED.width),
+             height = COALESCE(files.height, EXCLUDED.height)",
     )
     .bind(cid)
     .bind(sha256)
@@ -379,8 +384,36 @@ pub async fn insert_file(
     .bind(mime)
     .bind(filename)
     .bind(thumb_cid)
+    .bind(dims.map(|d| d.0))
+    .bind(dims.map(|d| d.1))
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+// files the booru facade surfaces but whose dimensions were never probed (pre-dating the column,
+// or restored from a manifest that carries no byte facts)
+pub async fn files_missing_dims(pool: &PgPool, limit: i64) -> Result<Vec<String>> {
+    let rows = sqlx::query_scalar(
+        "SELECT f.cid FROM files f
+         WHERE f.width IS NULL AND (f.mime LIKE 'image/%' OR f.mime LIKE 'video/%')
+           AND EXISTS (SELECT 1 FROM post_files pf WHERE pf.cid = f.cid)
+           AND NOT EXISTS (SELECT 1 FROM denylist d WHERE d.cid = f.cid)
+         LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+pub async fn set_dims(pool: &PgPool, cid: &str, width: i32, height: i32) -> Result<()> {
+    sqlx::query("UPDATE files SET width = $2, height = $3 WHERE cid = $1")
+        .bind(cid)
+        .bind(width)
+        .bind(height)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -835,9 +868,14 @@ CREATE TABLE IF NOT EXISTS files (
     mime      TEXT NOT NULL,
     filename  TEXT,
     thumb_cid TEXT,
+    -- pixel dimensions; NULL = not probed yet, 0 = probe failed (so the backfill never retries it)
+    width     INTEGER,
+    height    INTEGER,
     added_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS files_sha256 ON files (sha256);
+ALTER TABLE files ADD COLUMN IF NOT EXISTS width INTEGER;
+ALTER TABLE files ADD COLUMN IF NOT EXISTS height INTEGER;
 
 CREATE TABLE IF NOT EXISTS denylist (
     cid      TEXT PRIMARY KEY,
@@ -865,7 +903,9 @@ CREATE TABLE IF NOT EXISTS posts (
     PRIMARY KEY (platform, creator_id, post_id)
 );
 
+-- id is the stable integer handle the booru facade exposes; ingest order keeps it roughly newest-last
 CREATE TABLE IF NOT EXISTS post_files (
+    id         BIGSERIAL,
     platform   TEXT NOT NULL,
     creator_id TEXT NOT NULL,
     post_id    TEXT NOT NULL,
@@ -874,6 +914,8 @@ CREATE TABLE IF NOT EXISTS post_files (
     PRIMARY KEY (platform, creator_id, post_id, file_index)
 );
 CREATE INDEX IF NOT EXISTS post_files_cid ON post_files (cid);
+ALTER TABLE post_files ADD COLUMN IF NOT EXISTS id BIGSERIAL;
+CREATE UNIQUE INDEX IF NOT EXISTS post_files_id ON post_files (id);
 
 -- contributor session cookies, stored only as RSA-wrapped ciphertext. the private key lives offline
 -- and touches the box only during an import round, so a database dump reveals no usable tokens
@@ -930,7 +972,7 @@ SELECT EXTRACT(EPOCH FROM f.added_at)::bigint AS created_at,
        p.platform, c.creator, p.creator_id, p.post_id, pf.file_index,
        NULLIF(p.title, '') AS post_title, p.posted_at, p.tier, p.body AS content,
        CASE WHEN f.thumb_cid IS NOT NULL THEN '/ipfs/' || f.thumb_cid END AS thumb,
-       f.cid
+       f.cid, pf.id AS file_id, f.sha256, f.thumb_cid, f.width, f.height
 FROM post_files pf
 JOIN posts p ON (p.platform, p.creator_id, p.post_id) = (pf.platform, pf.creator_id, pf.post_id)
 JOIN creators c ON (c.platform, c.creator_id) = (p.platform, p.creator_id)

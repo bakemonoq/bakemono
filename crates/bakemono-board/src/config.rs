@@ -22,6 +22,10 @@ pub struct BoardConfig {
     pub dmca_contact: Option<String>,
     pub contact: Option<String>,
     pub static_dir: Option<String>,
+    // absolute base for URLs handed to external clients (booru API); unset = derive from the request
+    pub public_url: Option<String>,
+    // board-wide content rating reported by the booru API: general/sensitive/questionable/explicit
+    pub rating: Option<String>,
     pub community: Vec<CommunityLink>,
 }
 
@@ -40,6 +44,7 @@ impl BoardConfig {
         }
         cfg.dmca_contact = cfg.dmca_contact.or_else(|| env_opt("BAKEMONO_DMCA_CONTACT"));
         cfg.contact = cfg.contact.or_else(|| env_opt("BAKEMONO_CONTACT"));
+        cfg.public_url = cfg.public_url.or_else(|| env_opt("BAKEMONO_PUBLIC_URL"));
         cfg
     }
 }

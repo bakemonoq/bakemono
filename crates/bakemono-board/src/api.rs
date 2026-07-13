@@ -24,6 +24,11 @@ const ENDPOINTS: &[&str] = &[
     "/api/creators?source=&sort=&dir=&page=",
     "/api/creators/{platform}/{creator_id}?tier=&page=",
 ];
+const BOORU_ENDPOINTS: &[&str] = &[
+    "/index.php?page=dapi&s=post&q=index&tags=&pid=&limit=&json=1",
+    "/index.php?page=dapi&s=tag&q=index&name_pattern=&limit=",
+    "/autocomplete.php?q=",
+];
 const ICON_WARN: &str = "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z'/><path d='M12 9v4'/><path d='M12 17h.01'/></svg>";
 
 pub fn routes() -> axum::Router<AppState> {
@@ -51,6 +56,7 @@ async fn index(State(pool): State<PgPool>, headers: HeaderMap) -> Response {
         head,
         root,
         endpoints: ENDPOINTS,
+        booru: BOORU_ENDPOINTS,
     })
     .into_response()
 }
@@ -97,6 +103,18 @@ fn page(head: Option<&str>, root: Option<&str>) -> Html<String> {
                     p { "Every file reference is a CID plus an " code { "ipfs://<cid>" } " URI; bytes come from IPFS, not from us" }
                     ul.list {
                         @for e in ENDPOINTS { li { code { (e) } } }
+                    }
+                }
+                div.panel {
+                    h3 { "Booru clients" }
+                    p {
+                        "The board also speaks the Gelbooru 0.2 API, so booru explorer apps can browse it: "
+                        "add this site as a Gelbooru-compatible source. Tags are derived - creator name, platform, "
+                        code { "free" } "/" code { "paid" } ", " code { "video" } "/" code { "gif" } "/" code { "animated" }
+                        " - and any other search term matches post titles"
+                    }
+                    ul.list {
+                        @for e in BOORU_ENDPOINTS { li { code { (e) } } }
                     }
                 }
             }
@@ -244,6 +262,7 @@ struct ApiIndex {
     head: Option<String>,
     root: Option<String>,
     endpoints: &'static [&'static str],
+    booru: &'static [&'static str],
 }
 
 #[derive(Serialize)]

@@ -359,16 +359,21 @@ async fn ingest_pair(pool: &PgPool, kubo: &Kubo, media: &Path, sidecar: &Path) -
             let thumb_sha = hex::encode(Sha256::digest(&bytes));
             let thumb_size = bytes.len() as i64;
             let cid = kubo.add(bytes, "thumb").await?;
-            db::insert_file(pool, &cid, &thumb_sha, thumb_size, "image/jpeg", None, None).await?;
+            db::insert_file(pool, &cid, &thumb_sha, thumb_size, "image/jpeg", None, None, None).await?;
             kubo.pin_archive(&cid, &format!("thumb {}", meta.post_key())).await?;
             Some(cid)
         }
         None => None,
     };
+    let dims = if mime.starts_with("image/") || mime.starts_with("video/") {
+        thumb::dimensions(media).await
+    } else {
+        None
+    };
     let cid = kubo.add_path(media).await?;
     kubo.pin_archive(&cid, &meta.post_key()).await?;
     let filename = media.file_name().and_then(|n| n.to_str());
-    db::insert_file(pool, &cid, &sha256, size as i64, &mime, filename, thumb_cid.as_deref()).await?;
+    db::insert_file(pool, &cid, &sha256, size as i64, &mime, filename, thumb_cid.as_deref(), dims).await?;
     db::upsert_creator(pool, &meta.platform, &meta.creator_id, &meta.creator).await?;
     db::upsert_post(pool, &meta).await?;
     db::upsert_post_file(pool, &meta, &cid).await?;

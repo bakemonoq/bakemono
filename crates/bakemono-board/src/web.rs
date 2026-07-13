@@ -57,6 +57,7 @@ pub fn router(state: AppState) -> Router {
         .route("/head.json", get(head_json))
         .route("/follower.json", get(follower_json))
         .merge(crate::api::routes())
+        .merge(crate::booru::routes())
         .with_state(state)
 }
 

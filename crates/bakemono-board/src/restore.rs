@@ -72,6 +72,7 @@ async fn restore_shard(pool: &PgPool, kubo: &Kubo, shard: &Shard) -> Result<()> 
                 &file.mime,
                 file.filename.as_deref(),
                 file.thumb.as_deref(),
+                None,
             )
             .await?;
             db::upsert_post(pool, &meta).await?;
@@ -82,7 +83,7 @@ async fn restore_shard(pool: &PgPool, kubo: &Kubo, shard: &Shard) -> Result<()> 
             if let Some(thumb) = &file.thumb {
                 let bytes = kubo.cat(thumb).await.with_context(|| format!("fetching thumb {thumb}"))?;
                 let sha = hex::encode(Sha256::digest(&bytes));
-                db::insert_file(pool, thumb, &sha, bytes.len() as i64, "image/jpeg", None, None).await?;
+                db::insert_file(pool, thumb, &sha, bytes.len() as i64, "image/jpeg", None, None, None).await?;
                 kubo.pin(thumb).await?;
                 kubo.pin_archive(thumb, &format!("thumb {}", meta.post_key())).await?;
             }
