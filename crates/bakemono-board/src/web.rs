@@ -67,6 +67,9 @@ pub fn router(state: AppState) -> Router {
 // how many cards a browse page shows; one extra is fetched to detect a next page without a count query
 const PAGE: i64 = 36;
 
+// board build shown in the wordmark capsule and footer, so a keeper can tell at a glance which release is live
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 async fn home(State(pool): State<PgPool>) -> Html<String> {
     // 12 keeps Recent to two rows on a wide screen
     let posts = db::list_posts(&pool, "", db::SortField::Created, true, "", "", 12, 0)
@@ -741,7 +744,7 @@ fn nav_btn(
 
 // full media (not the tiny preview) served straight from the local IPFS gateway (/ipfs/{cid}), one at a
 // time and centered - content is the point of the page. loading direct from Kubo keeps the board out of
-// the byte path; each item loads only when shown, so a many-image post does not fetch it all at once
+// the byte path; items prefetch in chunks of 10, so a many-image post does not fetch it all at once
 fn carousel(files: &[db::ManifestRow]) -> Markup {
     let items: Vec<String> = files
         .iter()
@@ -1815,6 +1818,7 @@ pub(crate) fn render(title: &str, body: Markup) -> Html<String> {
                         a.brand href="/" {
                             @if let Some(m) = &cfg.mascot { img.brandmascot src=(m) alt=""; }
                             span { (cfg.name) }
+                            span.vertag { "v" (VERSION) }
                         }
                         // the search field is a full bar on desktop; on mobile it collapses and this checkbox
                         // (toggled by the search icon button) reveals it as a row under the top bar
@@ -1867,6 +1871,8 @@ fn footer(cfg: &config::BoardConfig) -> Markup {
                 p.small.muted {
                     "Files are served from a peer swarm, not stored here. "
                     a href="/info" { "How this works" }
+                    " "
+                    span.vertag { (cfg.name) " v" (VERSION) }
                 }
             }
         }
@@ -1946,6 +1952,9 @@ button,input,select { font:inherit }
 .brand { display:flex; align-items:center; gap:.5rem; font-weight:800; font-size:1.15rem; color:var(--text); white-space:nowrap }
 .brand:hover { text-decoration:none }
 .brandmascot { width:28px; height:28px; border-radius:7px; object-fit:cover }
+.vertag { display:inline-block; padding:.03rem .4rem; border-radius:7px; background:var(--surface1); color:var(--subtext0);
+  font-size:.62rem; font-weight:700; letter-spacing:.02em; vertical-align:middle }
+.brand .vertag { margin-left:.1rem }
 .topsearch { flex:1; position:relative; display:flex; align-items:center; max-width:520px; margin:0 auto }
 .topsearch input { flex:1; height:40px; padding:0 .9rem 0 2.4rem; border-radius:10px; border:1px solid var(--surface1);
   background:var(--surface0); color:var(--text) }
@@ -2387,9 +2396,18 @@ for (const el of document.querySelectorAll('.carousel')) {
     n.src = it.u
     nodes[idx] = n
   }
+  // readers almost always page forward a few times, so fetch ahead in chunks of 10; the next
+  // chunk starts when the user reaches the last item already requested
+  const CHUNK = 10
+  let loaded = 0
+  const preload = () => {
+    const end = Math.min(loaded + CHUNK, items.length)
+    while (loaded < end) { if (!nodes[loaded]) build(loaded); loaded++ }
+  }
   const show = (n) => {
     cur = (n + items.length) % items.length
     if (count) count.textContent = (cur + 1) + ' / ' + items.length
+    if (cur >= loaded - 1) preload()
     if (!nodes[cur]) build(cur)
     render(cur)
   }
