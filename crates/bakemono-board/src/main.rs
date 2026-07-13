@@ -42,12 +42,13 @@ async fn serve() -> Result<()> {
     let bind = env_or("BAKEMONO_BIND", "127.0.0.1:3000");
     let pool = db::connect(&database_url()).await?;
     let kubo = Arc::new(kubo::Kubo::from_env());
+    let mirror_progress = Arc::new(mirror::Progress::default());
 
     if let Err(e) = publish::sync_local_denylist(&pool).await {
         tracing::warn!("local denylist sync failed: {e:#}");
     }
     tokio::spawn(scrape::run_scheduler(pool.clone(), kubo.clone()));
-    tokio::spawn(mirror::run_scheduler(pool.clone(), kubo.clone()));
+    tokio::spawn(mirror::run_scheduler(pool.clone(), kubo.clone(), mirror_progress.clone()));
     tokio::spawn(thumb::backfill_dims(pool.clone()));
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
@@ -57,6 +58,7 @@ async fn serve() -> Result<()> {
         kubo,
         probe_gate: Arc::new(Semaphore::new(env_usize("BAKEMONO_PROBE_CONCURRENCY", 4))),
         import_gate: Arc::new(Semaphore::new(env_usize("BAKEMONO_IMPORT_CONCURRENCY", 2))),
+        mirror: mirror_progress,
     };
     axum::serve(listener, web::router(state)).await?;
     Ok(())
@@ -152,7 +154,8 @@ async fn cmd_mirror(args: Vec<String>) -> Result<()> {
     }
     let pool = db::connect(&database_url()).await?;
     let kubo = kubo::Kubo::from_env();
-    let stats = mirror::mirror_round(&pool, &kubo, &url, &limits).await?;
+    let progress = mirror::Progress::default();
+    let stats = mirror::mirror_round(&pool, &kubo, &url, &limits, &progress).await?;
     println!("{} files across {} posts ({} skipped)", stats.files, stats.posts, stats.skipped);
     publish_and_report(&pool, &kubo).await
 }

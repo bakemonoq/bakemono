@@ -136,18 +136,20 @@ pub async fn scrape_feed(
     request.cookies = Some(Cookies::File(cookie_file.path.clone()));
     request.options = scrape_options(platform);
 
-    stream_ingest(pool, kubo, &scraper_for(platform), &request, &staging).await
+    stream_ingest(pool, kubo, &scraper_for(platform), &request, &staging, |_| {}).await
 }
 
 // ingest each file the moment gallery-dl finishes downloading it, streaming paths over a channel
 // to a concurrent consumer. content shows up as it downloads, a restart mid-scrape only loses the
-// one file in flight, and deleting each file as it lands keeps staging bounded
-pub async fn stream_ingest(
+// one file in flight, and deleting each file as it lands keeps staging bounded. on_file fires once
+// per ingested file so a caller can surface live progress
+pub async fn stream_ingest<F: FnMut(&PostMeta) + Send>(
     pool: &PgPool,
     kubo: &Kubo,
     scraper: &Scraper,
     request: &ScrapeRequest,
     staging: &Path,
+    mut on_file: F,
 ) -> Result<(IngestStats, Vec<CreatorSeen>)> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
     let scrape = async {
@@ -176,6 +178,7 @@ pub async fn stream_ingest(
             match ingest_pair(pool, kubo, &media, &sidecar).await {
                 Ok(meta) => {
                     acc.record(&meta);
+                    on_file(&meta);
                     let _ = std::fs::remove_file(&media);
                     let _ = std::fs::remove_file(&sidecar);
                 }

@@ -1,6 +1,7 @@
+use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -11,13 +12,13 @@ use sqlx::postgres::PgPool;
 use bakemono_scraper::ScrapeRequest;
 
 use crate::kubo::Kubo;
-use crate::scrape::{self, IngestStats};
+use crate::scrape::{self, IngestStats, PostMeta};
 
 // a mirror source is a kemono-style archive (e.g. pawchive): /api/v1/creators enumerates it and
 // gallery-dl fetches {base}/{service}/user/{id}. mirrored posts keep their origin platform, so
 // they merge and dedupe with directly scraped content
 
-pub async fn run_scheduler(pool: PgPool, kubo: Arc<Kubo>) {
+pub async fn run_scheduler(pool: PgPool, kubo: Arc<Kubo>, progress: Arc<Progress>) {
     let bases = bases_from_env();
     if bases.is_empty() {
         tracing::info!("mirror scheduler off (no BAKEMONO_MIRROR_URLS)");
@@ -29,7 +30,7 @@ pub async fn run_scheduler(pool: PgPool, kubo: Arc<Kubo>) {
     }
     loop {
         for base in &bases {
-            match mirror_round(&pool, &kubo, base, &Limits::from_env()).await {
+            match mirror_round(&pool, &kubo, base, &Limits::from_env(), &progress).await {
                 Ok(stats) => tracing::info!(
                     base,
                     files = stats.files,
@@ -64,10 +65,17 @@ impl Limits {
 
 const PUBLISH_EVERY: Duration = Duration::from_secs(900);
 
-pub async fn mirror_round(pool: &PgPool, kubo: &Kubo, base: &str, limits: &Limits) -> Result<IngestStats> {
+pub async fn mirror_round(
+    pool: &PgPool,
+    kubo: &Kubo,
+    base: &str,
+    limits: &Limits,
+    progress: &Progress,
+) -> Result<IngestStats> {
     let base = base.trim_end_matches('/');
     let picked = pick(fetch_creators(base).await?, limits.creators);
     tracing::info!(base, creators = picked.len(), "mirror round starting");
+    progress.start_round(host_of(base), picked.len());
     let root = scrape::staging_dir().join("mirror").join(host_of(base));
     std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
 
@@ -89,7 +97,7 @@ pub async fn mirror_round(pool: &PgPool, kubo: &Kubo, base: &str, limits: &Limit
                     return IngestStats::default();
                 }
             }
-            mirror_creator(pool, kubo, base, &root, &creator, posts).await
+            mirror_creator(pool, kubo, base, &root, &creator, posts, progress).await
         }
     });
 
@@ -110,6 +118,7 @@ pub async fn mirror_round(pool: &PgPool, kubo: &Kubo, base: &str, limits: &Limit
         }
     }
     drop(stream);
+    progress.finish_round();
     if total.files > 0 {
         crate::publish::publish_if_changed(pool, kubo).await?;
     }
@@ -123,6 +132,7 @@ async fn mirror_creator(
     root: &Path,
     creator: &Creator,
     posts: u32,
+    progress: &Progress,
 ) -> IngestStats {
     let scope = root.join(format!("{}-{}", creator.service, creator.id));
     if let Err(e) = std::fs::create_dir_all(&scope) {
@@ -139,15 +149,24 @@ async fn mirror_creator(
     if posts > 0 {
         request.options.push(format!("max-posts={posts}"));
     }
-    match scrape::stream_ingest(pool, kubo, &mirror_scraper(), &request, &scope).await {
+    let key = format!("{}-{}", creator.service, creator.id);
+    progress.begin(&key, &creator.name, &creator.service);
+    let ingest =
+        scrape::stream_ingest(pool, kubo, &mirror_scraper(), &request, &scope, |meta| {
+            progress.bump(&key, meta);
+        })
+        .await;
+    match ingest {
         Ok((stats, _)) => {
             if stats.files > 0 {
                 tracing::info!(url, files = stats.files, posts = stats.posts, "mirrored creator");
             }
+            progress.finish(&key, stats.files, stats.posts, false);
             stats
         }
         Err(e) => {
             tracing::warn!(url, "mirror creator failed: {e:#}");
+            progress.finish(&key, 0, 0, true);
             IngestStats { skipped: 1, ..Default::default() }
         }
     }
@@ -162,9 +181,186 @@ fn mirror_scraper() -> bakemono_scraper::Scraper {
     }
 }
 
+// live per-creator round state the /mod dashboard reads. shared across the concurrent creator jobs;
+// the mirror never persists this, so a restart just starts the next round's view fresh
+#[derive(Default)]
+pub struct Progress {
+    round: Mutex<Option<Round>>,
+}
+
+struct Round {
+    base: String,
+    started: Instant,
+    total: usize,
+    done: usize,
+    files: usize,
+    posts: usize,
+    active: Vec<Active>,
+    recent: VecDeque<Finished>,
+    finished: bool,
+}
+
+struct Active {
+    key: String,
+    name: String,
+    platform: String,
+    started: Instant,
+    files: usize,
+    posts: HashSet<String>,
+}
+
+struct Finished {
+    name: String,
+    platform: String,
+    files: usize,
+    posts: usize,
+    secs: u64,
+    skipped: bool,
+}
+
+const RECENT_CAP: usize = 12;
+
+impl Progress {
+    fn start_round(&self, base: String, total: usize) {
+        *self.round.lock().unwrap() = Some(Round {
+            base,
+            started: Instant::now(),
+            total,
+            done: 0,
+            files: 0,
+            posts: 0,
+            active: Vec::new(),
+            recent: VecDeque::new(),
+            finished: false,
+        });
+    }
+
+    fn begin(&self, key: &str, name: &str, platform: &str) {
+        if let Some(r) = self.round.lock().unwrap().as_mut() {
+            r.active.push(Active {
+                key: key.to_string(),
+                name: name.to_string(),
+                platform: platform.to_string(),
+                started: Instant::now(),
+                files: 0,
+                posts: HashSet::new(),
+            });
+        }
+    }
+
+    fn bump(&self, key: &str, meta: &PostMeta) {
+        if let Some(r) = self.round.lock().unwrap().as_mut() {
+            if let Some(a) = r.active.iter_mut().find(|a| a.key == key) {
+                a.files += 1;
+                a.posts.insert(meta.post_key());
+            }
+        }
+    }
+
+    fn finish(&self, key: &str, files: usize, posts: usize, skipped: bool) {
+        if let Some(r) = self.round.lock().unwrap().as_mut() {
+            let secs = r
+                .active
+                .iter()
+                .find(|a| a.key == key)
+                .map(|a| a.started.elapsed().as_secs())
+                .unwrap_or(0);
+            let (name, platform) = r
+                .active
+                .iter()
+                .find(|a| a.key == key)
+                .map(|a| (a.name.clone(), a.platform.clone()))
+                .unwrap_or_else(|| (key.to_string(), String::new()));
+            r.active.retain(|a| a.key != key);
+            r.done += 1;
+            r.files += files;
+            r.posts += posts;
+            r.recent.push_front(Finished { name, platform, files, posts, secs, skipped });
+            r.recent.truncate(RECENT_CAP);
+        }
+    }
+
+    fn finish_round(&self) {
+        if let Some(r) = self.round.lock().unwrap().as_mut() {
+            r.active.clear();
+            r.finished = true;
+        }
+    }
+
+    pub fn snapshot(&self) -> Option<RoundSnapshot> {
+        let guard = self.round.lock().unwrap();
+        let r = guard.as_ref()?;
+        let active: Vec<ActiveSnapshot> = r
+            .active
+            .iter()
+            .map(|a| ActiveSnapshot {
+                name: a.name.clone(),
+                platform: a.platform.clone(),
+                files: a.files,
+                posts: a.posts.len(),
+                elapsed_secs: a.started.elapsed().as_secs(),
+            })
+            .collect();
+        let live_files: usize = active.iter().map(|a| a.files).sum();
+        let live_posts: usize = active.iter().map(|a| a.posts).sum();
+        Some(RoundSnapshot {
+            base: r.base.clone(),
+            elapsed_secs: r.started.elapsed().as_secs(),
+            total: r.total,
+            done: r.done,
+            files: r.files + live_files,
+            posts: r.posts + live_posts,
+            finished: r.finished,
+            active,
+            recent: r
+                .recent
+                .iter()
+                .map(|f| FinishedSnapshot {
+                    name: f.name.clone(),
+                    platform: f.platform.clone(),
+                    files: f.files,
+                    posts: f.posts,
+                    secs: f.secs,
+                    skipped: f.skipped,
+                })
+                .collect(),
+        })
+    }
+}
+
+pub struct RoundSnapshot {
+    pub base: String,
+    pub elapsed_secs: u64,
+    pub total: usize,
+    pub done: usize,
+    pub files: usize,
+    pub posts: usize,
+    pub finished: bool,
+    pub active: Vec<ActiveSnapshot>,
+    pub recent: Vec<FinishedSnapshot>,
+}
+
+pub struct ActiveSnapshot {
+    pub name: String,
+    pub platform: String,
+    pub files: usize,
+    pub posts: usize,
+    pub elapsed_secs: u64,
+}
+
+pub struct FinishedSnapshot {
+    pub name: String,
+    pub platform: String,
+    pub files: usize,
+    pub posts: usize,
+    pub secs: u64,
+    pub skipped: bool,
+}
+
 struct Creator {
     id: String,
     service: String,
+    name: String,
     favorited: i64,
 }
 
@@ -196,6 +392,8 @@ struct RawCreator {
     #[serde(default)]
     service: String,
     #[serde(default)]
+    name: String,
+    #[serde(default)]
     favorited: Option<i64>,
     #[serde(default)]
     ever_imported: bool,
@@ -212,7 +410,8 @@ fn parse_creators(raw: &[u8]) -> Result<Vec<Creator>> {
         let Some(id) = stringy(Some(&v.id)) else {
             continue;
         };
-        out.push(Creator { id, service: v.service, favorited: v.favorited.unwrap_or(0) });
+        let name = if v.name.is_empty() { id.clone() } else { v.name };
+        out.push(Creator { id, service: v.service, name, favorited: v.favorited.unwrap_or(0) });
     }
     Ok(out)
 }
