@@ -22,10 +22,17 @@ pub struct BoardConfig {
     pub dmca_contact: Option<String>,
     pub contact: Option<String>,
     pub static_dir: Option<String>,
-    // absolute base for URLs handed to external clients (booru API); unset = derive from the request
+    // absolute base for URLs handed to external clients (booru API, canonical/OG tags, sitemap); unset =
+    // derive from the request. crawlers need an absolute canonical, so set this on a public board
     pub public_url: Option<String>,
     // board-wide content rating reported by the booru API: general/sensitive/questionable/explicit
     pub rating: Option<String>,
+    // raw markup injected verbatim into every <head>, for search-console verification meta tags and the
+    // like; operator-authored, same trust level as the binary
+    pub head_html: Option<String>,
+    // shared secret for IndexNow submissions (Bing/Yandex/DuckDuckGo). any 8-128 hex-ish string; the board
+    // serves it at /indexnow.txt so the engines can verify ownership. unset = no IndexNow pings
+    pub indexnow_key: Option<String>,
     pub community: Vec<CommunityLink>,
 }
 
@@ -44,8 +51,18 @@ impl BoardConfig {
         }
         cfg.dmca_contact = cfg.dmca_contact.or_else(|| env_opt("BAKEMONO_DMCA_CONTACT"));
         cfg.contact = cfg.contact.or_else(|| env_opt("BAKEMONO_CONTACT"));
-        cfg.public_url = cfg.public_url.or_else(|| env_opt("BAKEMONO_PUBLIC_URL"));
+        cfg.public_url = cfg
+            .public_url
+            .or_else(|| env_opt("BAKEMONO_PUBLIC_URL"))
+            .map(|u| u.trim_end_matches('/').to_string());
+        cfg.indexnow_key = cfg.indexnow_key.or_else(|| env_opt("BAKEMONO_INDEXNOW_KEY"));
         cfg
+    }
+
+    // the public origin with no trailing slash, or None when unset. absolute URLs for canonical/OG/sitemap
+    // are only emitted when this is known - a guessed host would poison the canonical
+    pub fn base_url(&self) -> Option<&str> {
+        self.public_url.as_deref().filter(|u| !u.is_empty())
     }
 }
 

@@ -287,6 +287,70 @@ pub async fn random_post(pool: &PgPool) -> Result<Option<(String, String, String
     Ok(row)
 }
 
+// one crawlable URL for the sitemap: post_id is None for a creator row. lastmod is the newest file
+// added_at in the group, as a unix epoch - a proper timestamp, unlike the free-form posted_at string
+#[derive(sqlx::FromRow)]
+pub struct SitemapRow {
+    pub platform: String,
+    pub creator_id: String,
+    pub post_id: Option<String>,
+    pub lastmod: i64,
+}
+
+pub async fn sitemap_post_count(pool: &PgPool) -> Result<i64> {
+    let n = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM (SELECT DISTINCT platform, creator_id, post_id FROM visible_content) t",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
+}
+
+// stable ordering (platform, creator_id, post_id) so a given offset maps to the same slice across the
+// sitemap index and its chunk files even as rows are added
+pub async fn sitemap_posts(pool: &PgPool, limit: i64, offset: i64) -> Result<Vec<SitemapRow>> {
+    let rows = sqlx::query_as::<_, SitemapRow>(
+        "SELECT platform, creator_id, post_id, MAX(created_at) AS lastmod
+         FROM visible_content
+         GROUP BY platform, creator_id, post_id
+         ORDER BY platform, creator_id, post_id
+         LIMIT $1 OFFSET $2",
+    )
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+pub async fn sitemap_creators(pool: &PgPool) -> Result<Vec<SitemapRow>> {
+    let rows = sqlx::query_as::<_, SitemapRow>(
+        "SELECT platform, creator_id, NULL::text AS post_id, MAX(created_at) AS lastmod
+         FROM visible_content
+         GROUP BY platform, creator_id
+         ORDER BY platform, creator_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+// posts whose newest file landed at or after `since` (unix epoch), for an IndexNow ping after a publish
+pub async fn posts_since(pool: &PgPool, since: i64, limit: i64) -> Result<Vec<(String, String, String)>> {
+    let rows = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT platform, creator_id, post_id FROM visible_content
+         GROUP BY platform, creator_id, post_id
+         HAVING MAX(created_at) >= $1
+         ORDER BY MAX(created_at) DESC
+         LIMIT $2",
+    )
+    .bind(since)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 // popularity signal for the Popular sort; deduped per browser by the caller so a refresh does not inflate it
 pub async fn bump_views(pool: &PgPool, platform: &str, creator_id: &str, post_id: &str) -> Result<()> {
     sqlx::query(
@@ -719,6 +783,17 @@ pub async fn record_head(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+// published_at of the newest head as a unix epoch; the IndexNow ping uses it to scope "new since last
+// publish" before the fresh head lands
+pub async fn last_head_published_epoch(pool: &PgPool) -> Result<Option<i64>> {
+    let epoch = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT EXTRACT(EPOCH FROM published_at)::bigint FROM manifest_heads ORDER BY version DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(epoch.flatten())
 }
 
 pub async fn latest_head_json(pool: &PgPool) -> Result<Option<String>> {

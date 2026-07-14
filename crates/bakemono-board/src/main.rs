@@ -10,6 +10,7 @@ mod publish;
 mod restore;
 mod sanitize;
 mod scrape;
+mod seo;
 mod thumb;
 mod web;
 
