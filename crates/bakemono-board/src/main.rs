@@ -61,7 +61,11 @@ async fn serve() -> Result<()> {
         import_gate: Arc::new(Semaphore::new(env_usize("BAKEMONO_IMPORT_CONCURRENCY", 2))),
         mirror: mirror_progress,
     };
-    axum::serve(listener, web::router(state)).await?;
+    // normalize_path must wrap the router as an outer layer so it rewrites "//index.php" etc before
+    // routing; Router::layer would run after matching and miss the 404
+    use tower::Layer;
+    let app = axum::middleware::from_fn(booru::normalize_path).layer(web::router(state));
+    axum::serve(listener, axum::ServiceExt::<axum::extract::Request>::into_make_service(app)).await?;
     Ok(())
 }
 

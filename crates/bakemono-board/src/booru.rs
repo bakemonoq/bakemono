@@ -1,4 +1,5 @@
 use axum::extract::{Query, Request, State};
+use axum::http::uri::{PathAndQuery, Uri};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -8,6 +9,44 @@ use sqlx::postgres::PgPool;
 use sqlx::{Postgres, QueryBuilder};
 
 use crate::config;
+
+// booru clients build request URLs by concatenating a stored base with a path, which routinely
+// yields "//index.php" (base kept its trailing slash) or a stray trailing slash. axum matches paths
+// literally and 404s those, so collapse runs of slashes app-wide before routing
+pub async fn normalize_path(mut req: Request, next: Next) -> Response {
+    let path = req.uri().path();
+    if path.contains("//") || (path.len() > 1 && path.ends_with('/')) {
+        let normalized = collapse_slashes(path);
+        let rest = match req.uri().query() {
+            Some(q) => format!("{normalized}?{q}"),
+            None => normalized,
+        };
+        let mut parts = req.uri().clone().into_parts();
+        if let Ok(pq) = PathAndQuery::from_maybe_shared(rest) {
+            parts.path_and_query = Some(pq);
+            if let Ok(uri) = Uri::from_parts(parts) {
+                *req.uri_mut() = uri;
+            }
+        }
+    }
+    next.run(req).await
+}
+
+fn collapse_slashes(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let mut prev_slash = false;
+    for c in path.chars() {
+        if c == '/' && prev_slash {
+            continue;
+        }
+        prev_slash = c == '/';
+        out.push(c);
+    }
+    if out.len() > 1 && out.ends_with('/') {
+        out.pop();
+    }
+    out
+}
 
 // Gelbooru 0.2 dapi facade so stock booru clients can browse the board. There is no tag table:
 // tags are derived per file (artist slug, platform, tier, media kind) and an unknown search token
@@ -27,19 +66,18 @@ async fn cors(req: Request, next: Next) -> Response {
     res
 }
 
+// clients differ on how they probe index.php: some hit it bare to check the site exists, some send
+// page=post&s=list (old gallery), some the canonical page=dapi&s=post&q=index. dispatch on `s` alone
+// and default to posts, so any of those validates instead of 404ing
 async fn dapi(State(pool): State<PgPool>, headers: HeaderMap, Query(p): Query<Dapi>) -> Response {
     if p.page.as_deref() == Some("autocomplete2") {
         return complete(&pool, p.term.as_deref().unwrap_or_default()).await;
     }
-    if p.page.as_deref() != Some("dapi") || p.q.as_deref() != Some("index") {
-        return StatusCode::NOT_FOUND.into_response();
-    }
     let json = p.json.as_deref() == Some("1");
     let result = match p.s.as_deref() {
-        Some("post") => posts(&pool, &headers, &p, json).await,
         Some("tag") => tags(&pool, &p, json).await,
         Some("comment") => Ok(xml_response(format!("{XML_HEAD}<comments type=\"array\"/>\n"))),
-        _ => return StatusCode::NOT_FOUND.into_response(),
+        _ => posts(&pool, &headers, &p, json).await,
     };
     result.unwrap_or_else(|e| {
         tracing::warn!("booru query failed: {e:#}");
@@ -51,7 +89,7 @@ async fn posts(pool: &PgPool, headers: &HeaderMap, p: &Dapi, json: bool) -> anyh
     let limit = p.limit.unwrap_or(100).clamp(1, 100);
     let offset = p.pid.unwrap_or(0).max(0) * limit;
     let Some(search) = Search::parse(p.tags.as_deref().unwrap_or(""), p.id) else {
-        return Ok(render_posts(Vec::new(), 0, 0, json));
+        return Ok(render_posts(Vec::new(), 0, offset, limit, json));
     };
     let mut count = QueryBuilder::new("SELECT COUNT(*) FROM visible_content vc WHERE ");
     search.push_where(&mut count);
@@ -71,12 +109,14 @@ async fn posts(pool: &PgPool, headers: &HeaderMap, p: &Dapi, json: bool) -> anyh
     let rows: Vec<FileRow> = qb.build_query_as().fetch_all(pool).await?;
     let base = base_url(headers);
     let out = rows.iter().map(|r| BooruPost::from_row(r, &base)).collect();
-    Ok(render_posts(out, total, offset, json))
+    Ok(render_posts(out, total, offset, limit, json))
 }
 
-fn render_posts(posts: Vec<BooruPost>, count: i64, offset: i64, json: bool) -> Response {
+fn render_posts(posts: Vec<BooruPost>, count: i64, offset: i64, limit: i64, json: bool) -> Response {
     if json {
-        return Json(posts).into_response();
+        // gelbooru wraps the array in @attributes + a `post` key; a bare array trips stricter clients
+        return Json(PostsJson { attributes: Attributes { limit, offset, count }, post: posts })
+            .into_response();
     }
     let mut xml = String::with_capacity(posts.len() * 700 + 128);
     xml.push_str(XML_HEAD);
@@ -106,11 +146,18 @@ async fn tags(pool: &PgPool, p: &Dapi, json: bool) -> anyhow::Result<Response> {
     let rows: Vec<(String, i32, i64)> =
         sqlx::query_as(&sql).bind(&pattern).bind(&names).bind(limit).fetch_all(pool).await?;
     if json {
-        let out: Vec<BooruTag> = rows
-            .into_iter()
-            .map(|(name, kind, count)| BooruTag { id: tag_id(&name), name, count, kind, ambiguous: 0 })
+        let tag: Vec<BooruTag> = rows
+            .iter()
+            .map(|(name, kind, count)| BooruTag {
+                id: tag_id(name),
+                name: name.clone(),
+                count: *count,
+                kind: *kind,
+                ambiguous: 0,
+            })
             .collect();
-        return Ok(Json(out).into_response());
+        let attributes = Attributes { limit, offset: 0, count: tag.len() as i64 };
+        return Ok(Json(TagsJson { attributes, tag }).into_response());
     }
     let mut xml = String::from(XML_HEAD);
     xml.push_str("<tags type=\"array\">\n");
@@ -574,6 +621,28 @@ struct BooruTag {
     ambiguous: i32,
 }
 
+// gelbooru's json envelope: a metadata object plus the array under a type-named key
+#[derive(Serialize)]
+struct PostsJson {
+    #[serde(rename = "@attributes")]
+    attributes: Attributes,
+    post: Vec<BooruPost>,
+}
+
+#[derive(Serialize)]
+struct TagsJson {
+    #[serde(rename = "@attributes")]
+    attributes: Attributes,
+    tag: Vec<BooruTag>,
+}
+
+#[derive(Serialize)]
+struct Attributes {
+    limit: i64,
+    offset: i64,
+    count: i64,
+}
+
 #[derive(Serialize)]
 struct AcEntry {
     #[serde(rename = "type")]
@@ -588,7 +657,6 @@ struct AcEntry {
 struct Dapi {
     page: Option<String>,
     s: Option<String>,
-    q: Option<String>,
     id: Option<i64>,
     tags: Option<String>,
     pid: Option<i64>,
