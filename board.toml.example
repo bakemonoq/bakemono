@@ -31,6 +31,24 @@ static_dir = "/config/static"
 dmca_contact = "dmca@example.org"
 contact = "hi@example.org"
 
+# SEO. Set public_url to the board's real origin (no trailing slash) once it is on a public domain: it is
+# the base for the canonical link, Open Graph tags and the sitemap, all of which need an absolute URL a
+# crawler can trust. Unset = no canonical/OG/sitemap, and the booru API derives file links from the request.
+# public_url = "https://board.example"
+
+# Content rating reported to the booru API and, when questionable/explicit, emitted as <meta name="rating"
+# content="adult"> so search engines file the board under SafeSearch instead of penalising it.
+# rating = "explicit"
+
+# Raw markup injected verbatim into every <head>. Meant for search-console verification meta tags; you can
+# also verify by DNS and leave this unset. Operator-authored, same trust level as the binary.
+# head_html = '<meta name="google-site-verification" content="..."><meta name="yandex-verification" content="...">'
+
+# IndexNow key: any 8-128 char hex-ish string. Enables instant submission of new posts to Bing/Yandex (and,
+# via Bing, DuckDuckGo) after each publish; the board serves it at /indexnow.txt for ownership verification.
+# Google ignores IndexNow, so it stays on the sitemap + Search Console path. Unset = no IndexNow pings.
+# indexnow_key = "0123456789abcdef0123456789abcdef"
+
 # Community links shown in the footer. Add as many as you like.
 [[community]]
 label = "Telegram"

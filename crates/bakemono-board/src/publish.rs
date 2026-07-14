@@ -54,6 +54,9 @@ pub async fn publish_if_changed(pool: &PgPool, kubo: &Kubo) -> Result<Option<Hea
 
     let version = last.as_ref().map(|l| l.version + 1).unwrap_or(1);
     let prev = last.map(|l| l.head_cid);
+    // the previous publish time bounds "new since last publish" for the IndexNow ping; grab it before the
+    // fresh head lands, or 0 on the first publish so nothing is missed
+    let since = db::last_head_published_epoch(pool).await.ok().flatten().unwrap_or(0);
     let published_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let head = Head::build(version as u64, root_cid.clone(), prev, published_at, &key)
         .context("signing head")?;
@@ -62,6 +65,7 @@ pub async fn publish_if_changed(pool: &PgPool, kubo: &Kubo) -> Result<Option<Hea
     kubo.pin_archive(&root_cid, &format!("root v{version}")).await?;
     kubo.pin_archive(&head_cid, &format!("head v{version}")).await?;
     db::record_head(pool, version, &head_cid, &root_cid, &String::from_utf8(head_json)?).await?;
+    tokio::spawn(crate::seo::ping_indexnow(pool.clone(), since));
     tracing::info!(
         version,
         head_cid,

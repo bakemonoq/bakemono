@@ -61,7 +61,24 @@ pub fn router(state: AppState) -> Router {
         .route("/follower.json", get(follower_json))
         .merge(crate::api::routes())
         .merge(crate::booru::routes())
+        .merge(crate::seo::routes())
+        .fallback(not_found)
         .with_state(state)
+}
+
+// unmatched routes get the styled shell with a 404 status, not a blank body, and stay out of the index
+async fn not_found() -> Response {
+    let page = render_full(
+        "Not found",
+        Meta { noindex: true, ..Meta::default() },
+        html! {
+            section.block {
+                h1.pagetitle { "Not found" }
+                p.muted { "That page does not exist. Try " a href="/posts" { "posts" } " or " a href="/creators" { "creators" } }
+            }
+        },
+    );
+    (StatusCode::NOT_FOUND, page).into_response()
 }
 
 // how many cards a browse page shows; one extra is fetched to detect a next page without a count query
@@ -79,8 +96,16 @@ async fn home(State(pool): State<PgPool>) -> Html<String> {
         .await
         .unwrap_or_default();
     let cfg = config::get();
-    render(
+    let og_image = posts.iter().find_map(|p| p.thumb.clone()).or_else(|| cfg.mascot.clone());
+    render_full(
         "",
+        Meta {
+            description: Some(board_description(cfg)),
+            canonical: Some("/".into()),
+            og_image,
+            og_type: Some("website"),
+            noindex: false,
+        },
         html! {
             (welcome(cfg))
             section.block {
@@ -109,8 +134,18 @@ async fn posts_index(State(pool): State<PgPool>, Query(query): Query<BrowseQuery
     let has_next = posts.len() as i64 > PAGE;
     posts.truncate(PAGE as usize);
     let total = db::count_posts(&pool, &source, &q, tier_db(&tier)).await.ok();
-    render(
-        "posts",
+    render_full(
+        "Posts",
+        Meta {
+            description: Some(format!(
+                "Browse archived posts from Patreon, Pixiv Fanbox and Boosty creators on {}",
+                config::get().name
+            )),
+            canonical: Some(listing_canonical("/posts", page)),
+            og_image: posts.iter().find_map(|p| p.thumb.clone()),
+            og_type: Some("website"),
+            noindex: false,
+        },
         html! {
             h1.pagetitle { "Posts" }
             (filter_bar("/posts", &q, &source, sort, desc, &tier, &platforms, None))
@@ -135,8 +170,18 @@ async fn creators_index(
     let has_next = creators.len() as i64 > PAGE;
     creators.truncate(PAGE as usize);
     let total = db::count_creators(&pool, &source, &q).await.ok();
-    render(
-        "creators",
+    render_full(
+        "Creators",
+        Meta {
+            description: Some(format!(
+                "Browse archived creators from Patreon, Pixiv Fanbox and Boosty on {}",
+                config::get().name
+            )),
+            canonical: Some(listing_canonical("/creators", page)),
+            og_image: creators.iter().find_map(|c| c.thumb.clone()),
+            og_type: Some("website"),
+            noindex: false,
+        },
         html! {
             h1.pagetitle { "Creators" }
             (filter_bar("/creators", &q, &source, sort, desc, "", &platforms, None))
@@ -194,8 +239,9 @@ async fn search_index(State(pool): State<PgPool>, Query(query): Query<SearchQuer
         (db::count_posts(&pool, &source, &q, tier_db(&tier)).await.ok(), "post")
     };
 
-    render(
-        "search",
+    render_full(
+        "Search",
+        Meta { noindex: true, ..Meta::default() },
         html! {
             h1.pagetitle { "Search" }
             div.tabs {
@@ -303,9 +349,10 @@ fn posts_grid(posts: &[db::PostCard]) -> Markup {
 fn post_card(p: &db::PostCard) -> Markup {
     let href = format!("/p/{}/{}/{}", p.platform, p.creator_id, p.post_id);
     let title = p.post_title.clone().unwrap_or_else(|| p.post_id.clone());
+    let alt = alt_for(&title, Some(&p.creator));
     html! {
         a.card href=(href) {
-            div.cardthumb { (card_thumb(p.thumb.as_deref(), &p.mime)) }
+            div.cardthumb { (card_thumb(p.thumb.as_deref(), &p.mime, &alt)) }
             div.cardmeta {
                 div.cardtitle { (title) }
                 div.cardsub {
@@ -332,9 +379,10 @@ fn creators_grid(creators: &[db::CreatorCard]) -> Markup {
 
 fn creator_card(c: &db::CreatorCard) -> Markup {
     let href = format!("/c/{}/{}", c.platform, c.creator_id);
+    let alt = format!("{} on {}", c.creator, pretty_platform(&c.platform));
     html! {
         a.card href=(href) {
-            div.cardthumb.banner { (card_thumb(c.thumb.as_deref(), c.mime.as_deref().unwrap_or(""))) }
+            div.cardthumb.banner { (card_thumb(c.thumb.as_deref(), c.mime.as_deref().unwrap_or(""), &alt)) }
             div.cardmeta {
                 div.cardtitle { (c.creator) }
                 div.cardsub {
@@ -349,11 +397,12 @@ fn creator_card(c: &db::CreatorCard) -> Markup {
 }
 
 // the thumbnail area: the inline preview paints instantly with zero fetch. no preview shows a placeholder
-// rather than pulling a full file into a grid cell, so a page of cards stays cheap
-fn card_thumb(thumb: Option<&str>, mime: &str) -> Markup {
+// rather than pulling a full file into a grid cell, so a page of cards stays cheap. the alt text is real
+// (post title / creator) so the grid feeds Google/Yandex Images
+fn card_thumb(thumb: Option<&str>, mime: &str, alt: &str) -> Markup {
     html! {
         @match thumb {
-            Some(t) => { img.cover src=(t) loading="lazy" alt=""; }
+            Some(t) => { img.cover src=(t) loading="lazy" alt=(alt); }
             None => { (placeholder(mime)) }
         }
         @if mime.starts_with("video/") { span.playbadge {} }
@@ -483,6 +532,16 @@ fn browse_url(
     format!("{base}?{}", parts.join("&"))
 }
 
+// the canonical for a listing page: only the page number survives, so every sort/filter permutation of
+// /posts or /creators collapses onto one indexable URL per page
+fn listing_canonical(base: &str, page: i64) -> String {
+    if page > 0 {
+        format!("{base}?page={page}")
+    } else {
+        base.to_string()
+    }
+}
+
 // a service id rendered for humans; unknown ids are just capitalized
 fn pretty_platform(p: &str) -> String {
     match p {
@@ -498,6 +557,90 @@ fn pretty_platform(p: &str) -> String {
                 None => String::new(),
             }
         }
+    }
+}
+
+// the home/listing description: the operator tagline if set, else a keyword-bearing default naming the
+// sources, so the board ranks for "patreon/fanbox archive" style queries
+fn board_description(cfg: &config::BoardConfig) -> String {
+    cfg.tagline.clone().unwrap_or_else(|| {
+        format!("{} archives posts from Patreon, Pixiv Fanbox and Boosty creators - browse and download images and videos by creator", cfg.name)
+    })
+}
+
+// a post's meta description: the real post text when it has any, else a synthesized line. either way it
+// is plain text with tags stripped and no trailing period, capped near the ~160 chars engines display
+fn post_description(body_html: &str, title: &str, creator: Option<&str>, platform: &str, files: usize) -> String {
+    let text = strip_tags(body_html);
+    let raw = if text.len() >= 40 {
+        text
+    } else {
+        let who = creator.map(|c| format!(" by {c}")).unwrap_or_default();
+        let noun = if files == 1 { "file" } else { "files" };
+        format!("{title}{who} - {files} {noun} archived from {} on {}", pretty_platform(platform), config::get().name)
+    };
+    truncate_desc(&raw, 160)
+}
+
+// collapse HTML to a single line of visible text: drop everything between angle brackets, then squeeze
+// runs of whitespace. good enough for a meta description, not a general HTML parser
+fn strip_tags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for c in html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if in_tag => {}
+            _ => out.push(c),
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_desc(s: &str, max: usize) -> String {
+    let trimmed = s.trim();
+    if trimmed.chars().count() <= max {
+        return trimmed.trim_end_matches(['.', ' ', ',']).to_string();
+    }
+    let mut cut: String = trimmed.chars().take(max).collect();
+    if let Some(sp) = cut.rfind(' ') {
+        cut.truncate(sp);
+    }
+    format!("{}...", cut.trim_end_matches(['.', ' ', ',']))
+}
+
+fn alt_for(title: &str, creator: Option<&str>) -> String {
+    match creator {
+        Some(c) => format!("{title} - {c}"),
+        None => title.to_string(),
+    }
+}
+
+// a BreadcrumbList so the search result shows the Creators / creator / post trail instead of a bare url.
+// items are (visible name, site-absolute path); `<` is escaped to < so a title can never break the
+// script block
+fn jsonld_breadcrumb(items: &[(&str, String)]) -> Markup {
+    let cfg = config::get();
+    let elements: Vec<serde_json::Value> = items
+        .iter()
+        .enumerate()
+        .map(|(i, (name, path))| {
+            serde_json::json!({
+                "@type": "ListItem",
+                "position": i + 1,
+                "name": name,
+                "item": absolute(cfg, path),
+            })
+        })
+        .collect();
+    let doc = serde_json::json!({
+        "@context": "https://schema.org",
+        "@type": "BreadcrumbList",
+        "itemListElement": elements,
+    });
+    html! {
+        script type="application/ld+json" { (PreEscaped(doc.to_string().replace('<', "\\u003c"))) }
     }
 }
 
@@ -613,7 +756,7 @@ async fn creator_page(
     Path((platform, creator_id)): Path<(String, String)>,
     Query(query): Query<BrowseQuery>,
     headers: HeaderMap,
-) -> Html<String> {
+) -> Response {
     let page = query.page.unwrap_or(0).max(0);
     let tier = tier_param(query.tier.as_deref());
     let mut posts = db::creator_posts(&pool, &platform, &creator_id, tier_db(&tier), PAGE + 1, page * PAGE)
@@ -622,6 +765,11 @@ async fn creator_page(
     let has_next = posts.len() as i64 > PAGE;
     posts.truncate(PAGE as usize);
     let total = db::creator_post_count(&pool, &platform, &creator_id, "").await.unwrap_or(0);
+    // an unknown creator (or one whose posts were all removed) is a real 404, not a blank page that
+    // lingers in the index as a soft 404
+    if total == 0 {
+        return not_found().await;
+    }
     let matching = if tier.is_empty() {
         total
     } else {
@@ -632,8 +780,22 @@ async fn creator_page(
         .map(|p| p.creator.clone())
         .unwrap_or_else(|| creator_id.clone());
     let base = format!("/c/{platform}/{creator_id}");
-    render(
-        &name,
+    let desc = format!(
+        "{name} - {total} {} archived from {} on {}. Browse and download images and videos",
+        if total == 1 { "post" } else { "posts" },
+        pretty_platform(&platform),
+        config::get().name
+    );
+    let meta = Meta {
+        description: Some(truncate_desc(&desc, 160)),
+        canonical: Some(if page > 0 { format!("{base}?page={page}") } else { base.clone() }),
+        og_image: posts.iter().find_map(|p| p.thumb.clone()),
+        og_type: Some("profile"),
+        noindex: false,
+    };
+    render_full(
+        &format!("{name} ({})", pretty_platform(&platform)),
+        meta,
         html! {
             div.crumbs { a href="/creators" { "Creators" } " / " span { (name) } }
             div.creatorhead {
@@ -648,6 +810,7 @@ async fn creator_page(
             (pager(&base, "", "", db::SortField::Created, true, &tier, None, page, has_next, false, Some(matching), "post"))
         },
     )
+    .into_response()
 }
 
 async fn post_page(
@@ -658,13 +821,16 @@ async fn post_page(
     let files = db::post_files(&pool, &platform, &creator_id, &post_id)
         .await
         .unwrap_or_default();
-    let first = files.first();
-    let title = first
-        .and_then(|f| f.post_title.clone())
-        .unwrap_or_else(|| post_id.clone());
-    let body = first.map(|f| crate::sanitize::body(&f.content)).unwrap_or_default();
-    let creator = first.map(|f| f.creator.clone());
-    let date = first.and_then(|f| f.posted_at.clone());
+    // a post with no visible files (never existed, or every file revoked) is a genuine 404: serving the
+    // shell at 200 would leave a thin soft-404 in the index and keep pointing crawlers at removed content
+    let Some(first) = files.first() else {
+        return not_found().await;
+    };
+    let title = first.post_title.clone().unwrap_or_else(|| post_id.clone());
+    let body = crate::sanitize::body(&first.content);
+    let creator = Some(first.creator.clone());
+    let date = first.posted_at.clone();
+    let og_image = files.iter().find_map(|f| f.thumb.clone());
     let adjacent = db::adjacent_posts(&pool, &platform, &creator_id, &post_id)
         .await
         .ok()
@@ -673,13 +839,31 @@ async fn post_page(
     // count one view per browser: a rolling cookie holds the last post opened, so a refresh does not re-count
     let token = view_token(&platform, &creator_id, &post_id);
     let repeat = cookie_value(&headers, "lastview").as_deref() == Some(token.as_str());
-    if !repeat && !files.is_empty() {
+    if !repeat {
         let _ = db::bump_views(&pool, &platform, &creator_id, &post_id).await;
     }
 
-    let page = render(
-        &title,
+    let seo_title = match &creator {
+        Some(c) => format!("{title} - {c}"),
+        None => title.clone(),
+    };
+    let alt = alt_for(&title, creator.as_deref());
+    let meta = Meta {
+        description: Some(post_description(&body, &title, creator.as_deref(), &platform, files.len())),
+        canonical: Some(format!("/p/{platform}/{creator_id}/{post_id}")),
+        og_image,
+        og_type: Some("article"),
+        noindex: false,
+    };
+    let page = render_full(
+        &seo_title,
+        meta,
         html! {
+            (jsonld_breadcrumb(&[
+                ("Creators", "/creators".to_string()),
+                (creator.as_deref().unwrap_or(&creator_id), format!("/c/{platform}/{creator_id}")),
+                (&title, format!("/p/{platform}/{creator_id}/{post_id}")),
+            ]))
             div.posthead {
                 (nav_btn(&platform, &creator_id,
                     adjacent.as_ref().and_then(|a| a.prev_id.as_deref()),
@@ -691,15 +875,14 @@ async fn post_page(
                             "by " a.strong href=(format!("/c/{platform}/{creator_id}")) { (c) }
                         }
                         @if let Some(d) = &date { " - " (pretty_date(d)) }
-                        @if !files.is_empty() { " - " (files.len()) @if files.len() == 1 { " file" } @else { " files" } }
+                        " - " (files.len()) @if files.len() == 1 { " file" } @else { " files" }
                     }
                 }
                 (nav_btn(&platform, &creator_id,
                     adjacent.as_ref().and_then(|a| a.next_id.as_deref()),
                     adjacent.as_ref().and_then(|a| a.next_title.as_deref()), false))
             }
-            @if files.is_empty() { p.muted { "This post has no files, or they are hidden" } }
-            (carousel(&files))
+            (carousel(&files, &alt))
             @if !body.is_empty() { div.body { (PreEscaped(&body)) } }
             @if is_mod(&headers) { (mod_bar_post(&platform, &creator_id, &post_id)) }
             script { (PreEscaped(CAROUSEL_JS)) }
@@ -745,7 +928,7 @@ fn nav_btn(
 // full media (not the tiny preview) served straight from the local IPFS gateway (/ipfs/{cid}), one at a
 // time and centered - content is the point of the page. loading direct from Kubo keeps the board out of
 // the byte path; items prefetch in chunks of 10, so a many-image post does not fetch it all at once
-fn carousel(files: &[db::ManifestRow]) -> Markup {
+fn carousel(files: &[db::ManifestRow], alt: &str) -> Markup {
     let items: Vec<String> = files
         .iter()
         .map(|f| {
@@ -759,7 +942,7 @@ fn carousel(files: &[db::ManifestRow]) -> Markup {
     let multi = items.len() > 1;
     let json = format!("[{}]", items.join(","));
     html! {
-        div.carousel data-items=(json) {
+        div.carousel data-items=(json) data-alt=(alt) {
             @if multi { button.cprev type="button" aria-label="Previous image" { (PreEscaped(ICON_PREV)) } }
             div.cstage {}
             @if multi { button.cnext type="button" aria-label="Next image" { (PreEscaped(ICON_NEXT)) } }
@@ -1791,13 +1974,36 @@ fn pretty_date(raw: &str) -> String {
     raw.to_string()
 }
 
+// per-page search metadata. everything is optional: an unset field emits no tag, so pages that do not
+// care (mod, contribute) keep the old minimal head. paths are made absolute against public_url
+#[derive(Default)]
+pub(crate) struct Meta {
+    pub description: Option<String>,
+    // path the crawler should treat as the one true URL, e.g. "/posts" for a filtered listing
+    pub canonical: Option<String>,
+    // preview image path ("/ipfs/{cid}") or absolute url; drives og:image and the twitter card
+    pub og_image: Option<String>,
+    // open-graph object type; empty falls back to "website"
+    pub og_type: Option<&'static str>,
+    // keep the page out of the index but still follow its links (search results, 404)
+    pub noindex: bool,
+}
+
 pub(crate) fn render(title: &str, body: Markup) -> Html<String> {
+    render_full(title, Meta::default(), body)
+}
+
+pub(crate) fn render_full(title: &str, meta: Meta, body: Markup) -> Html<String> {
     let cfg = config::get();
     let tab = if title.is_empty() {
         cfg.name.clone()
     } else {
         format!("{title} - {}", cfg.name)
     };
+    let canonical = meta.canonical.as_deref().map(|p| absolute(cfg, p));
+    let og_image = meta.og_image.as_deref().map(|p| absolute(cfg, p));
+    let og_title = if title.is_empty() { cfg.name.clone() } else { title.to_string() };
+    let adult = matches!(cfg.rating.as_deref(), Some("questionable") | Some("explicit"));
     Html(
         html! {
             (DOCTYPE)
@@ -1807,11 +2013,24 @@ pub(crate) fn render(title: &str, body: Markup) -> Html<String> {
                     meta name="viewport" content="width=device-width, initial-scale=1";
                     meta name="referrer" content="no-referrer";
                     title { (tab) }
+                    @if let Some(d) = &meta.description { meta name="description" content=(d); }
+                    @if meta.noindex { meta name="robots" content="noindex, follow"; }
+                    @if adult { meta name="rating" content="adult"; }
+                    @if let Some(c) = &canonical { link rel="canonical" href=(c); }
+                    meta property="og:site_name" content=(cfg.name);
+                    meta property="og:type" content=(meta.og_type.unwrap_or("website"));
+                    meta property="og:title" content=(og_title);
+                    @if let Some(d) = &meta.description { meta property="og:description" content=(d); }
+                    @if let Some(c) = &canonical { meta property="og:url" content=(c); }
+                    @if let Some(img) = &og_image { meta property="og:image" content=(img); }
+                    meta name="twitter:card" content=(if og_image.is_some() { "summary_large_image" } else { "summary" });
                     link rel="stylesheet" href=(concat!("/style.css?v=", env!("CARGO_PKG_VERSION")));
                     // operator accent override; the base sheet stays static and cacheable
                     @if let Some(accent) = &cfg.accent {
                         style { (PreEscaped(format!(":root{{--accent:{accent}}}"))) }
                     }
+                    // operator-authored verification meta tags etc., injected raw
+                    @if let Some(h) = &cfg.head_html { (PreEscaped(h)) }
                 }
                 body {
                     header.topbar {
@@ -1846,6 +2065,18 @@ pub(crate) fn render(title: &str, body: Markup) -> Html<String> {
         }
         .into_string(),
     )
+}
+
+// join a site-absolute path to public_url for canonical/OG tags; an already-absolute url or an unset
+// public_url passes through unchanged, so a relative value never gets a guessed host bolted on
+fn absolute(cfg: &config::BoardConfig, path: &str) -> String {
+    if path.starts_with("http://") || path.starts_with("https://") {
+        return path.to_string();
+    }
+    match cfg.base_url() {
+        Some(base) => format!("{base}{path}"),
+        None => path.to_string(),
+    }
 }
 
 fn footer(cfg: &config::BoardConfig) -> Markup {
@@ -2388,7 +2619,7 @@ for (const el of document.querySelectorAll('.carousel')) {
     const it = items[idx]
     let n
     if (it.v) { n = document.createElement('video'); n.controls = true; n.preload = 'metadata' }
-    else { n = new Image(); n.alt = ''; n.style.cursor = 'zoom-in'; n.title = 'click to view full size'; n.addEventListener('click', () => openLightbox(items, idx, show)) }
+    else { n = new Image(); n.alt = el.dataset.alt || ''; n.style.cursor = 'zoom-in'; n.title = 'click to view full size'; n.addEventListener('click', () => openLightbox(items, idx, show)) }
     n.className = 'cmedia'
     const settle = () => { if (cur === idx) render(idx) }
     if (it.v) n.onloadeddata = settle; else n.onload = settle
@@ -2439,6 +2670,43 @@ mod tests {
         assert_eq!(pretty_date("2026-03-14T10:00:00.000+00:00"), "Mar 14, 2026");
         assert_eq!(pretty_date("2026-03-14"), "Mar 14, 2026");
         assert_eq!(pretty_date("not a date"), "not a date");
+    }
+
+    #[test]
+    fn strip_tags_flattens_html_to_text() {
+        use super::strip_tags;
+        assert_eq!(strip_tags("<p>hello <b>world</b></p>"), "hello world");
+        assert_eq!(strip_tags("line\n\n  two"), "line two");
+        assert_eq!(strip_tags("no tags"), "no tags");
+    }
+
+    #[test]
+    fn truncate_desc_trims_and_caps() {
+        use super::truncate_desc;
+        // no trailing period, even under the cap
+        assert_eq!(truncate_desc("A short line.", 160), "A short line");
+        // caps at a word boundary and marks the cut
+        let long = "word ".repeat(60);
+        let out = truncate_desc(&long, 40);
+        assert!(out.ends_with("..."));
+        assert!(out.chars().count() <= 44);
+    }
+
+    #[test]
+    fn listing_canonical_keeps_only_page() {
+        use super::listing_canonical;
+        assert_eq!(listing_canonical("/posts", 0), "/posts");
+        assert_eq!(listing_canonical("/posts", 2), "/posts?page=2");
+    }
+
+    #[test]
+    fn post_description_falls_back_without_body() {
+        use super::post_description;
+        let d = post_description("", "My Post", Some("Alice"), "patreon", 3);
+        assert!(d.contains("My Post"));
+        assert!(d.contains("Alice"));
+        assert!(d.contains("Patreon"));
+        assert!(!d.ends_with('.'));
     }
 
     #[test]
