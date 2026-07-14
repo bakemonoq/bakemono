@@ -1,4 +1,4 @@
-use axum::extract::{Query, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::uri::{PathAndQuery, Uri};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
@@ -56,6 +56,15 @@ pub fn routes() -> axum::Router<crate::web::AppState> {
     axum::Router::new()
         .route("/index.php", get(dapi))
         .route("/autocomplete.php", get(autocomplete))
+        // danbooru REST surface: clients like Anime Boxes probe /posts.json to validate a site, and
+        // some prefix it with index.php. same query layer, danbooru-shaped output
+        .route("/posts.json", get(danbooru_posts))
+        .route("/index.php/posts.json", get(danbooru_posts))
+        // matchit forbids a literal ".json" suffix beside a path param, so capture the whole segment
+        // ("123.json") and strip it in the handler
+        .route("/posts/{id}", get(danbooru_post))
+        .route("/tags.json", get(danbooru_tags))
+        .route("/index.php/tags.json", get(danbooru_tags))
         .layer(axum::middleware::from_fn(cors))
 }
 
@@ -94,9 +103,18 @@ async fn posts(pool: &PgPool, headers: &HeaderMap, p: &Dapi, json: bool) -> anyh
     let mut count = QueryBuilder::new("SELECT COUNT(*) FROM visible_content vc WHERE ");
     search.push_where(&mut count);
     let total: i64 = count.build_query_scalar().fetch_one(pool).await?;
+    let rows = fetch_rows(pool, &search, limit, offset).await?;
+    let base = base_url(headers);
+    let out = rows.iter().map(|r| BooruPost::from_row(r, &base)).collect();
+    Ok(render_posts(out, total, offset, limit, json))
+}
+
+// shared post query for both the gelbooru and danbooru surfaces; denylisted content is already
+// absent from visible_content, so takedowns drop out of every api at once
+async fn fetch_rows(pool: &PgPool, search: &Search, limit: i64, offset: i64) -> anyhow::Result<Vec<FileRow>> {
     let mut qb = QueryBuilder::new(
         "SELECT vc.file_id, vc.cid, vc.thumb_cid, vc.sha256, vc.mime, vc.filename,
-                vc.width, vc.height, vc.platform, vc.creator, vc.creator_id, vc.post_id,
+                vc.width, vc.height, vc.size, vc.platform, vc.creator, vc.creator_id, vc.post_id,
                 vc.posted_at, vc.tier, vc.created_at, COALESCE(pv.views, 0)::bigint AS views
          FROM visible_content vc
          LEFT JOIN post_views pv
@@ -106,10 +124,7 @@ async fn posts(pool: &PgPool, headers: &HeaderMap, p: &Dapi, json: bool) -> anyh
     search.push_where(&mut qb);
     qb.push(" ORDER BY ").push(search.order_sql());
     qb.push(" LIMIT ").push_bind(limit).push(" OFFSET ").push_bind(offset);
-    let rows: Vec<FileRow> = qb.build_query_as().fetch_all(pool).await?;
-    let base = base_url(headers);
-    let out = rows.iter().map(|r| BooruPost::from_row(r, &base)).collect();
-    Ok(render_posts(out, total, offset, limit, json))
+    Ok(qb.build_query_as().fetch_all(pool).await?)
 }
 
 fn render_posts(posts: Vec<BooruPost>, count: i64, offset: i64, limit: i64, json: bool) -> Response {
@@ -204,12 +219,79 @@ async fn complete(pool: &PgPool, term: &str) -> Response {
     Json(out).into_response()
 }
 
+// danbooru v2 REST surface: clients like Anime Boxes take the site url as-is and append /posts.json
+// to validate and browse. bare json array, danbooru field names and single-letter rating
+async fn danbooru_posts(State(pool): State<PgPool>, headers: HeaderMap, Query(q): Query<DanbooruQuery>) -> Response {
+    let limit = q.limit.unwrap_or(20).clamp(1, 200);
+    let (offset, before, after) = q.paginate(limit);
+    let Some(mut search) = Search::parse(q.tags.as_deref().unwrap_or(""), None) else {
+        return Json(Vec::<DanbooruPost>::new()).into_response();
+    };
+    search.before = before;
+    search.after = after;
+    match fetch_rows(&pool, &search, limit, offset).await {
+        Ok(rows) => {
+            let base = base_url(&headers);
+            let out: Vec<DanbooruPost> = rows.iter().map(|r| DanbooruPost::from_row(r, &base)).collect();
+            Json(out).into_response()
+        }
+        Err(e) => {
+            tracing::warn!("danbooru posts failed: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn danbooru_post(State(pool): State<PgPool>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    let Ok(file_id) = id.trim_end_matches(".json").parse::<i64>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(mut search) = Search::parse("", None) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    search.id = Some(file_id);
+    match fetch_rows(&pool, &search, 1, 0).await {
+        Ok(rows) => match rows.first() {
+            Some(r) => Json(DanbooruPost::from_row(r, &base_url(&headers))).into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        },
+        Err(e) => {
+            tracing::warn!("danbooru post failed: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn danbooru_tags(State(pool): State<PgPool>, Query(q): Query<DanbooruTagQuery>) -> Response {
+    let limit = q.limit.unwrap_or(50).clamp(1, 1000);
+    let pattern = q.name_matches.as_deref().unwrap_or("").replace('*', "%");
+    let order = if q.order.as_deref() == Some("name") { "name" } else { "count DESC, name" };
+    let sql = format!(
+        "{TAG_UNION} WHERE count > 0 AND ($1 = '' OR name LIKE $1) ORDER BY {order} LIMIT $2"
+    );
+    let rows: Vec<(String, i32, i64)> = match sqlx::query_as(&sql).bind(&pattern).bind(limit).fetch_all(&pool).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("danbooru tags failed: {e:#}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let out: Vec<DanbooruTag> = rows
+        .into_iter()
+        .map(|(name, kind, count)| DanbooruTag { id: tag_id(&name), name, post_count: count, category: kind })
+        .collect();
+    Json(out).into_response()
+}
+
 // each search token is one condition; a plain word matches platform, artist slug or title so a
 // user typing either a derived tag or a title fragment gets results
 struct Search {
     tokens: Vec<(bool, Token)>,
     id: Option<i64>,
     order: Order,
+    // danbooru id-cursor pagination: file_id strictly below `before` / above `after`
+    before: Option<i64>,
+    after: Option<i64>,
 }
 
 enum Token {
@@ -262,13 +344,19 @@ impl Search {
             };
             tokens.push((neg, token));
         }
-        Some(Search { tokens, id, order })
+        Some(Search { tokens, id, order, before: None, after: None })
     }
 
     fn push_where(&self, qb: &mut QueryBuilder<Postgres>) {
         qb.push("(vc.mime LIKE 'image/%' OR vc.mime LIKE 'video/%')");
         if let Some(id) = self.id {
             qb.push(" AND vc.file_id = ").push_bind(id);
+        }
+        if let Some(b) = self.before {
+            qb.push(" AND vc.file_id < ").push_bind(b);
+        }
+        if let Some(a) = self.after {
+            qb.push(" AND vc.file_id > ").push_bind(a);
         }
         for (neg, token) in &self.tokens {
             qb.push(if *neg { " AND NOT " } else { " AND " });
@@ -601,6 +689,7 @@ struct FileRow {
     filename: Option<String>,
     width: Option<i32>,
     height: Option<i32>,
+    size: i64,
     platform: String,
     creator: String,
     creator_id: String,
@@ -672,4 +761,180 @@ struct Dapi {
 #[derive(serde::Deserialize)]
 struct Ac {
     q: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct DanbooruQuery {
+    tags: Option<String>,
+    page: Option<String>,
+    limit: Option<i64>,
+}
+
+impl DanbooruQuery {
+    // danbooru pages are 1-indexed, or a "b<id>"/"a<id>" cursor for deep paging past the offset wall.
+    // returns (offset, before_id, after_id)
+    fn paginate(&self, limit: i64) -> (i64, Option<i64>, Option<i64>) {
+        match self.page.as_deref() {
+            Some(p) if p.starts_with('b') => (0, p[1..].parse().ok(), None),
+            Some(p) if p.starts_with('a') => (0, None, p[1..].parse().ok()),
+            Some(p) => ((p.parse::<i64>().unwrap_or(1).max(1) - 1) * limit, None, None),
+            None => (0, None, None),
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct DanbooruTagQuery {
+    #[serde(rename = "search[name_matches]")]
+    name_matches: Option<String>,
+    #[serde(rename = "search[order]")]
+    order: Option<String>,
+    limit: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct DanbooruTag {
+    id: i64,
+    name: String,
+    post_count: i64,
+    // danbooru category ints line up with our tag kinds: 1 artist, 3 copyright, 5 meta
+    category: i32,
+}
+
+#[derive(Serialize)]
+struct DanbooruPost {
+    id: i64,
+    created_at: String,
+    updated_at: String,
+    score: i64,
+    up_score: i64,
+    down_score: i64,
+    fav_count: i64,
+    rating: &'static str,
+    source: String,
+    md5: String,
+    file_url: String,
+    large_file_url: String,
+    preview_file_url: String,
+    file_ext: String,
+    file_size: i64,
+    image_width: i32,
+    image_height: i32,
+    tag_string: String,
+    tag_string_general: String,
+    tag_string_artist: String,
+    tag_string_character: String,
+    tag_string_copyright: String,
+    tag_string_meta: String,
+    parent_id: Option<i64>,
+    has_children: bool,
+    is_deleted: bool,
+    is_banned: bool,
+    is_flagged: bool,
+    is_pending: bool,
+    pixiv_id: Option<i64>,
+}
+
+impl DanbooruPost {
+    fn from_row(r: &FileRow, base: &str) -> Self {
+        let ext = ext(&r.mime, r.filename.as_deref());
+        let image = format!("{}.{ext}", r.file_id);
+        let file_url = format!("{base}/ipfs/{}?filename={image}", r.cid);
+        let preview_file_url = match &r.thumb_cid {
+            Some(t) => format!("{base}/ipfs/{t}?filename={}_thumb.jpg", r.file_id),
+            None => file_url.clone(),
+        };
+        let created = iso_time(r.posted_at.as_deref(), r.created_at);
+        let md5 = r.sha256.get(..32).unwrap_or(&r.sha256).to_string();
+        let t = categorized_tags(r);
+        Self {
+            id: r.file_id,
+            updated_at: created.clone(),
+            created_at: created,
+            score: r.views,
+            up_score: r.views,
+            down_score: 0,
+            fav_count: 0,
+            rating: danbooru_rating(),
+            source: format!("{base}/p/{}/{}/{}", r.platform, r.creator_id, r.post_id),
+            md5,
+            large_file_url: file_url.clone(),
+            file_url,
+            preview_file_url,
+            file_ext: ext,
+            file_size: r.size,
+            image_width: r.width.unwrap_or(0),
+            image_height: r.height.unwrap_or(0),
+            tag_string: t.all,
+            tag_string_general: String::new(),
+            tag_string_artist: t.artist,
+            tag_string_character: String::new(),
+            tag_string_copyright: t.copyright,
+            tag_string_meta: t.meta,
+            parent_id: None,
+            has_children: false,
+            is_deleted: false,
+            is_banned: false,
+            is_flagged: false,
+            is_pending: false,
+            pixiv_id: None,
+        }
+    }
+}
+
+struct Categorized {
+    all: String,
+    artist: String,
+    copyright: String,
+    meta: String,
+}
+
+fn categorized_tags(r: &FileRow) -> Categorized {
+    let artist = slug(&r.creator);
+    let copyright = r.platform.clone();
+    let mut meta = Vec::new();
+    match r.tier.as_deref() {
+        Some("free") => meta.push("free"),
+        Some("subscriber") => meta.push("paid"),
+        _ => {}
+    }
+    if r.mime.starts_with("video/") {
+        meta.push("video");
+        meta.push("animated");
+    } else if r.mime == "image/gif" {
+        meta.push("gif");
+        meta.push("animated");
+    }
+    let meta = meta.join(" ");
+    let all = [artist.as_str(), copyright.as_str(), meta.as_str()]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Categorized { all, artist, copyright, meta }
+}
+
+// danbooru rating is a single letter; fold the board's one rating down to it
+fn danbooru_rating() -> &'static str {
+    match rating_class(rating()) {
+        'g' => "g",
+        's' => "s",
+        'q' => "q",
+        _ => "e",
+    }
+}
+
+fn iso_time(posted_at: Option<&str>, ingest_epoch: i64) -> String {
+    use chrono::{DateTime, NaiveDateTime, Utc};
+    if let Some(s) = posted_at {
+        if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+            return dt.to_rfc3339();
+        }
+        for f in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"] {
+            if let Ok(n) = NaiveDateTime::parse_from_str(s, f) {
+                return n.and_utc().to_rfc3339();
+            }
+        }
+    }
+    DateTime::<Utc>::from_timestamp(ingest_epoch, 0).unwrap_or_default().to_rfc3339()
 }
