@@ -1,10 +1,48 @@
 use anyhow::Result;
 use sqlx::postgres::{PgPool, PgPoolOptions};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 pub async fn connect(url: &str) -> Result<PgPool> {
     let pool = PgPoolOptions::new().max_connections(5).connect(url).await?;
     sqlx::raw_sql(SCHEMA).execute(&pool).await?;
     Ok(pool)
+}
+
+static CARDS_DIRTY: AtomicBool = AtomicBool::new(false);
+
+// browse reads a materialized snapshot; an ingest only flips a dirty flag, and this task collapses any
+// burst of inserts into one refresh per interval. so a scrape inserting rows every second still costs a
+// single refresh per cycle, never one per row. runs in the serve process; one-off cli commands that
+// mutate then exit refresh inline instead
+pub async fn run_card_refresher(pool: PgPool) {
+    let secs = std::env::var("BAKEMONO_CARD_REFRESH_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(20);
+    let interval = Duration::from_secs(secs);
+    loop {
+        tokio::time::sleep(interval).await;
+        if CARDS_DIRTY.swap(false, Ordering::Relaxed) {
+            if let Err(e) = refresh_cards(&pool).await {
+                CARDS_DIRTY.store(true, Ordering::Relaxed);
+                tracing::warn!("card refresh failed: {e:#}");
+            }
+        }
+    }
+}
+
+// concurrent so browse reads never block on the rebuild; the two statements run separately because
+// refresh concurrently cannot sit in a transaction
+pub async fn refresh_cards(pool: &PgPool) -> Result<()> {
+    sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY post_cards").execute(pool).await?;
+    sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY creator_cards").execute(pool).await?;
+    Ok(())
+}
+
+pub fn mark_cards_dirty() {
+    CARDS_DIRTY.store(true, Ordering::Relaxed);
 }
 
 pub async fn post_files(
@@ -76,7 +114,7 @@ impl SortField {
 // the services present in the catalog, to populate the source filter
 pub async fn platforms(pool: &PgPool) -> Result<Vec<String>> {
     let rows = sqlx::query_scalar::<_, String>(
-        "SELECT DISTINCT platform FROM visible_content ORDER BY platform",
+        "SELECT DISTINCT platform FROM post_cards ORDER BY platform",
     )
     .fetch_all(pool)
     .await?;
@@ -96,18 +134,13 @@ pub async fn list_posts(
     offset: i64,
 ) -> Result<Vec<PostCard>> {
     let sql = format!(
-        "SELECT t.*, COALESCE(pv.views, 0) AS views FROM (
-             SELECT DISTINCT ON (platform, creator_id, post_id)
-                    platform, creator_id, post_id, creator, post_title, posted_at, created_at,
-                    mime, thumb, tier,
-                    COUNT(*) OVER (PARTITION BY platform, creator_id, post_id) AS files
-             FROM visible_content
-             WHERE ($1 = '' OR post_title ILIKE '%' || $1 || '%' OR creator ILIKE '%' || $1 || '%')
-               AND ($4 = '' OR platform = $4)
-               AND ($5 = '' OR tier = $5)
-             ORDER BY platform, creator_id, post_id, (thumb IS NULL), file_index
-         ) t
+        "SELECT platform, creator_id, post_id, pc.creator, pc.post_title, pc.posted_at,
+                pc.mime, pc.thumb, pc.tier, pc.files, pc.created_at, COALESCE(pv.views, 0) AS views
+         FROM post_cards pc
          LEFT JOIN post_views pv USING (platform, creator_id, post_id)
+         WHERE ($1 = '' OR pc.post_title ILIKE '%' || $1 || '%' OR pc.creator ILIKE '%' || $1 || '%')
+           AND ($4 = '' OR pc.platform = $4)
+           AND ($5 = '' OR pc.tier = $5)
          ORDER BY {} LIMIT $2 OFFSET $3",
         sort.post_order(desc)
     );
@@ -133,27 +166,14 @@ pub async fn list_creators(
     offset: i64,
 ) -> Result<Vec<CreatorCard>> {
     let sql = format!(
-        "SELECT c.platform, c.creator_id, c.creator, c.posts, c.files, COALESCE(v.views, 0)::bigint AS views,
-                cov.thumb, cov.mime
-         FROM (
-             SELECT platform, creator_id, MAX(creator) AS creator,
-                    COUNT(DISTINCT post_id) AS posts, COUNT(DISTINCT cid) AS files,
-                    MAX(created_at) AS last_at
-             FROM visible_content
-             WHERE ($1 = '' OR creator ILIKE '%' || $1 || '%')
-               AND ($4 = '' OR platform = $4)
-             GROUP BY platform, creator_id
-         ) c
+        "SELECT platform, creator_id, cc.creator, cc.posts, cc.files,
+                COALESCE(v.views, 0)::bigint AS views, cc.thumb, cc.mime
+         FROM creator_cards cc
          LEFT JOIN (
              SELECT platform, creator_id, SUM(views) AS views FROM post_views GROUP BY platform, creator_id
          ) v USING (platform, creator_id)
-         LEFT JOIN LATERAL (
-             SELECT thumb, mime FROM visible_content vm
-             WHERE vm.platform = c.platform AND vm.creator_id = c.creator_id
-             -- pin the cover to the newest post by content date, not ingest time, so a re-scrape that
-             -- rewrites added_at never reshuffles it; deterministic tiebreak keeps it stable per post
-             ORDER BY (thumb IS NULL), posted_at DESC NULLS LAST, post_id DESC, file_index LIMIT 1
-         ) cov ON true
+         WHERE ($1 = '' OR cc.creator ILIKE '%' || $1 || '%')
+           AND ($4 = '' OR cc.platform = $4)
          ORDER BY {} LIMIT $2 OFFSET $3",
         sort.creator_order(desc)
     );
@@ -216,12 +236,10 @@ pub async fn creator_post_count(pool: &PgPool, platform: &str, creator_id: &str,
 // how many distinct posts match a browse filter, for the "N posts" count next to the pager
 pub async fn count_posts(pool: &PgPool, source: &str, q: &str, tier: &str) -> Result<i64> {
     let n = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM (
-             SELECT DISTINCT platform, creator_id, post_id FROM visible_content
-             WHERE ($1 = '' OR post_title ILIKE '%' || $1 || '%' OR creator ILIKE '%' || $1 || '%')
-               AND ($2 = '' OR platform = $2)
-               AND ($3 = '' OR tier = $3)
-         ) t",
+        "SELECT COUNT(*) FROM post_cards
+         WHERE ($1 = '' OR post_title ILIKE '%' || $1 || '%' OR creator ILIKE '%' || $1 || '%')
+           AND ($2 = '' OR platform = $2)
+           AND ($3 = '' OR tier = $3)",
     )
     .bind(q)
     .bind(source)
@@ -233,11 +251,9 @@ pub async fn count_posts(pool: &PgPool, source: &str, q: &str, tier: &str) -> Re
 
 pub async fn count_creators(pool: &PgPool, source: &str, q: &str) -> Result<i64> {
     let n = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM (
-             SELECT DISTINCT platform, creator_id FROM visible_content
-             WHERE ($1 = '' OR creator ILIKE '%' || $1 || '%')
-               AND ($2 = '' OR platform = $2)
-         ) t",
+        "SELECT COUNT(*) FROM creator_cards
+         WHERE ($1 = '' OR creator ILIKE '%' || $1 || '%')
+           AND ($2 = '' OR platform = $2)",
     )
     .bind(q)
     .bind(source)
@@ -452,6 +468,7 @@ pub async fn insert_file(
     .bind(dims.map(|d| d.1))
     .execute(pool)
     .await?;
+    mark_cards_dirty();
     Ok(())
 }
 
@@ -491,6 +508,7 @@ pub async fn upsert_creator(pool: &PgPool, platform: &str, creator_id: &str, nam
     .bind(name)
     .execute(pool)
     .await?;
+    mark_cards_dirty();
     Ok(())
 }
 
@@ -513,6 +531,7 @@ pub async fn upsert_post(pool: &PgPool, meta: &crate::scrape::PostMeta) -> Resul
     .bind(&meta.tier)
     .execute(pool)
     .await?;
+    mark_cards_dirty();
     Ok(())
 }
 
@@ -529,6 +548,7 @@ pub async fn upsert_post_file(pool: &PgPool, meta: &crate::scrape::PostMeta, cid
     .bind(cid)
     .execute(pool)
     .await?;
+    mark_cards_dirty();
     Ok(())
 }
 
@@ -712,6 +732,7 @@ pub async fn deny_cid(pool: &PgPool, cid: &str, reason: &str) -> Result<()> {
     .bind(reason)
     .execute(pool)
     .await?;
+    mark_cards_dirty();
     Ok(())
 }
 
@@ -732,6 +753,7 @@ pub async fn deny_restored(
     .bind(revoked_at)
     .execute(pool)
     .await?;
+    mark_cards_dirty();
     Ok(())
 }
 
@@ -1053,4 +1075,55 @@ JOIN posts p ON (p.platform, p.creator_id, p.post_id) = (pf.platform, pf.creator
 JOIN creators c ON (c.platform, c.creator_id) = (p.platform, p.creator_id)
 JOIN files f ON f.cid = pf.cid
 WHERE NOT EXISTS (SELECT 1 FROM denylist d WHERE d.cid = f.cid);
+
+-- browse read model: one indexable row per post / per creator, so a listing is an index range scan
+-- instead of a full rescan of the file table. built on the base tables (not visible_content) so the
+-- schema's DROP VIEW at the top has no dependency to trip over. refresh_cards rebuilds them after every
+-- ingest round and takedown. views are excluded (they change on every page view) and joined at read time
+CREATE MATERIALIZED VIEW IF NOT EXISTS post_cards AS
+SELECT DISTINCT ON (pf.platform, pf.creator_id, pf.post_id)
+       pf.platform, pf.creator_id, pf.post_id,
+       c.creator,
+       NULLIF(p.title, '') AS post_title,
+       p.posted_at, p.tier,
+       EXTRACT(EPOCH FROM f.added_at)::bigint AS created_at,
+       f.mime,
+       CASE WHEN f.thumb_cid IS NOT NULL THEN '/ipfs/' || f.thumb_cid END AS thumb,
+       COUNT(*) OVER (PARTITION BY pf.platform, pf.creator_id, pf.post_id) AS files
+FROM post_files pf
+JOIN posts p ON (p.platform, p.creator_id, p.post_id) = (pf.platform, pf.creator_id, pf.post_id)
+JOIN creators c ON (c.platform, c.creator_id) = (pf.platform, pf.creator_id)
+JOIN files f ON f.cid = pf.cid
+WHERE NOT EXISTS (SELECT 1 FROM denylist d WHERE d.cid = f.cid)
+ORDER BY pf.platform, pf.creator_id, pf.post_id, (f.thumb_cid IS NULL), pf.file_index;
+CREATE UNIQUE INDEX IF NOT EXISTS post_cards_pk ON post_cards (platform, creator_id, post_id);
+CREATE INDEX IF NOT EXISTS post_cards_recent ON post_cards (posted_at DESC NULLS LAST, created_at DESC);
+CREATE INDEX IF NOT EXISTS post_cards_platform ON post_cards (platform);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS creator_cards AS
+SELECT c.platform, c.creator_id, c.creator, c.posts, c.files, c.last_at, cov.thumb, cov.mime
+FROM (
+    SELECT pf.platform, pf.creator_id, MAX(cr.creator) AS creator,
+           COUNT(DISTINCT pf.post_id) AS posts, COUNT(DISTINCT pf.cid) AS files,
+           MAX(EXTRACT(EPOCH FROM f.added_at)::bigint) AS last_at
+    FROM post_files pf
+    JOIN posts p ON (p.platform, p.creator_id, p.post_id) = (pf.platform, pf.creator_id, pf.post_id)
+    JOIN creators cr ON (cr.platform, cr.creator_id) = (pf.platform, pf.creator_id)
+    JOIN files f ON f.cid = pf.cid
+    WHERE NOT EXISTS (SELECT 1 FROM denylist d WHERE d.cid = f.cid)
+    GROUP BY pf.platform, pf.creator_id
+) c
+LEFT JOIN LATERAL (
+    SELECT CASE WHEN f.thumb_cid IS NOT NULL THEN '/ipfs/' || f.thumb_cid END AS thumb, f.mime
+    FROM post_files pf
+    JOIN posts p ON (p.platform, p.creator_id, p.post_id) = (pf.platform, pf.creator_id, pf.post_id)
+    JOIN files f ON f.cid = pf.cid
+    WHERE pf.platform = c.platform AND pf.creator_id = c.creator_id
+      AND NOT EXISTS (SELECT 1 FROM denylist d WHERE d.cid = f.cid)
+    -- newest post by content date, deterministic tiebreak, so a re-scrape never reshuffles the cover
+    ORDER BY (f.thumb_cid IS NULL), p.posted_at DESC NULLS LAST, pf.post_id DESC, pf.file_index
+    LIMIT 1
+) cov ON true;
+CREATE UNIQUE INDEX IF NOT EXISTS creator_cards_pk ON creator_cards (platform, creator_id);
+CREATE INDEX IF NOT EXISTS creator_cards_recent ON creator_cards (last_at DESC);
 ";

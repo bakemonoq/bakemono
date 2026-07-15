@@ -48,6 +48,10 @@ async fn serve() -> Result<()> {
     if let Err(e) = publish::sync_local_denylist(&pool).await {
         tracing::warn!("local denylist sync failed: {e:#}");
     }
+    if let Err(e) = db::refresh_cards(&pool).await {
+        tracing::warn!("initial card refresh failed: {e:#}");
+    }
+    tokio::spawn(db::run_card_refresher(pool.clone()));
     tokio::spawn(scrape::run_scheduler(pool.clone(), kubo.clone()));
     tokio::spawn(mirror::run_scheduler(pool.clone(), kubo.clone(), mirror_progress.clone()));
     tokio::spawn(thumb::backfill_dims(pool.clone()));
@@ -205,7 +209,8 @@ async fn cmd_restore(head_cid: Option<String>) -> Result<()> {
     };
     let pool = db::connect(&database_url()).await?;
     let kubo = kubo::Kubo::from_env();
-    restore::restore(&pool, &kubo, head_cid.trim()).await
+    restore::restore(&pool, &kubo, head_cid.trim()).await?;
+    db::refresh_cards(&pool).await
 }
 
 async fn publish_and_report(pool: &sqlx::postgres::PgPool, kubo: &kubo::Kubo) -> Result<()> {
@@ -213,7 +218,8 @@ async fn publish_and_report(pool: &sqlx::postgres::PgPool, kubo: &kubo::Kubo) ->
         Some(head) => println!("manifest v{} published, head {}", head.version, head_cid_of(pool).await?),
         None => println!("manifest unchanged"),
     }
-    Ok(())
+    // a one-off command writes then exits, so there is no refresher task to pick up the change
+    db::refresh_cards(pool).await
 }
 
 async fn head_cid_of(pool: &sqlx::postgres::PgPool) -> Result<String> {
