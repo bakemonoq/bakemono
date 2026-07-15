@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -169,6 +169,11 @@ pub async fn stream_ingest<F: FnMut(&PostMeta) + Send>(
             if is_sidecar(&media) || is_thumb(&media) {
                 continue;
             }
+            if !keep_extension(&media) {
+                let _ = std::fs::remove_file(&media);
+                let _ = std::fs::remove_file(sidecar_path(&media));
+                continue;
+            }
             let sidecar = sidecar_path(&media);
             // the metadata sidecar is written right after gallery-dl prints the media path; give it a
             // moment, and if it never lands leave the file for the final sweep
@@ -313,6 +318,13 @@ async fn ingest_paths(
     let mut creators: std::collections::BTreeMap<(String, String), CreatorSeen> = Default::default();
     for media in files {
         if is_sidecar(media) || is_thumb(media) {
+            continue;
+        }
+        if !keep_extension(media) {
+            if delete {
+                let _ = std::fs::remove_file(media);
+                let _ = std::fs::remove_file(sidecar_path(media));
+            }
             continue;
         }
         let sidecar = sidecar_path(media);
@@ -549,6 +561,30 @@ fn is_thumb(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|n| n.ends_with(".thumb.jpg") || n.ends_with(".thumbtmp.jpg") || n.ends_with(".thumbtmp.webp"))
+}
+
+// operator format policy: BAKEMONO_KEEP_EXTENSIONS is a space/comma list of extensions to keep
+// (e.g. "jpg png mp4"); a file outside the list is never ingested. empty/unset keeps everything, so
+// this is off by default for other operators
+fn keep_extension(media: &Path) -> bool {
+    static ALLOWED: OnceLock<Vec<String>> = OnceLock::new();
+    let allowed = ALLOWED
+        .get_or_init(|| parse_keep_exts(&std::env::var("BAKEMONO_KEEP_EXTENSIONS").unwrap_or_default()));
+    ext_allowed(allowed, media)
+}
+
+fn parse_keep_exts(raw: &str) -> Vec<String> {
+    raw.replace(',', " ").split_whitespace().map(|s| s.to_ascii_lowercase()).collect()
+}
+
+fn ext_allowed(allowed: &[String], media: &Path) -> bool {
+    if allowed.is_empty() {
+        return true;
+    }
+    match media.extension().and_then(|e| e.to_str()) {
+        Some(ext) => allowed.iter().any(|a| a == &ext.to_ascii_lowercase()),
+        None => false,
+    }
 }
 
 fn sidecar_path(media: &Path) -> PathBuf {
@@ -792,6 +828,19 @@ mod tests {
         assert_eq!(meta.posted_at.as_deref(), Some("2026-07-04T03:23:31"));
         assert_eq!(meta.creator_url.as_deref(), Some("https://www.patreon.com/user?u=9919437"));
         assert_eq!(meta.post_key(), "patreon:9919437:162854990");
+    }
+
+    #[test]
+    fn keep_extension_allowlist() {
+        // empty allowlist keeps everything (default for other operators)
+        assert!(ext_allowed(&[], Path::new("x.zip")));
+        let allow = parse_keep_exts("jpg, png  MP4");
+        assert_eq!(allow, vec!["jpg", "png", "mp4"]);
+        assert!(ext_allowed(&allow, Path::new("a/b.JPG")));   // case-insensitive
+        assert!(ext_allowed(&allow, Path::new("clip.mp4")));
+        assert!(!ext_allowed(&allow, Path::new("HD pack.zip")));
+        assert!(!ext_allowed(&allow, Path::new("art.psd")));
+        assert!(!ext_allowed(&allow, Path::new("noext")));    // no extension: filtered when a list is set
     }
 
     #[test]

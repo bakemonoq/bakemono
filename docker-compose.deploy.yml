@@ -64,6 +64,9 @@ services:
       # proxy (Cloudflare) so _PROXY must be set for it to appear in /contribute; unset = scrape direct
       BAKEMONO_SCRAPE_PROXY: ${BAKEMONO_SCRAPE_PROXY:-}
       BAKEMONO_SCRAPE_MEDIA_PROXY: ${BAKEMONO_SCRAPE_MEDIA_PROXY:-}
+      # space/comma list of file extensions to keep (e.g. "jpg png mp4"); a file outside the list is
+      # never ingested. empty = keep everything. use it to run an image/video-only archive
+      BAKEMONO_KEEP_EXTENSIONS: ${BAKEMONO_KEEP_EXTENSIONS:-}
       # mod password (HTTP Basic auth); leave unset to disable /mod
       BAKEMONO_MOD_TOKEN: ${BAKEMONO_MOD_TOKEN:-}
       # board title shown in the header, browser tab and /info; unset keeps the default wordmark
