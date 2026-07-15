@@ -1,5 +1,4 @@
 use axum::extract::{Path, Query, Request, State};
-use axum::http::uri::{PathAndQuery, Uri};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -9,44 +8,6 @@ use sqlx::postgres::PgPool;
 use sqlx::{Postgres, QueryBuilder};
 
 use crate::config;
-
-// booru clients build request URLs by concatenating a stored base with a path, which routinely
-// yields "//index.php" (base kept its trailing slash) or a stray trailing slash. axum matches paths
-// literally and 404s those, so collapse runs of slashes app-wide before routing
-pub async fn normalize_path(mut req: Request, next: Next) -> Response {
-    let path = req.uri().path();
-    if path.contains("//") || (path.len() > 1 && path.ends_with('/')) {
-        let normalized = collapse_slashes(path);
-        let rest = match req.uri().query() {
-            Some(q) => format!("{normalized}?{q}"),
-            None => normalized,
-        };
-        let mut parts = req.uri().clone().into_parts();
-        if let Ok(pq) = PathAndQuery::from_maybe_shared(rest) {
-            parts.path_and_query = Some(pq);
-            if let Ok(uri) = Uri::from_parts(parts) {
-                *req.uri_mut() = uri;
-            }
-        }
-    }
-    next.run(req).await
-}
-
-fn collapse_slashes(path: &str) -> String {
-    let mut out = String::with_capacity(path.len());
-    let mut prev_slash = false;
-    for c in path.chars() {
-        if c == '/' && prev_slash {
-            continue;
-        }
-        prev_slash = c == '/';
-        out.push(c);
-    }
-    if out.len() > 1 && out.ends_with('/') {
-        out.pop();
-    }
-    out
-}
 
 // Gelbooru 0.2 dapi facade so stock booru clients can browse the board. There is no tag table:
 // tags are derived per file (artist slug, platform, tier, media kind) and an unknown search token
