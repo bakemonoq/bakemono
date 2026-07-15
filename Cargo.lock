@@ -177,7 +177,7 @@ dependencies = [
 
 [[package]]
 name = "bakemono-board"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "aes-gcm",
  "ammonia",
@@ -209,7 +209,7 @@ dependencies = [
 
 [[package]]
 name = "bakemono-core"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -221,7 +221,7 @@ dependencies = [
 
 [[package]]
 name = "bakemono-scraper"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "thiserror",

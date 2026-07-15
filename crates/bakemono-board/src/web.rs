@@ -24,8 +24,6 @@ pub struct AppState {
     // subprocess, so a flood of posts must shed load rather than exhaust processes/FDs on the box
     pub probe_gate: Arc<Semaphore>,
     pub import_gate: Arc<Semaphore>,
-    // live pawchive-mirror round state, rendered on /mod and polled at /mod/reupload
-    pub mirror: Arc<crate::mirror::Progress>,
 }
 
 // lets handlers that only need the pool keep extracting State<PgPool> unchanged
@@ -53,7 +51,6 @@ pub fn router(state: AppState) -> Router {
         .route("/c/{platform}/{creator_id}", get(creator_page))
         .route("/p/{platform}/{creator_id}/{post_id}", get(post_page))
         .route("/mod", get(mod_page))
-        .route("/mod/reupload", get(mod_reupload))
         .route("/mod/deny-cid", post(mod_deny_cid))
         .route("/mod/cookie-autoimport", post(mod_cookie_autoimport))
         .route("/mod/cookie-delete", post(mod_cookie_delete))
@@ -1372,24 +1369,14 @@ async fn mod_page(State(state): State<AppState>, headers: HeaderMap) -> Response
     let keys = db::cookie_overview(&state.pool).await.unwrap_or_default();
     let creators = db::cookie_creator_rows(&state.pool).await.unwrap_or_default();
     let denied = db::denylist(&state.pool).await.unwrap_or_default();
-    let reupload = state.mirror.snapshot();
-    let page = render("mod", mod_body(&keys, &creators, &denied, reupload.as_ref()));
+    let page = render("mod", mod_body(&keys, &creators, &denied));
     with_mod_cookie(page.into_response())
-}
-
-// the Reupload panel on its own, polled every few seconds so the bars advance without a full reload
-async fn mod_reupload(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(denied) = require_mod(&headers) {
-        return denied;
-    }
-    Html(reupload_panel(state.mirror.snapshot().as_ref()).into_string()).into_response()
 }
 
 fn mod_body(
     keys: &[db::CookieRow],
     creators: &[(i64, String, String, String, bool)],
     denied: &[(String, String, String)],
-    reupload: Option<&crate::mirror::RoundSnapshot>,
 ) -> Markup {
     let live = keys.iter().filter(|k| k.status == "live").count();
     let paused = keys.iter().filter(|k| !k.allow_autoimport).count();
@@ -1397,10 +1384,7 @@ fn mod_body(
     html! {
         div.modhead {
             h1.pagetitle { "Contributor keys" }
-            div.modlinks {
-                a.viewlink href="#reupload" { "Reupload" }
-                a.viewlink href="#takedowns" { "Takedowns" }
-            }
+            a.viewlink href="#takedowns" { "Takedowns" }
         }
         div.stats {
             (stat_card(keys.len() as i64, "keys"))
@@ -1409,93 +1393,11 @@ fn mod_body(
             (stat_card(reach, "creators reached"))
             (stat_card(denied.len() as i64, "revoked"))
         }
-        section.block id="reupload" {
-            div.blockhead { h2 { "Reupload" } }
-            p.muted { "Live mirror of pawchive: each round walks the most-favorited creators, scraping every full post through the shared ingest. Concurrency and caps are the " code { "BAKEMONO_MIRROR_*" } " vars" }
-            div #reuploadbody { (reupload_panel(reupload)) }
-        }
         section.block {
             p.muted { "Keys are the encrypted session cookies contributors hand the board. Tokens stay sealed with the offline key: pause skips a key on the next round, drop deletes its token for good. Rounds run with " code { "bakemono autoimport < cookie-private.pem" } }
             (keys_list(keys, creators))
         }
         (takedown_panel(denied))
-        script { (PreEscaped(REUPLOAD_POLL_JS)) }
-    }
-}
-
-// polls the fragment endpoint and swaps just the panel body, so the bars advance without reloading
-// the page or re-running the mod db queries. stays running while idle to catch the next round
-const REUPLOAD_POLL_JS: &str = "\
-setInterval(function(){fetch('/mod/reupload').then(function(r){return r.ok?r.text():null}).then(function(h){\
-var e=document.getElementById('reuploadbody');if(e&&h!=null)e.innerHTML=h})['catch'](function(){})},4000);";
-
-fn reupload_panel(snap: Option<&crate::mirror::RoundSnapshot>) -> Markup {
-    let Some(r) = snap else {
-        return html! { p.muted { "No mirror round yet. Set " code { "BAKEMONO_MIRROR_URLS" } " and the scheduler starts one" } };
-    };
-    let pct = if r.total > 0 { (r.done * 100 / r.total).min(100) } else { 0 };
-    html! {
-        div.rupstat {
-            span.chip.platform { (r.base) }
-            @if r.finished { span.chip { "sleeping until next round" } } @else { span.chip.ok { "running" } }
-            span.muted { " " (r.done) " / " (r.total) " creators - " (r.files) " files, " (r.posts) " posts - " (human_secs(r.elapsed_secs)) }
-        }
-        div.rupbar { i style=(format!("width:{pct}%")) {} }
-        @if r.active.is_empty() {
-            @if !r.finished { p.muted { "Spinning up creators..." } }
-        } @else {
-            div.rupgrid {
-                @for a in &r.active { (active_card(a)) }
-            }
-        }
-        @if !r.recent.is_empty() {
-            h3.ruph { "Recently done" }
-            ul.list.ruprecent {
-                @for f in &r.recent { (finished_row(f)) }
-            }
-        }
-    }
-}
-
-// one active creator: name, a live-animated bar, and its counters. ~6 short lines as it fills
-fn active_card(a: &crate::mirror::ActiveSnapshot) -> Markup {
-    let rate = if a.elapsed_secs > 0 { a.files as u64 * 60 / a.elapsed_secs } else { 0 };
-    html! {
-        div.rupcard {
-            div.rupname { (a.name) " " span.chip.platform { (pretty_platform(&a.platform)) } }
-            div.rupbar.indet { i {} }
-            div.rupmeta {
-                span { b { (a.posts) } " posts" }
-                span { b { (a.files) } " files" }
-                span { (human_secs(a.elapsed_secs)) }
-                span { (rate) " files/min" }
-            }
-        }
-    }
-}
-
-fn finished_row(f: &crate::mirror::FinishedSnapshot) -> Markup {
-    html! {
-        li {
-            span.chip.platform { (pretty_platform(&f.platform)) } " "
-            (f.name) " - "
-            @if f.skipped {
-                span.chip.danger { "failed" }
-            } @else {
-                span.muted { (f.files) " files, " (f.posts) " posts in " (human_secs(f.secs)) }
-            }
-        }
-    }
-}
-
-// compact "2h 5m" / "3m 12s" / "45s" for round and per-creator elapsed
-fn human_secs(secs: u64) -> String {
-    if secs >= 3600 {
-        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
-    } else if secs >= 60 {
-        format!("{}m {}s", secs / 60, secs % 60)
-    } else {
-        format!("{secs}s")
     }
 }
 
@@ -2403,20 +2305,6 @@ li.report.csam { border-left:3px solid var(--red); padding-left:.6rem }
 .stat .num { font-size:1.7rem; font-weight:800 }
 .stat .num.danger { color:var(--red) }
 .stat .label { color:var(--subtext0); font-size:.85em }
-.modlinks { display:flex; gap:.6rem; flex-wrap:wrap }
-.rupstat { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap; margin-bottom:.5rem }
-.rupbar { height:8px; border-radius:6px; background:var(--surface0); overflow:hidden; margin:.2rem 0 1rem }
-.rupbar > i { display:block; height:100%; background:var(--accent); border-radius:6px; transition:width .6s ease }
-.rupbar.indet { position:relative }
-.rupbar.indet > i { position:absolute; width:35%; left:0; animation:rupslide 1.3s ease-in-out infinite }
-@keyframes rupslide { 0%{left:-35%} 100%{left:100%} }
-.rupgrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(230px,1fr)); gap:.8rem }
-.rupcard { border:1px solid var(--surface0); background:var(--mantle); border-radius:10px; padding:.8rem .9rem }
-.rupname { font-weight:700; margin-bottom:.3rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
-.rupmeta { display:grid; grid-template-columns:1fr 1fr; gap:.15rem .8rem; color:var(--subtext0); font-size:.82rem }
-.rupmeta b { color:var(--text) }
-.ruph { margin:1.2rem 0 .4rem; font-size:1rem }
-.ruprecent li { font-size:.88rem }
 .steps { list-style:none; counter-reset:step; padding:0 }
 .step { counter-increment:step; border:1px solid var(--surface0); background:var(--mantle); border-radius:10px; padding:1.1rem 1.3rem; margin:1rem 0 }
 .step h3 { margin:0 0 .5rem }
@@ -2780,7 +2668,7 @@ mod tests {
         let denied = vec![
             ("bafkreiexamplecidexamplecidexample".into(), "dmca-us".into(), "2026-07-02T00:00:00+00:00".into()),
         ];
-        let html = render("mod", mod_body(&keys, &creators, &denied, None)).0;
+        let html = render("mod", mod_body(&keys, &creators, &denied)).0;
         assert!(html.contains("key #7"));
         assert!(html.contains("Pause"), "an autoimport-on key offers Pause");
         assert!(html.contains("Resume"), "an autoimport-off key offers Resume");
@@ -2791,50 +2679,5 @@ mod tests {
         assert!(html.contains("Creators reached"));
         assert!(html.contains("(unsubscribed)"));
         assert!(html.contains("Takedowns"));
-    }
-
-    #[test]
-    fn reupload_panel_shows_round_and_creators() {
-        use super::reupload_panel;
-        use crate::mirror::{ActiveSnapshot, FinishedSnapshot, RoundSnapshot};
-        let snap = RoundSnapshot {
-            base: "pawchive.pw".into(),
-            elapsed_secs: 3725,
-            total: 100,
-            done: 22,
-            files: 41522,
-            posts: 6354,
-            finished: false,
-            active: vec![ActiveSnapshot {
-                name: "Maplestar".into(),
-                platform: "patreon".into(),
-                files: 71,
-                posts: 12,
-                elapsed_secs: 300,
-            }],
-            recent: vec![FinishedSnapshot {
-                name: "Anna Anon".into(),
-                platform: "fanbox".into(),
-                files: 83,
-                posts: 40,
-                secs: 95,
-                skipped: false,
-            }],
-        };
-        let html = reupload_panel(Some(&snap)).into_string();
-        assert!(html.contains("22 / 100 creators"));
-        assert!(html.contains("width:22%"));
-        assert!(html.contains("Maplestar"));
-        assert!(html.contains("files/min"));
-        assert!(html.contains("Anna Anon"));
-        assert!(reupload_panel(None).into_string().contains("No mirror round yet"));
-    }
-
-    #[test]
-    fn human_secs_formats() {
-        use super::human_secs;
-        assert_eq!(human_secs(45), "45s");
-        assert_eq!(human_secs(192), "3m 12s");
-        assert_eq!(human_secs(3725), "1h 2m");
     }
 }

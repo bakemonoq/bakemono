@@ -4,7 +4,6 @@ mod config;
 mod crypto;
 mod db;
 mod kubo;
-mod mirror;
 mod platform;
 mod publish;
 mod restore;
@@ -30,12 +29,11 @@ async fn main() -> Result<()> {
         Some("ingest") => cmd_ingest(args.collect()).await,
         Some("publish") => cmd_publish().await,
         Some("scrape") => cmd_scrape(args.collect()).await,
-        Some("mirror") => cmd_mirror(args.collect()).await,
         Some("restore") => cmd_restore(args.next()).await,
         Some("keygen") => cmd_keygen(args.next()).await,
         Some("autoimport") => cmd_autoimport().await,
         Some(other) => {
-            bail!("unknown command `{other}` (expected serve, add, ingest, publish, scrape, mirror, restore, keygen or autoimport)")
+            bail!("unknown command `{other}` (expected serve, add, ingest, publish, scrape, restore, keygen or autoimport)")
         }
     }
 }
@@ -44,7 +42,6 @@ async fn serve() -> Result<()> {
     let bind = env_or("BAKEMONO_BIND", "127.0.0.1:3000");
     let pool = db::connect(&database_url()).await?;
     let kubo = Arc::new(kubo::Kubo::from_env());
-    let mirror_progress = Arc::new(mirror::Progress::default());
 
     if let Err(e) = publish::sync_local_denylist(&pool).await {
         tracing::warn!("local denylist sync failed: {e:#}");
@@ -54,7 +51,6 @@ async fn serve() -> Result<()> {
     }
     tokio::spawn(db::run_card_refresher(pool.clone()));
     tokio::spawn(scrape::run_scheduler(pool.clone(), kubo.clone()));
-    tokio::spawn(mirror::run_scheduler(pool.clone(), kubo.clone(), mirror_progress.clone()));
     tokio::spawn(thumb::backfill_dims(pool.clone()));
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
@@ -64,7 +60,6 @@ async fn serve() -> Result<()> {
         kubo,
         probe_gate: Arc::new(Semaphore::new(env_usize("BAKEMONO_PROBE_CONCURRENCY", 4))),
         import_gate: Arc::new(Semaphore::new(env_usize("BAKEMONO_IMPORT_CONCURRENCY", 2))),
-        mirror: mirror_progress,
     };
     axum::serve(listener, web::router(state)).await?;
     Ok(())
@@ -153,37 +148,6 @@ async fn cmd_scrape(args: Vec<String>) -> Result<()> {
     let pool = db::connect(&database_url()).await?;
     let kubo = kubo::Kubo::from_env();
     let stats = scrape::scrape_source(&pool, &kubo, &url, cookies.as_deref(), limit).await?;
-    println!("{} files across {} posts ({} skipped)", stats.files, stats.posts, stats.skipped);
-    publish_and_report(&pool, &kubo).await
-}
-
-// one-off round against a kemono-style archive; caps override the BAKEMONO_MIRROR_* env defaults
-async fn cmd_mirror(args: Vec<String>) -> Result<()> {
-    let mut url = None;
-    let mut caps = Vec::new();
-    for arg in args {
-        if let Ok(n) = arg.parse::<u64>() {
-            caps.push(n);
-        } else if url.is_none() {
-            url = Some(arg);
-        } else {
-            bail!("unexpected argument `{arg}`");
-        }
-    }
-    let Some(url) = url else {
-        bail!("usage: bakemono mirror <base-url> [creators] [posts]");
-    };
-    let mut limits = mirror::Limits::from_env();
-    if let Some(n) = caps.first() {
-        limits.creators = *n as usize;
-    }
-    if let Some(n) = caps.get(1) {
-        limits.posts = *n as u32;
-    }
-    let pool = db::connect(&database_url()).await?;
-    let kubo = kubo::Kubo::from_env();
-    let progress = mirror::Progress::default();
-    let stats = mirror::mirror_round(&pool, &kubo, &url, &limits, &progress).await?;
     println!("{} files across {} posts ({} skipped)", stats.files, stats.posts, stats.skipped);
     publish_and_report(&pool, &kubo).await
 }
