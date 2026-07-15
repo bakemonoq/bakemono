@@ -41,6 +41,8 @@ pub fn router(state: AppState) -> Router {
         .route("/style.css", get(style_css))
         .route("/static/{file}", get(static_file))
         .route("/assets/{file}", get(asset_file))
+        .route("/favicon.ico", get(favicon_ico))
+        .route("/apple-touch-icon.png", get(apple_touch_icon))
         .route("/posts", get(posts_index))
         .route("/creators", get(creators_index))
         .route("/search", get(search_index))
@@ -699,8 +701,36 @@ async fn asset_file(Path(file): Path<String>) -> Response {
         "devtools_pick_application.png" => include_bytes!("../../../assets/devtools_pick_application.png"),
         "copy_cookie_patreon.png" => include_bytes!("../../../assets/copy_cookie_patreon.png"),
         "cookies_extension.png" => include_bytes!("../../../assets/cookies_extension.png"),
+        "favicon-16.png" => include_bytes!("../../../assets/favicon-16.png"),
+        "favicon-32.png" => include_bytes!("../../../assets/favicon-32.png"),
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
+    (
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+// browsers and crawlers probe these well-known root paths, so they get their own routes rather than
+// riding /assets. the .ico bundles 16 and 32 px for legacy clients
+async fn favicon_ico() -> Response {
+    let bytes: &'static [u8] = include_bytes!("../../../assets/favicon.ico");
+    (
+        [
+            (header::CONTENT_TYPE, "image/x-icon"),
+            (header::CACHE_CONTROL, "public, max-age=604800"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+async fn apple_touch_icon() -> Response {
+    let bytes: &'static [u8] = include_bytes!("../../../assets/apple-touch-icon.png");
     (
         [
             (header::CONTENT_TYPE, "image/png"),
@@ -2012,6 +2042,10 @@ pub(crate) fn render_full(title: &str, meta: Meta, body: Markup) -> Html<String>
                     meta charset="utf-8";
                     meta name="viewport" content="width=device-width, initial-scale=1";
                     meta name="referrer" content="no-referrer";
+                    link rel="icon" href="/favicon.ico" sizes="any";
+                    link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon-32.png";
+                    link rel="icon" type="image/png" sizes="16x16" href="/assets/favicon-16.png";
+                    link rel="apple-touch-icon" href="/apple-touch-icon.png";
                     title { (tab) }
                     @if let Some(d) = &meta.description { meta name="description" content=(d); }
                     @if meta.noindex { meta name="robots" content="noindex, follow"; }
