@@ -27,14 +27,15 @@ async fn main() -> Result<()> {
         // no-arg default stays `serve` so docker entrypoints need no arguments
         None | Some("serve") => serve().await,
         Some("add") => cmd_add(args.collect()).await,
-        Some("ingest") => cmd_ingest(args.next()).await,
+        Some("ingest") => cmd_ingest(args.collect()).await,
+        Some("publish") => cmd_publish().await,
         Some("scrape") => cmd_scrape(args.collect()).await,
         Some("mirror") => cmd_mirror(args.collect()).await,
         Some("restore") => cmd_restore(args.next()).await,
         Some("keygen") => cmd_keygen(args.next()).await,
         Some("autoimport") => cmd_autoimport().await,
         Some(other) => {
-            bail!("unknown command `{other}` (expected serve, add, ingest, scrape, mirror, restore, keygen or autoimport)")
+            bail!("unknown command `{other}` (expected serve, add, ingest, publish, scrape, mirror, restore, keygen or autoimport)")
         }
     }
 }
@@ -97,14 +98,36 @@ async fn cmd_add(paths: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_ingest(dir: Option<String>) -> Result<()> {
+// import a directory of media + sidecars. --no-publish lets a batch importer ingest many dirs and
+// control publish cadence itself with `bakemono publish`, instead of rebuilding the manifest per dir
+async fn cmd_ingest(args: Vec<String>) -> Result<()> {
+    let mut dir = None;
+    let mut publish = true;
+    for arg in args {
+        match arg.as_str() {
+            "--no-publish" => publish = false,
+            _ if dir.is_none() => dir = Some(arg),
+            _ => bail!("unexpected argument `{arg}`"),
+        }
+    }
     let Some(dir) = dir else {
-        bail!("usage: bakemono ingest <dir>");
+        bail!("usage: bakemono ingest [--no-publish] <dir>");
     };
     let pool = db::connect(&database_url()).await?;
     let kubo = kubo::Kubo::from_env();
     let stats = scrape::ingest_dir(&pool, &kubo, std::path::Path::new(&dir)).await?;
     println!("{} files across {} posts ({} skipped)", stats.files, stats.posts, stats.skipped);
+    if publish {
+        publish_and_report(&pool, &kubo).await
+    } else {
+        Ok(())
+    }
+}
+
+// publish a fresh signed head if the catalog changed since the last one
+async fn cmd_publish() -> Result<()> {
+    let pool = db::connect(&database_url()).await?;
+    let kubo = kubo::Kubo::from_env();
     publish_and_report(&pool, &kubo).await
 }
 
