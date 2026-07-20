@@ -155,6 +155,30 @@ pub async fn list_posts(
     Ok(rows)
 }
 
+// top posts by views logged in the trailing window; ranked on the daily buckets, display count stays the
+// running total so the same post reads the same everywhere. inner join to post_cards drops revoked posts
+pub async fn list_popular(pool: &PgPool, days: i64, limit: i64) -> Result<Vec<PostCard>> {
+    let rows = sqlx::query_as::<_, PostCard>(
+        "SELECT pc.platform, pc.creator_id, pc.post_id, pc.creator, pc.post_title, pc.posted_at,
+                pc.mime, pc.thumb, pc.tier, pc.files, pc.created_at, COALESCE(pv.views, 0) AS views
+         FROM (
+             SELECT platform, creator_id, post_id, SUM(views) AS recent
+             FROM post_views_daily
+             WHERE day >= CURRENT_DATE - ($1::text || ' days')::interval
+             GROUP BY platform, creator_id, post_id
+         ) r
+         JOIN post_cards pc USING (platform, creator_id, post_id)
+         LEFT JOIN post_views pv USING (platform, creator_id, post_id)
+         ORDER BY r.recent DESC, pc.posted_at DESC NULLS LAST, pc.created_at DESC
+         LIMIT $2",
+    )
+    .bind(days)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 // one card per creator; views is the summed views over their posts so every sort field works on both tabs
 pub async fn list_creators(
     pool: &PgPool,
@@ -367,8 +391,10 @@ pub async fn posts_since(pool: &PgPool, since: i64, limit: i64) -> Result<Vec<(S
     Ok(rows)
 }
 
-// popularity signal for the Popular sort; deduped per browser by the caller so a refresh does not inflate it
+// popularity signal for the Popular sort; deduped per browser by the caller so a refresh does not inflate it.
+// the running total drives sort/display; the daily bucket feeds the trailing-window Popular Now section
 pub async fn bump_views(pool: &PgPool, platform: &str, creator_id: &str, post_id: &str) -> Result<()> {
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO post_views (platform, creator_id, post_id, views) VALUES ($1, $2, $3, 1)
          ON CONFLICT (platform, creator_id, post_id) DO UPDATE SET views = post_views.views + 1",
@@ -376,8 +402,19 @@ pub async fn bump_views(pool: &PgPool, platform: &str, creator_id: &str, post_id
     .bind(platform)
     .bind(creator_id)
     .bind(post_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    sqlx::query(
+        "INSERT INTO post_views_daily (platform, creator_id, post_id, day, views)
+         VALUES ($1, $2, $3, CURRENT_DATE, 1)
+         ON CONFLICT (platform, creator_id, post_id, day) DO UPDATE SET views = post_views_daily.views + 1",
+    )
+    .bind(platform)
+    .bind(creator_id)
+    .bind(post_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -1061,6 +1098,17 @@ CREATE TABLE IF NOT EXISTS post_views (
     views      BIGINT NOT NULL DEFAULT 0,
     PRIMARY KEY (platform, creator_id, post_id)
 );
+
+-- per-day view buckets so Popular Now can rank on a trailing window; the all-time total lives in post_views
+CREATE TABLE IF NOT EXISTS post_views_daily (
+    platform   TEXT NOT NULL,
+    creator_id TEXT NOT NULL,
+    post_id    TEXT NOT NULL,
+    day        DATE NOT NULL,
+    views      BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (platform, creator_id, post_id, day)
+);
+CREATE INDEX IF NOT EXISTS post_views_daily_day ON post_views_daily (day);
 
 -- the single surface the browse UI reads
 CREATE OR REPLACE VIEW visible_content AS

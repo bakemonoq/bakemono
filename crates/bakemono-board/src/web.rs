@@ -86,7 +86,14 @@ const PAGE: i64 = 36;
 // board build shown in the wordmark capsule and footer, so a keeper can tell at a glance which release is live
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+// trailing window and card count for the Popular Now strip
+const POPULAR_DAYS: i64 = 30;
+const POPULAR_COUNT: i64 = 6;
+
 async fn home(State(pool): State<PgPool>) -> Html<String> {
+    let popular = db::list_popular(&pool, POPULAR_DAYS, POPULAR_COUNT)
+        .await
+        .unwrap_or_default();
     // 12 keeps Recent to two rows on a wide screen
     let posts = db::list_posts(&pool, "", db::SortField::Created, true, "", "", 12, 0)
         .await
@@ -107,8 +114,14 @@ async fn home(State(pool): State<PgPool>) -> Html<String> {
         },
         html! {
             (welcome(cfg))
+            @if !popular.is_empty() {
+                section.block {
+                    (blockhead(ICON_POPULAR, "Popular Now", Some(("/posts?sort=views", "all popular"))))
+                    (posts_grid(&popular))
+                }
+            }
             section.block {
-                div.blockhead { h2 { "Recent" } a.more href="/posts" { "all posts" } }
+                (blockhead(ICON_RECENT, "Recent", Some(("/posts", "all posts"))))
                 @if posts.is_empty() {
                     p.muted { "Nothing indexed yet. Publish some manifests to a relay the board subscribes to" }
                 }
@@ -116,12 +129,22 @@ async fn home(State(pool): State<PgPool>) -> Html<String> {
             }
             @if !creators.is_empty() {
                 section.block {
-                    div.blockhead { h2 { "Creators" } a.more href="/creators" { "all creators" } }
+                    (blockhead(ICON_CREATORS, "Creators", Some(("/creators", "all creators"))))
                     (creators_grid(&creators))
                 }
             }
         },
     )
+}
+
+// a section heading: leading icon + title, with an optional "more" link floated to the right
+fn blockhead(icon: &str, title: &str, more: Option<(&str, &str)>) -> Markup {
+    html! {
+        div.blockhead {
+            h2 { span.hicon { (PreEscaped(icon)) } (title) }
+            @if let Some((href, label)) = more { a.more href=(href) { (label) } }
+        }
+    }
 }
 
 async fn posts_index(State(pool): State<PgPool>, Query(query): Query<BrowseQuery>) -> Html<String> {
@@ -2075,6 +2098,8 @@ const ICON_PREV: &str = "<svg viewBox='0 0 24 24' width='20' height='20' fill='n
 const ICON_NEXT: &str = "<svg viewBox='0 0 24 24' width='20' height='20' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M9 18l6-6-6-6'/></svg>";
 const ICON_CREATORS: &str = "<svg viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2'/><circle cx='9' cy='7' r='4'/><path d='M23 21v-2a4 4 0 0 0-3-3.87'/><path d='M16 3.13a4 4 0 0 1 0 7.75'/></svg>";
 const ICON_POSTS: &str = "<svg viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><rect x='3' y='3' width='7' height='7' rx='1'/><rect x='14' y='3' width='7' height='7' rx='1'/><rect x='3' y='14' width='7' height='7' rx='1'/><rect x='14' y='14' width='7' height='7' rx='1'/></svg>";
+const ICON_POPULAR: &str = "<svg viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z'/></svg>";
+const ICON_RECENT: &str = "<svg viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='9'/><path d='M12 7v5l3 2'/></svg>";
 const ICON_CONTRIBUTE: &str = "<svg viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.6l-1-1a5.5 5.5 0 1 0-7.8 7.8l1 1L12 21l7.8-7.6 1-1a5.5 5.5 0 0 0 0-7.8z'/></svg>";
 const ICON_IMAGE: &str = "<svg viewBox='0 0 24 24' width='30' height='30' fill='none' stroke='currentColor' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'><rect x='3' y='3' width='18' height='18' rx='2'/><circle cx='8.5' cy='8.5' r='1.5'/><path d='M21 15l-5-5L5 21'/></svg>";
 const ICON_INFO: &str = "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='9'/><path d='M12 16v-4M12 8h.01'/></svg>";
@@ -2144,8 +2169,10 @@ main { max-width:1240px; margin:0 auto; padding:1.4rem 1.1rem 3rem }
 .pagetitle { font-size:1.6rem; margin:.2rem 0 1rem }
 .modhead { display:flex; align-items:baseline; justify-content:space-between; gap:1rem; flex-wrap:wrap }
 .block { margin:1.8rem 0; scroll-margin-top:72px }
-.blockhead { display:flex; align-items:baseline; justify-content:space-between; margin-bottom:.8rem }
-.blockhead h2 { margin:0; font-size:1.25rem }
+.blockhead { display:flex; align-items:center; justify-content:space-between; margin-bottom:.8rem }
+.blockhead h2 { margin:0; font-size:1.25rem; display:flex; align-items:center; gap:.5rem }
+.hicon { display:inline-flex; color:var(--accent) }
+.hicon svg { width:20px; height:20px }
 .more { font-size:.85rem; font-weight:600 }
 .crumbs { color:var(--subtext0); font-size:.85rem; margin-bottom:.6rem }
 .crumbs a { color:var(--subtext1) }
