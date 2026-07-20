@@ -242,7 +242,9 @@ pub async fn all_creator_links(pool: &PgPool) -> Result<Vec<CreatorLink>> {
     Ok(rows)
 }
 
-// one creator's posts as grid cards, newest first
+// one creator's posts as grid cards, newest first. reads the materialized post_cards (one indexed row per
+// post) rather than re-deriving cards from visible_content per request, which for a prolific creator meant a
+// join + window + distinct over every file they have
 pub async fn creator_posts(
     pool: &PgPool,
     platform: &str,
@@ -252,18 +254,12 @@ pub async fn creator_posts(
     offset: i64,
 ) -> Result<Vec<PostCard>> {
     let rows = sqlx::query_as::<_, PostCard>(
-        "SELECT t.*, COALESCE(pv.views, 0) AS views FROM (
-             SELECT DISTINCT ON (platform, creator_id, post_id)
-                    platform, creator_id, post_id, creator, post_title, posted_at, created_at,
-                    mime, thumb, tier,
-                    COUNT(*) OVER (PARTITION BY platform, creator_id, post_id) AS files
-             FROM visible_content
-             WHERE platform = $1 AND creator_id = $2
-               AND ($3 = '' OR tier = $3)
-             ORDER BY platform, creator_id, post_id, (thumb IS NULL), file_index
-         ) t
+        "SELECT pc.platform, pc.creator_id, pc.post_id, pc.creator, pc.post_title, pc.posted_at,
+                pc.mime, pc.thumb, pc.tier, pc.files, pc.created_at, COALESCE(pv.views, 0) AS views
+         FROM post_cards pc
          LEFT JOIN post_views pv USING (platform, creator_id, post_id)
-         ORDER BY posted_at DESC NULLS LAST, created_at DESC LIMIT $4 OFFSET $5",
+         WHERE pc.platform = $1 AND pc.creator_id = $2 AND ($3 = '' OR pc.tier = $3)
+         ORDER BY pc.posted_at DESC NULLS LAST, pc.created_at DESC LIMIT $4 OFFSET $5",
     )
     .bind(platform)
     .bind(creator_id)
@@ -277,7 +273,7 @@ pub async fn creator_posts(
 
 pub async fn creator_post_count(pool: &PgPool, platform: &str, creator_id: &str, tier: &str) -> Result<i64> {
     let n = sqlx::query_scalar(
-        "SELECT COUNT(DISTINCT post_id) FROM visible_content
+        "SELECT COUNT(*) FROM post_cards
          WHERE platform = $1 AND creator_id = $2 AND ($3 = '' OR tier = $3)",
     )
     .bind(platform)
@@ -330,15 +326,11 @@ pub async fn adjacent_posts(
              SELECT post_id,
                     -- window is newest-first, so the left/prev button steps to a newer post (LAG) and the
                     -- right/next button to an older one (LEAD)
-                    LAG(post_id)  OVER w AS prev_id, LAG(t)  OVER w AS prev_title,
-                    LEAD(post_id) OVER w AS next_id, LEAD(t) OVER w AS next_title
-             FROM (
-                 SELECT post_id, MAX(post_title) AS t, MAX(posted_at) AS pa, MAX(created_at) AS ca
-                 FROM visible_content
-                 WHERE platform = $1 AND creator_id = $2
-                 GROUP BY post_id
-             ) g
-             WINDOW w AS (ORDER BY pa DESC NULLS LAST, ca DESC)
+                    LAG(post_id)     OVER w AS prev_id, LAG(post_title)  OVER w AS prev_title,
+                    LEAD(post_id)    OVER w AS next_id, LEAD(post_title) OVER w AS next_title
+             FROM post_cards
+             WHERE platform = $1 AND creator_id = $2
+             WINDOW w AS (ORDER BY posted_at DESC NULLS LAST, created_at DESC)
          ) r WHERE post_id = $3",
     )
     .bind(platform)
