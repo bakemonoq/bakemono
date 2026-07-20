@@ -43,6 +43,7 @@ pub fn router(state: AppState) -> Router {
         .route("/apple-touch-icon.png", get(apple_touch_icon))
         .route("/posts", get(posts_index))
         .route("/creators", get(creators_index))
+        .route("/creators/all", get(creators_all))
         .route("/search", get(search_index))
         .route("/random", get(random_redirect))
         .route("/keepers", get(keepers))
@@ -204,12 +205,55 @@ async fn creators_index(
             noindex: false,
         },
         html! {
-            h1.pagetitle { "Creators" }
+            div.modhead {
+                h1.pagetitle { "Creators" }
+                a.more href="/creators/all" { "A-Z directory" }
+            }
             (filter_bar("/creators", &q, &source, sort, desc, &platforms, None))
             (pager("/creators", &q, &source, sort, desc, None, page, has_next, true, total, "creator"))
             @if creators.is_empty() { p.muted { "No creators match" } }
             (creators_grid(&creators))
             (pager("/creators", &q, &source, sort, desc, None, page, has_next, false, total, "creator"))
+        },
+    )
+}
+
+// a flat, crawlable index of every creator, name as anchor text. this is the on-site fix for creator-name
+// queries ranking the /creators hub instead of the target page: it puts all creator pages two clicks from
+// home and hands each one its own name as the link text, the strongest on-page relevance signal we control
+async fn creators_all(State(pool): State<PgPool>) -> Html<String> {
+    let creators = db::all_creator_links(&pool).await.unwrap_or_default();
+    let cfg = config::get();
+    render_full(
+        "All creators",
+        Meta {
+            description: Some(truncate_desc(
+                &format!(
+                    "Full A-Z directory of {} creators archived on {} from Patreon, Pixiv Fanbox and Boosty",
+                    creators.len(),
+                    cfg.name
+                ),
+                160,
+            )),
+            canonical: Some("/creators/all".into()),
+            og_type: Some("website"),
+            ..Meta::default()
+        },
+        html! {
+            div.crumbs { a href="/creators" { "Creators" } " / " span { "All" } }
+            h1.pagetitle { "All creators" }
+            p.muted {
+                (creators.len()) " creators archived. Jump to one below, or "
+                a href="/creators" { "search and filter" }
+            }
+            div.dir {
+                @for c in &creators {
+                    a.dirlink href=(format!("/c/{}/{}", c.platform, c.creator_id)) {
+                        span.dirname { (c.creator) }
+                        span.dirmeta { (pretty_platform(&c.platform)) " - " (c.posts) }
+                    }
+                }
+            }
         },
     )
 }
@@ -2002,6 +2046,7 @@ fn footer(cfg: &config::BoardConfig) -> Markup {
                     }
                 }
                 nav.footlinks {
+                    a href="/creators/all" { (PreEscaped(ICON_CREATORS)) span { "Creators A-Z" } }
                     a href="/info" { (PreEscaped(ICON_INFO)) span { "Info" } }
                     a href="/api" { (PreEscaped(ICON_API)) span { "API" } }
                     a href="/keepers" { (PreEscaped(ICON_KEEPERS)) span { "Keepers" } }
@@ -2128,6 +2173,12 @@ main { max-width:1240px; margin:0 auto; padding:1.4rem 1.1rem 3rem }
 .crumbs a { color:var(--subtext1) }
 .creatorhead { display:flex; flex-wrap:wrap; align-items:center; gap:.7rem; margin-bottom:1.2rem }
 .creatorhead h1 { margin:0; font-size:1.6rem }
+
+.dir { display:grid; grid-template-columns:repeat(auto-fill,minmax(230px,1fr)); gap:2px 16px; margin-top:1rem }
+.dirlink { display:flex; align-items:baseline; justify-content:space-between; gap:.6rem; padding:.4rem .5rem; border-radius:7px; min-width:0 }
+.dirlink:hover { background:var(--mantle) }
+.dirname { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:600 }
+.dirmeta { color:var(--subtext0); font-size:.78rem; white-space:nowrap; flex-shrink:0 }
 
 .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(170px,1fr)); gap:14px }
 .grid.wide { grid-template-columns:repeat(auto-fill,minmax(230px,1fr)) }
