@@ -223,6 +223,25 @@ pub async fn list_creators(
     Ok(rows)
 }
 
+// every creator as a bare link row for the crawlable A-Z directory: one flat page so each creator page is
+// two clicks from home with its name as anchor text, instead of buried under paginated browse
+#[derive(sqlx::FromRow)]
+pub struct CreatorLink {
+    pub platform: String,
+    pub creator_id: String,
+    pub creator: String,
+    pub posts: i64,
+}
+
+pub async fn all_creator_links(pool: &PgPool) -> Result<Vec<CreatorLink>> {
+    let rows = sqlx::query_as::<_, CreatorLink>(
+        "SELECT platform, creator_id, creator, posts FROM creator_cards ORDER BY lower(creator), creator_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 // one creator's posts as grid cards, newest first
 pub async fn creator_posts(
     pool: &PgPool,
