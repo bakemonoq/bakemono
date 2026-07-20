@@ -906,13 +906,89 @@ pub struct ShardRow {
     pub thumb_cid: Option<String>,
 }
 
-pub async fn all_creators(pool: &PgPool) -> Result<Vec<(String, String, String)>> {
+#[derive(sqlx::FromRow)]
+pub struct ShardDigest {
+    pub platform: String,
+    pub creator_id: String,
+    pub creator: String,
+    pub digest: String,
+    pub posts: i64,
+    pub bytes: i64,
+}
+
+// one grouped pass yields every creator's content digest plus the counts a ShardRef needs. the digest
+// spans each field that lands in the shard, in the order shard_rows emits them, so it flips exactly when
+// the shard's bytes would - which lets publish rebuild only the changed shards. creators with no visible
+// file produce no row, matching publish skipping empty shards
+pub async fn shard_digests(pool: &PgPool) -> Result<Vec<ShardDigest>> {
     let rows = sqlx::query_as(
-        "SELECT platform, creator_id, creator FROM creators ORDER BY platform, creator_id",
+        "SELECT p.platform, p.creator_id, MAX(c.creator) AS creator,
+                md5(COALESCE(MAX(c.creator), '') || string_agg(
+                    concat_ws(E'\\x1f',
+                        p.post_id, p.title, p.body, COALESCE(p.posted_at, ''), COALESCE(p.tier, ''),
+                        pf.file_index::text, f.cid, f.sha256, f.size::text, f.mime, COALESCE(f.filename, ''),
+                        CASE WHEN f.thumb_cid IS NULL
+                                  OR EXISTS (SELECT 1 FROM denylist dt WHERE dt.cid = f.thumb_cid)
+                             THEN '' ELSE f.thumb_cid END),
+                    E'\\x1e' ORDER BY p.posted_at DESC NULLS LAST, p.post_id DESC, pf.file_index)) AS digest,
+                COUNT(DISTINCT p.post_id)::bigint AS posts,
+                COALESCE(SUM(f.size), 0)::bigint AS bytes
+         FROM posts p
+         JOIN post_files pf ON (pf.platform, pf.creator_id, pf.post_id) = (p.platform, p.creator_id, p.post_id)
+         JOIN creators c ON (c.platform, c.creator_id) = (p.platform, p.creator_id)
+         JOIN files f ON f.cid = pf.cid
+         WHERE NOT EXISTS (SELECT 1 FROM denylist d WHERE d.cid = f.cid)
+         GROUP BY p.platform, p.creator_id",
     )
     .fetch_all(pool)
     .await?;
     Ok(rows)
+}
+
+// the shard state carried over from the last publish, keyed (platform, creator_id): (digest, cid, posts, bytes)
+pub async fn stored_shards(pool: &PgPool) -> Result<Vec<(String, String, String, String, i64, i64)>> {
+    let rows = sqlx::query_as(
+        "SELECT platform, creator_id, digest, cid, posts, bytes FROM manifest_shards",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+pub async fn upsert_shard(
+    pool: &PgPool,
+    platform: &str,
+    creator_id: &str,
+    digest: &str,
+    cid: &str,
+    posts: i64,
+    bytes: i64,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO manifest_shards (platform, creator_id, digest, cid, posts, bytes)
+         VALUES ($1,$2,$3,$4,$5,$6)
+         ON CONFLICT (platform, creator_id) DO UPDATE SET
+             digest = EXCLUDED.digest, cid = EXCLUDED.cid,
+             posts = EXCLUDED.posts, bytes = EXCLUDED.bytes",
+    )
+    .bind(platform)
+    .bind(creator_id)
+    .bind(digest)
+    .bind(cid)
+    .bind(posts)
+    .bind(bytes)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn delete_shard(pool: &PgPool, platform: &str, creator_id: &str) -> Result<()> {
+    sqlx::query("DELETE FROM manifest_shards WHERE platform = $1 AND creator_id = $2")
+        .bind(platform)
+        .bind(creator_id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 pub async fn revoked_entries(pool: &PgPool) -> Result<Vec<(String, Option<String>, String, String)>> {
@@ -1088,6 +1164,18 @@ CREATE TABLE IF NOT EXISTS manifest_heads (
     root_cid     TEXT NOT NULL,
     head_json    TEXT NOT NULL,
     published_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- last published shard per creator: digest lets a publish reuse the stored CID for unchanged creators
+-- instead of re-adding every shard, so the cost tracks what changed, not the whole catalog
+CREATE TABLE IF NOT EXISTS manifest_shards (
+    platform   TEXT NOT NULL,
+    creator_id TEXT NOT NULL,
+    digest     TEXT NOT NULL,
+    cid        TEXT NOT NULL,
+    posts      BIGINT NOT NULL,
+    bytes      BIGINT NOT NULL,
+    PRIMARY KEY (platform, creator_id)
 );
 
 -- view tally per post, the signal behind the Popular sort; deduped per browser by the caller

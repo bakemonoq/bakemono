@@ -1,28 +1,58 @@
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use sqlx::postgres::PgPool;
 
-use bakemono_core::manifest::{BoardKey, FileEntry, Head, Post, RevokedEntry, Root, Shard, ShardRef};
+use bakemono_core::manifest::{
+    shard_key, BoardKey, FileEntry, Head, Post, RevokedEntry, Root, Shard, ShardRef,
+};
 
 use crate::db;
 use crate::kubo::Kubo;
 
-// rebuild the whole manifest and publish a new head, unless nothing changed. shard diffing is
-// free: identical content serializes to identical bytes, which kubo maps to the identical CID
+// rebuild the manifest and publish a new head, unless nothing changed. only shards whose content digest
+// moved since the last publish are re-added to kubo; the rest reuse their stored CID, so the work tracks
+// what changed rather than the whole catalog - the add + pin round-trips are what the box can't afford
+// per-creator at scale
 pub async fn publish_if_changed(pool: &PgPool, kubo: &Kubo) -> Result<Option<Head>> {
     let key = board_key()?;
     let mut root = Root::default();
-    for (platform, creator_id, creator) in db::all_creators(pool).await? {
-        let shard = build_shard(pool, &platform, &creator_id, &creator).await?;
-        if shard.posts.is_empty() {
-            continue;
+    let stored: HashMap<(String, String), (String, String, u64, u64)> = db::stored_shards(pool)
+        .await?
+        .into_iter()
+        .map(|(pl, ci, digest, cid, posts, bytes)| ((pl, ci), (digest, cid, posts as u64, bytes as u64)))
+        .collect();
+    let mut live: HashSet<(String, String)> = HashSet::new();
+    for row in db::shard_digests(pool).await? {
+        let k = (row.platform.clone(), row.creator_id.clone());
+        live.insert(k.clone());
+        let shard_ref = match stored.get(&k) {
+            Some((digest, cid, posts, bytes)) if *digest == row.digest => {
+                ShardRef { cid: cid.clone(), posts: *posts, bytes: *bytes }
+            }
+            _ => {
+                let shard = build_shard(pool, &row.platform, &row.creator_id, &row.creator).await?;
+                if shard.posts.is_empty() {
+                    continue;
+                }
+                let cid = kubo.add(shard.to_json()?, &shard.key()).await?;
+                kubo.pin_archive(&cid, &format!("shard {}", shard.key())).await?;
+                db::upsert_shard(
+                    pool, &row.platform, &row.creator_id, &row.digest, &cid, row.posts, row.bytes,
+                )
+                .await?;
+                ShardRef { cid, posts: row.posts as u64, bytes: row.bytes as u64 }
+            }
+        };
+        root.shards.insert(shard_key(&row.platform, &row.creator_id), shard_ref);
+    }
+    // creators whose visible content is now fully gone (every file revoked) leave the manifest and its
+    // shard table, so a later publish never resurrects a stale CID for them
+    for k in stored.keys() {
+        if !live.contains(k) {
+            db::delete_shard(pool, &k.0, &k.1).await?;
         }
-        let posts = shard.posts.len() as u64;
-        let bytes: u64 = shard.posts.iter().flat_map(|p| &p.files).map(|f| f.size).sum();
-        let cid = kubo.add(shard.to_json()?, &shard.key()).await?;
-        kubo.pin_archive(&cid, &format!("shard {}", shard.key())).await?;
-        root.shards.insert(shard.key(), ShardRef { cid, posts, bytes });
     }
     let mut denied_cids = Vec::new();
     for (cid, sha256, reason, revoked_at) in db::revoked_entries(pool).await? {
