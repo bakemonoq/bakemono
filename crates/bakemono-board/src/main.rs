@@ -49,9 +49,10 @@ async fn serve() -> Result<()> {
     if let Err(e) = db::refresh_cards(&pool).await {
         tracing::warn!("initial card refresh failed: {e:#}");
     }
-    tokio::spawn(db::run_card_refresher(pool.clone()));
-    tokio::spawn(scrape::run_scheduler(pool.clone(), kubo.clone()));
-    tokio::spawn(thumb::backfill_dims(pool.clone()));
+    let bg = db::background_pool(&database_url(), 4).await?;
+    tokio::spawn(db::run_card_refresher(bg.clone()));
+    tokio::spawn(scrape::run_scheduler(bg.clone(), kubo.clone()));
+    tokio::spawn(thumb::backfill_dims(bg));
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!("board on http://{bind}");

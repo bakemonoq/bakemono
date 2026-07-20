@@ -5,6 +5,9 @@
 services:
   postgres:
     image: postgres:16
+    # default 64m starves parallel query shared memory; a card-view refresh then falls back to a ~29s
+    # serial rebuild instead of a few-second parallel one
+    shm_size: 1g
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: bakemono

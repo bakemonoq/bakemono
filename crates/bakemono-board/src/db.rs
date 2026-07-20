@@ -4,9 +4,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 pub async fn connect(url: &str) -> Result<PgPool> {
-    let pool = PgPoolOptions::new().max_connections(5).connect(url).await?;
+    let pool = build_pool(url, 16).await?;
     sqlx::raw_sql(SCHEMA).execute(&pool).await?;
     Ok(pool)
+}
+
+// a separate small pool for the serve process's background tasks (card refresher, scrape scheduler, dims
+// backfill), so their long-held connections stay off the web pool - a 20s+ REFRESH can no longer make a
+// page load wait out the acquire timeout. schema is already ensured by connect
+pub async fn background_pool(url: &str, max: u32) -> Result<PgPool> {
+    build_pool(url, max).await
+}
+
+async fn build_pool(url: &str, max: u32) -> Result<PgPool> {
+    Ok(PgPoolOptions::new().max_connections(max).connect(url).await?)
 }
 
 static CARDS_DIRTY: AtomicBool = AtomicBool::new(false);
@@ -20,7 +31,7 @@ pub async fn run_card_refresher(pool: PgPool) {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(20);
+        .unwrap_or(180);
     let interval = Duration::from_secs(secs);
     loop {
         tokio::time::sleep(interval).await;
@@ -111,10 +122,11 @@ impl SortField {
     }
 }
 
-// the services present in the catalog, to populate the source filter
+// the services present in the catalog, to populate the source filter. read off creator_cards (one row per
+// creator) rather than post_cards (one per post), since the distinct set is identical but far smaller to scan
 pub async fn platforms(pool: &PgPool) -> Result<Vec<String>> {
     let rows = sqlx::query_scalar::<_, String>(
-        "SELECT DISTINCT platform FROM post_cards ORDER BY platform",
+        "SELECT DISTINCT platform FROM creator_cards ORDER BY platform",
     )
     .fetch_all(pool)
     .await?;
@@ -1235,6 +1247,11 @@ ORDER BY pf.platform, pf.creator_id, pf.post_id, (f.thumb_cid IS NULL), pf.file_
 CREATE UNIQUE INDEX IF NOT EXISTS post_cards_pk ON post_cards (platform, creator_id, post_id);
 CREATE INDEX IF NOT EXISTS post_cards_recent ON post_cards (posted_at DESC NULLS LAST, created_at DESC);
 CREATE INDEX IF NOT EXISTS post_cards_platform ON post_cards (platform);
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+-- substring search for the browse/search ILIKE; two single-column gin indexes so title OR creator becomes a
+-- bitmap-or of index scans instead of a full seq scan of the whole view
+CREATE INDEX IF NOT EXISTS post_cards_title_trgm ON post_cards USING gin (post_title gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS post_cards_creator_trgm ON post_cards USING gin (creator gin_trgm_ops);
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS creator_cards AS
 SELECT c.platform, c.creator_id, c.creator, c.posts, c.files, c.last_at, cov.thumb, cov.mime
@@ -1262,4 +1279,5 @@ LEFT JOIN LATERAL (
 ) cov ON true;
 CREATE UNIQUE INDEX IF NOT EXISTS creator_cards_pk ON creator_cards (platform, creator_id);
 CREATE INDEX IF NOT EXISTS creator_cards_recent ON creator_cards (last_at DESC);
+CREATE INDEX IF NOT EXISTS creator_cards_creator_trgm ON creator_cards USING gin (creator gin_trgm_ops);
 ";
